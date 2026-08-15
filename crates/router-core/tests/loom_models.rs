@@ -106,3 +106,52 @@ fn breaker_recovers_after_any_interleaving() {
         assert_eq!(breaker.admit(1001), Admission::Yes);
     });
 }
+
+/// Post-paid token debits racing pre-flight consumes: the bucket can never
+/// go below zero, and inflow/outflow always reconcile.
+#[test]
+fn vkey_tpm_debit_never_underflows() {
+    loom::model(|| {
+        let bucket = Arc::new(TokenBucket::new(5, 0));
+        let debit = {
+            let bucket = bucket.clone();
+            thread::spawn(move || bucket.debit_saturating(4, 0))
+        };
+        let consume = {
+            let bucket = bucket.clone();
+            thread::spawn(move || u64::from(bucket.try_consume(3, 0)) * 3)
+        };
+        debit.join().unwrap();
+        let consumed = consume.join().unwrap();
+        let left = bucket.available_tokens();
+        // Outflow: up to 4 debited (saturating) + 0-or-3 consumed; the
+        // balance must land exactly where the winners left it, never wrap.
+        assert!(left <= 5, "underflow wrapped: {left}");
+        assert!(consumed + left <= 5);
+    });
+}
+
+/// Spend accounting racing a period rollover: enforcement never loses a
+/// debit that landed in the *new* period, and the counter never wraps.
+#[test]
+fn vkey_spend_rollover_race_is_sound() {
+    use router_core::vkey::SpendState;
+    loom::model(|| {
+        let spend = Arc::new(SpendState::default());
+        spend.add(100, 1); // period 1 accrues spend
+        let roller = {
+            let spend = spend.clone();
+            thread::spawn(move || spend.add(40, 2)) // first write of period 2
+        };
+        let racer = {
+            let spend = spend.clone();
+            thread::spawn(move || spend.add(60, 2))
+        };
+        roller.join().unwrap();
+        racer.join().unwrap();
+        // The packed-word CAS makes rollover exact: both period-2 debits
+        // survive and no period-1 spend can leak in.
+        assert_eq!(spend.current(2), 100);
+        assert_eq!(spend.current(3), 0);
+    });
+}

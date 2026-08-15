@@ -84,6 +84,42 @@ impl TokenBucket {
         }
     }
 
+    /// Post-paid debit: drain up to `tokens`, never below zero. Used when
+    /// the true cost is only known after the response (token-per-minute
+    /// accounting) — the drain blocks subsequent admissions until refill.
+    pub fn debit_saturating(&self, tokens: u64, now_ms: u64) {
+        self.refill(now_ms);
+        let need = tokens.saturating_mul(1000);
+        let mut current = self.available.load(Ordering::Acquire);
+        loop {
+            let next = current.saturating_sub(need);
+            if next == current {
+                return;
+            }
+            match self.available.compare_exchange_weak(
+                current,
+                next,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return,
+                Err(actual) => current = actual,
+            }
+        }
+    }
+
+    /// Duplicate the bucket including its current balance and refill
+    /// cursor — used when a table rebuild carries a key's limiter state
+    /// into the new snapshot.
+    pub fn clone_state(&self) -> Self {
+        Self {
+            available: AtomicU64::new(self.available.load(Ordering::Acquire)),
+            last_refill_ms: AtomicU64::new(self.last_refill_ms.load(Ordering::Acquire)),
+            capacity_milli: self.capacity_milli,
+            refill_milli_per_ms: self.refill_milli_per_ms,
+        }
+    }
+
     pub fn available_tokens(&self) -> u64 {
         self.available.load(Ordering::Acquire) / 1000
     }

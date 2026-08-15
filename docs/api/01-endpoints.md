@@ -42,7 +42,7 @@ array**, not as separate APIs:
 | `file` / document parts (e.g. PDFs) | Translated where both dialects support documents; precise `400` otherwise |
 | video inputs | Capability-gated relay to providers that accept them; not cross-translated |
 
-This is why `max_body_size` defaults to 50 MB and why the zero-copy body
+This is why `max_body_size` defaults to 100 MB and why the zero-copy body
 design ([../architecture/04-json-engine.md](../architecture/04-json-engine.md))
 is a core requirement rather than an optimization.
 

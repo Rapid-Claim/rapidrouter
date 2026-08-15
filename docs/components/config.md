@@ -12,8 +12,9 @@ database or config service in either mode.
 [server]
 host = "0.0.0.0"
 port = 8080
-max_body_size_mb = 50
+max_body_size_mb = 100
 auth_keys = ["env.CARET_GATEWAY_KEY"]     # omit for open localhost use
+require_auth = false                      # true: refuse anonymous requests
 drain_timeout_secs = 30
 
 [providers.openai]
@@ -58,6 +59,30 @@ cooldown_secs = 15
 [reliability.retries]
 max_attempts = 2
 on = ["connect_error", "429", "5xx"]
+
+[console]                       # the console and /admin/api exist only
+admin_keys = ["env.CARET_ADMIN_KEY"]      # once admin credentials do
+session_ttl_secs = 43200
+
+[usage]
+retention_days = 30             # local partitions pruned by the binary
+flush_interval_secs = 10
+per_key_metrics = false         # bounded per-key metric labels
+
+[pricing."openai/gpt-4o-mini"]  # overrides the built-in price table
+input_per_mtok = 0.15
+output_per_mtok = 0.60
+
+[[virtual_keys]]                # file-mode form; console/CLI is the usual path
+name        = "checkout-service"
+id          = "9f3a2c"
+secret_hash = "blake3:…"        # from `caret-router key hash`
+models      = ["openai/gpt-4o-mini", "fast"]
+budget      = { usd = 250, period = "monthly" }
+rate_limit  = { rpm = 600, tpm = 400_000 }
+expires     = "2027-01-01T00:00:00Z"
+tags        = { team = "payments" }
+enabled     = true
 ```
 
 ## Semantics
@@ -77,6 +102,19 @@ on = ["connect_error", "429", "5xx"]
   deployment maps missing models — all rejected before the port binds, with
   pathed messages (`providers.groq.keys[0].weight: must be > 0`).
   `caret-router check <file>` runs the same validation standalone for CI.
+- **Virtual keys carry hashes, never secrets.** A `[[virtual_keys]]` entry
+  is validated like everything else: the id must be six hex characters, the
+  hash must be `blake3:` plus 64 hex characters, and every scope entry must
+  name a configured provider or alias. Managed-mode keys live in the store
+  instead and win over a file entry with the same id, because rotation
+  state lives there. See
+  [virtual-keys.md](virtual-keys.md).
+- **`[console] admin_keys` is the console's on-switch.** With none
+  configured, `/console` and `/admin/api/*` do not exist — separate
+  credentials from data-plane keys, by construction.
+- **`[pricing]` overrides the built-in table** per `provider/model`, in USD
+  per million tokens. Unknown models simply cost nothing in reports rather
+  than guessing.
 
 ## Applying changes
 

@@ -133,6 +133,12 @@ fn empty_config_is_valid_but_bare() {
 }
 
 #[test]
+fn default_upload_limit_is_one_hundred_megabytes() {
+    let config = Config::from_str("", Format::Toml).unwrap();
+    assert_eq!(config.server.max_body_size, 100 * 1024 * 1024);
+}
+
+#[test]
 fn unknown_field_rejected() {
     let err = load("[server]\nprot = 8080\n", &[]).unwrap_err();
     assert!(
@@ -431,5 +437,183 @@ fn region_rejected_outside_bedrock() {
         &[],
         "providers.openai.region",
         "only valid for the bedrock provider",
+    );
+}
+
+// ---- Phase 7 sections: virtual keys, console, usage, pricing ----
+
+const VK_HASH: &str = "blake3:0000000000000000000000000000000000000000000000000000000000000000";
+
+fn vk_block(extra: &str) -> String {
+    format!(
+        "[providers.openai]\nkeys = [{{ name = \"k\", value = \"sk\" }}]\n\n\
+         [[virtual_keys]]\nname = \"svc\"\nid = \"9f3a2c\"\nsecret_hash = \"{VK_HASH}\"\n{extra}"
+    )
+}
+
+#[test]
+fn virtual_key_full_form_resolves() {
+    let config = load(
+        &vk_block(
+            "models = [\"openai/gpt-4o-mini\", \"fast\"]\n\
+             budget = { usd = 250.0, period = \"monthly\" }\n\
+             rate_limit = { rpm = 600, tpm = 400000 }\n\
+             expires = \"2027-01-01T00:00:00Z\"\n\
+             tags = { team = \"payments\" }\n\n\
+             [aliases]\nfast = \"openai/gpt-4o-mini\"\n",
+        ),
+        &[],
+    )
+    .unwrap();
+    let vk = &config.virtual_keys[0];
+    assert_eq!(vk.id, "9f3a2c");
+    assert_eq!(vk.models, vec!["openai/gpt-4o-mini", "fast"]);
+    assert!(vk.budget.is_some());
+    assert_eq!(vk.rate.unwrap().rpm, Some(600));
+    assert!(vk.expires_ms.is_some());
+    assert!(vk.enabled);
+}
+
+#[test]
+fn virtual_key_bad_id_and_hash_rejected() {
+    assert_invalid(
+        "[[virtual_keys]]\nname = \"a\"\nid = \"xyz\"\nsecret_hash = \"blake3:00\"\n",
+        &[],
+        "virtual_keys[0].id",
+        "6 hex characters",
+    );
+    assert_invalid(
+        "[[virtual_keys]]\nname = \"a\"\nid = \"9f3a2c\"\nsecret_hash = \"plain\"\n",
+        &[],
+        "virtual_keys[0].secret_hash",
+        "blake3:",
+    );
+}
+
+#[test]
+fn virtual_key_duplicate_ids_rejected() {
+    let doc = format!(
+        "[[virtual_keys]]\nname = \"a\"\nid = \"9f3a2c\"\nsecret_hash = \"{VK_HASH}\"\n\n\
+         [[virtual_keys]]\nname = \"b\"\nid = \"9f3a2c\"\nsecret_hash = \"{VK_HASH}\"\n"
+    );
+    assert_invalid(&doc, &[], "virtual_keys[1].id", "duplicate");
+}
+
+#[test]
+fn virtual_key_scope_must_name_known_provider_or_alias() {
+    assert_invalid(
+        &vk_block("models = [\"nosuch/model\"]\n"),
+        &[],
+        "virtual_keys[0].models[0]",
+        "unknown provider",
+    );
+    assert_invalid(
+        &vk_block("models = [\"bare-model\"]\n"),
+        &[],
+        "virtual_keys[0].models[0]",
+        "not a configured alias",
+    );
+}
+
+#[test]
+fn virtual_key_budget_and_rate_bounds() {
+    assert_invalid(
+        &vk_block("budget = { usd = -1.0, period = \"monthly\" }\n"),
+        &[],
+        "virtual_keys[0].budget.usd",
+        "positive",
+    );
+    assert_invalid(
+        &vk_block("budget = { usd = 1.0, period = \"hourly\" }\n"),
+        &[],
+        "virtual_keys[0].budget.period",
+        "unknown period",
+    );
+    assert_invalid(
+        &vk_block("rate_limit = { rpm = 0 }\n"),
+        &[],
+        "virtual_keys[0].rate_limit.rpm",
+        "must be > 0",
+    );
+    assert_invalid(
+        &vk_block("rate_limit = {}\n"),
+        &[],
+        "virtual_keys[0].rate_limit",
+        "rpm and/or tpm",
+    );
+    assert_invalid(
+        &vk_block("expires = \"tomorrow\"\n"),
+        &[],
+        "virtual_keys[0].expires",
+        "RFC 3339",
+    );
+}
+
+#[test]
+fn console_admin_keys_resolve_and_ttl_is_bounded() {
+    let config = load(
+        "[providers.openai]\nkeys = [{ name = \"k\", value = \"sk\" }]\n\n\
+         [console]\nadmin_keys = [\"env.ADMIN_KEY\"]\n",
+        &[("ADMIN_KEY", "admin-secret")],
+    )
+    .unwrap();
+    assert!(config.console.enabled());
+    assert!(config.console.admin_keys[0].verify("admin-secret"));
+
+    assert_invalid(
+        "[console]\nadmin_keys = [\"env.MISSING\"]\n",
+        &[],
+        "console.admin_keys[0]",
+        "not set",
+    );
+    assert_invalid(
+        "[console]\nsession_ttl_secs = 5\n",
+        &[],
+        "console.session_ttl_secs",
+        "between",
+    );
+}
+
+#[test]
+fn usage_and_pricing_bounds() {
+    assert_invalid(
+        "[usage]\nretention_days = 0\n",
+        &[],
+        "usage.retention_days",
+        "between",
+    );
+    assert_invalid(
+        "[pricing.\"openai/gpt-4o-mini\"]\ninput_per_mtok = -0.5\noutput_per_mtok = 0.6\n",
+        &[],
+        "pricing.openai/gpt-4o-mini",
+        "non-negative",
+    );
+    let config = load(
+        "[providers.openai]\nkeys = [{ name = \"k\", value = \"sk\" }]\n\n\
+         [pricing.\"openai/gpt-4o-mini\"]\ninput_per_mtok = 0.15\noutput_per_mtok = 0.6\n",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(config.pricing["openai/gpt-4o-mini"].input_per_mtok, 0.15);
+}
+
+#[test]
+fn store_refs_resolve_through_the_source() {
+    // Managed mode composes a source that answers `store.<name>`.
+    let config = load(
+        "[providers.openai]\nkeys = [{ name = \"k\", value = \"store.openai_key\" }]\n",
+        &[("store.openai_key", "sk-from-store")],
+    )
+    .unwrap();
+    assert_eq!(
+        config.providers["openai"].keys[0].secret.expose(),
+        "sk-from-store"
+    );
+
+    assert_invalid(
+        "[providers.openai]\nkeys = [{ name = \"k\", value = \"store.missing\" }]\n",
+        &[],
+        "providers.openai.keys[0].value",
+        "store secret `missing` is not set",
     );
 }

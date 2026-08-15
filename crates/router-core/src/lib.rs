@@ -10,6 +10,7 @@ pub mod secret;
 pub mod sse;
 pub(crate) mod sync;
 pub mod token_bucket;
+pub mod vkey;
 
 pub use error::{ErrorClass, GatewayError};
 pub use secret::SecretString;

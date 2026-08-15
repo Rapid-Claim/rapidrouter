@@ -49,6 +49,12 @@ pub struct Config {
     /// Fully resolved fallback chains.
     pub fallbacks: BTreeMap<TargetModel, Vec<TargetModel>>,
     pub reliability: Reliability,
+    /// File-declared virtual keys; managed mode appends store-held keys.
+    pub virtual_keys: Vec<crate::vkey::VirtualKeyDef>,
+    pub console: ConsoleConfig,
+    pub usage: UsageConfig,
+    /// Price overrides per `provider/model`, merged over the built-ins.
+    pub pricing: BTreeMap<String, Price>,
 }
 
 #[derive(Debug)]
@@ -57,7 +63,45 @@ pub struct ServerConfig {
     pub port: u16,
     pub max_body_size: u64,
     pub auth_keys: Vec<SecretString>,
+    pub require_auth: bool,
     pub drain_timeout: Duration,
+}
+
+#[derive(Debug, Default)]
+pub struct ConsoleConfig {
+    pub admin_keys: Vec<SecretString>,
+    pub session_ttl: Duration,
+}
+
+impl ConsoleConfig {
+    /// The console and admin API exist only when credentials do.
+    pub fn enabled(&self) -> bool {
+        !self.admin_keys.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct UsageConfig {
+    pub retention_days: u32,
+    pub flush_interval: Duration,
+    pub per_key_metrics: bool,
+}
+
+impl Default for UsageConfig {
+    fn default() -> Self {
+        Self {
+            retention_days: 30,
+            flush_interval: Duration::from_secs(10),
+            per_key_metrics: false,
+        }
+    }
+}
+
+/// USD per million tokens.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Price {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
 }
 
 #[derive(Debug)]

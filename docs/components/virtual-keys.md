@@ -86,12 +86,15 @@ caret-router key create --name checkout-service \
   --models openai/gpt-4o-mini,fast --budget-usd 250/monthly --rpm 600
 # → prints the full key once
 
-caret-router key ls | rotate <id> | disable <id> | rm <id>
+caret-router key ls | rotate <id> | disable <id> | enable <id> | rm <id>
+
+caret-router key hash            # a secret_hash for a file-mode entry
 ```
 
 - **Rotate** issues a new secret for the same id/attributes with an overlap
-  window (old secret honored for `rotation_grace`, default 24 h) so
-  deployments roll without a hard cut.
+  window (`--grace-hours`, default 24 h) so deployments roll without a hard
+  cut. Both secrets verify until the window closes; then only the new one
+  does.
 - **Revoke** (disable/rm) propagates via the store — effective on every
   node within consensus round-trips, no restart.
 - All of the above is equally available in the console's Keys page and the

@@ -36,6 +36,31 @@ jobs:
       - name: Model-check breaker and token bucket
         run: RUSTFLAGS="--cfg loom" cargo test -p router-core --test loom_models --release
 
+  console:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - uses: Swatinem/rust-cache@v2
+      - run: npm ci
+        working-directory: console
+      - run: npm run typecheck && npm run build
+        working-directory: console
+      - run: npx playwright install --with-deps chromium
+        working-directory: console
+      - run: npm run test:e2e
+        working-directory: console
+      - name: Enforce compressed JavaScript budget
+        run: npm run budget
+        working-directory: console
+      - name: Console builds out of the Rust tree too
+        run: cargo build -p router-server --no-default-features
+
   sdk-suite:
     runs-on: ubuntu-latest
     steps:

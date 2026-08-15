@@ -1,0 +1,76 @@
+/* The design system: one small set of custom properties drives every
+   surface. Light and dark are token swaps — `prefers-color-scheme` by
+   default, overridable per-operator via `data-theme` on the root. */
+:root {
+  color-scheme: light dark;
+  --bg: #f6f7f6;
+  --surface: #ffffff;
+  --surface-2: #eef1ef;
+  --border: #dfe4e1;
+  --border-strong: #b9c2bd;
+  --text: #17201c;
+  --muted: #5b6560;
+  --accent: #1c6a52;
+  --accent-hover: #14523f;
+  --accent-ink: #ffffff;
+  --accent-soft: #e4f2ed;
+  --danger: #a32c37;
+  --danger-soft: #fae8e9;
+  --warning: #7a5010;
+  --focus: #15599f;
+  --radius-control: 5px;
+  --radius-panel: 7px;
+  --sidebar: #18231e;
+  --sidebar-text: #d9e2dd;
+  --sidebar-muted: #b6c3bc;
+}
+
+/* Dark tokens live once and are applied by either signal. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #111714;
+    --surface: #17201c;
+    --surface-2: #202b26;
+    --border: #2d3933;
+    --border-strong: #4b5a52;
+    --text: #edf2ef;
+    --muted: #a8b3ad;
+    --accent: #6cc9a6;
+    --accent-hover: #8ad9bc;
+    --accent-ink: #0d1a15;
+    --accent-soft: #1d3a30;
+    --danger: #f4949b;
+    --danger-soft: #3d2226;
+    --warning: #e0b872;
+    --focus: #7fb6ef;
+    --sidebar: #0b100e;
+    --sidebar-text: #cbd5d0;
+    --sidebar-muted: #9fada6;
+  }
+}
+
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #111714;
+  --surface: #17201c;
+  --surface-2: #202b26;
+  --border: #2d3933;
+  --border-strong: #4b5a52;
+  --text: #edf2ef;
+  --muted: #a8b3ad;
+  --accent: #6cc9a6;
+  --accent-hover: #8ad9bc;
+  --accent-ink: #0d1a15;
+  --accent-soft: #1d3a30;
+  --danger: #f4949b;
+  --danger-soft: #3d2226;
+  --warning: #e0b872;
+  --focus: #7fb6ef;
+  --sidebar: #0b100e;
+  --sidebar-text: #cbd5d0;
+  --sidebar-muted: #9fada6;
+}
+
+:root[data-theme="light"] {
+  color-scheme: light;
+}

@@ -1,0 +1,25 @@
+{
+  "name": "caret-router-console",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b && vite build",
+    "dev": "vite",
+    "typecheck": "tsc -b --pretty false",
+    "test:e2e": "playwright test",
+    "budget": "node scripts/bundle-budget.mjs"
+  },
+  "dependencies": {
+    "lucide-solid": "^0.468.0",
+    "solid-js": "^1.9.4",
+    "uplot": "^1.6.31"
+  },
+  "devDependencies": {
+    "@axe-core/playwright": "^4.10.2",
+    "@playwright/test": "^1.50.0",
+    "typescript": "^5.7.2",
+    "vite": "^6.0.5",
+    "vite-plugin-solid": "^2.11.0"
+  }
+}

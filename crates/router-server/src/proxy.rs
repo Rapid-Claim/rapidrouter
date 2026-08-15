@@ -11,19 +11,136 @@ use axum::extract::State;
 use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use bytes::Bytes;
+use futures_util::StreamExt;
 use http_body_util::BodyExt;
-use http_body_util::Full;
 use router_core::breaker::Breaker;
 use router_core::chat::ChatRequest;
 use router_core::config::{AuthMode, RetryOn};
 use router_core::eventstream::EventStreamParser;
 use router_core::router::{KeyRuntime, ResolvedRoute, RoutePlan};
 use router_core::sse::SseParser;
+use router_core::vkey::{self, VkDeny, VkRuntime};
 use router_core::{ErrorClass, GatewayError, clock, json};
 use router_providers::{Dialect, InboundStream, RenderTarget, UpstreamStream};
 use serde_json::Value;
 
 use crate::AppState;
+use crate::usage::{self, TokenUsage, UsageHook};
+
+/// Enforce a virtual key's scope, rate limits, and budget — after model
+/// extraction, before any upstream work.
+fn vk_gate(vk: &VkRuntime, requested: &str, plan: &RoutePlan) -> Result<(), GatewayError> {
+    let resolved = plan
+        .targets
+        .first()
+        .map(|r| format!("{}/{}", r.provider.name, r.upstream_model));
+    if !vk.allows_model(requested, resolved.as_deref()) {
+        return Err(GatewayError::new(
+            ErrorClass::Permission,
+            format!(
+                "virtual key `{}` does not allow model `{requested}`",
+                vk.def.name
+            ),
+        )
+        .with_param("model"));
+    }
+    let ordinal = vk.period_ordinal(vkey::unix_now_ms());
+    match vk.admit(clock::now_ms(), ordinal) {
+        Ok(()) => Ok(()),
+        Err(VkDeny::RateLimited { .. }) => Err(GatewayError::new(
+            ErrorClass::RateLimited,
+            format!("virtual key `{}` rate limit exceeded", vk.def.name),
+        )),
+        Err(VkDeny::BudgetExhausted) => Err(GatewayError::new(
+            ErrorClass::InsufficientQuota,
+            format!(
+                "virtual key `{}` has exhausted its budget for this period",
+                vk.def.name
+            ),
+        )),
+    }
+}
+
+fn meter(response: Response, mut hook: UsageHook, dialect: Dialect, stream: bool) -> Response {
+    hook.provider = response
+        .headers()
+        .get("x-caret-provider")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    hook.model = response
+        .headers()
+        .get("x-caret-model")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_owned();
+    hook.attempts = response
+        .headers()
+        .get("x-caret-attempts")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(1);
+    hook.overhead_us = response
+        .headers()
+        .get("x-caret-overhead-us")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.parse().ok())
+        .unwrap_or_default();
+    hook.stream = stream;
+    usage::meter_response(response, hook, dialect)
+}
+
+/// Attribute a request that failed before (or instead of) serving a
+/// response body.
+fn record_failure(
+    state: &AppState,
+    vk: &Option<Arc<VkRuntime>>,
+    endpoint: &'static str,
+    requested: &str,
+    err: &GatewayError,
+    started: Instant,
+    headers: &HeaderMap,
+) {
+    let hook = build_hook(state, vk, endpoint, requested, headers, started);
+    let mut hook = hook;
+    hook.provider = err.provider.clone().unwrap_or_default();
+    hook.complete(err.class.http_status(), TokenUsage::default());
+}
+
+fn build_hook(
+    state: &AppState,
+    vk: &Option<Arc<VkRuntime>>,
+    endpoint: &'static str,
+    requested: &str,
+    headers: &HeaderMap,
+    started: Instant,
+) -> UsageHook {
+    UsageHook {
+        pipeline: state.usage.clone(),
+        vkey: vk.clone(),
+        pricing: state.pricing.load().as_ref().clone(),
+        events: Some(state.events.clone()),
+        // Stamped onto the request by the `request_id` middleware, so the
+        // usage record and the client's `x-request-id` are the same value.
+        request_id: headers
+            .get("x-request-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or_default()
+            .to_owned(),
+        endpoint,
+        requested: requested.to_owned(),
+        provider: String::new(),
+        model: String::new(),
+        stream: false,
+        attempts: 0,
+        started,
+        overhead_us: 0,
+        tag: headers
+            .get("x-caret-tag")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned),
+    }
+}
 
 /// Cap for buffered (non-streaming) translated response bodies.
 const MAX_TRANSLATED_RESPONSE: usize = 64 * 1024 * 1024;
@@ -33,6 +150,8 @@ const MAX_TRANSLATED_RESPONSE: usize = 64 * 1024 * 1024;
 pub enum Endpoint {
     Completions,
     Embeddings,
+    AudioSpeech,
+    ImagesGenerations,
 }
 
 impl Endpoint {
@@ -40,6 +159,17 @@ impl Endpoint {
         match self {
             Self::Completions => "/completions",
             Self::Embeddings => "/embeddings",
+            Self::AudioSpeech => "/audio/speech",
+            Self::ImagesGenerations => "/images/generations",
+        }
+    }
+
+    fn name(self) -> &'static str {
+        match self {
+            Self::Completions => "completions",
+            Self::Embeddings => "embeddings",
+            Self::AudioSpeech => "audio_speech",
+            Self::ImagesGenerations => "images_generations",
         }
     }
 }
@@ -217,12 +347,23 @@ pub async fn handle_chat(
     state: Arc<AppState>,
     inbound: InboundChat,
     headers: HeaderMap,
+    vk: Option<Arc<VkRuntime>>,
 ) -> Response {
     let started = Instant::now();
     let dialect = inbound.dialect();
-    match run_chat(&state, &inbound, &headers, started).await {
-        Ok(response) => response,
-        Err(err) => error_response_in(dialect, &err),
+    let requested = inbound.model().to_owned();
+    let stream = inbound.stream();
+    match run_chat(&state, &inbound, &headers, started, vk.as_deref()).await {
+        Ok(response) => meter(
+            response,
+            build_hook(&state, &vk, "chat", &requested, &headers, started),
+            dialect,
+            stream,
+        ),
+        Err(err) => {
+            record_failure(&state, &vk, "chat", &requested, &err, started, &headers);
+            error_response_in(dialect, &err)
+        }
     }
 }
 
@@ -231,9 +372,13 @@ async fn run_chat(
     inbound: &InboundChat,
     headers: &HeaderMap,
     started: Instant,
+    vk: Option<&VkRuntime>,
 ) -> Result<Response, GatewayError> {
     let table = state.table.load();
     let plan = table.plan(inbound.model())?;
+    if let Some(vk) = vk {
+        vk_gate(vk, inbound.model(), &plan)?;
+    }
     let in_dialect = inbound.dialect();
     let stream = inbound.stream();
 
@@ -382,7 +527,7 @@ struct TranslationCtx {
 async fn attempt(
     state: &AppState,
     route: &ResolvedRoute,
-    request: http::Request<Full<Bytes>>,
+    request: http::Request<Body>,
     breaker: &Breaker,
     permit: tokio::sync::OwnedSemaphorePermit,
     plan: &RoutePlan,
@@ -659,7 +804,7 @@ fn build_upstream_request(
     inbound: &HeaderMap,
     key: Option<&KeyRuntime>,
     body: Bytes,
-) -> Result<http::Request<Full<Bytes>>, GatewayError> {
+) -> Result<http::Request<Body>, GatewayError> {
     let base = route.provider.base_url.as_deref().ok_or_else(|| {
         GatewayError::new(
             ErrorClass::UpstreamError,
@@ -785,7 +930,7 @@ fn build_upstream_request(
         }
     }
 
-    builder.body(Full::new(body)).map_err(|e| {
+    builder.body(Body::from(body)).map_err(|e| {
         GatewayError::new(
             ErrorClass::UpstreamError,
             format!("bad upstream request: {e}"),
@@ -802,11 +947,31 @@ pub async fn handle_relay(
     endpoint: Endpoint,
     headers: HeaderMap,
     body: Bytes,
+    vk: Option<Arc<VkRuntime>>,
 ) -> Response {
     let started = Instant::now();
-    match run_relay(&state, endpoint, &headers, body, started).await {
-        Ok(response) => response,
-        Err(err) => error_response(&err),
+    let requested = json::probe(&body)
+        .map(|p| p.model)
+        .unwrap_or_else(|| "unknown".to_owned());
+    match run_relay(&state, endpoint, &headers, body, started, vk.as_deref()).await {
+        Ok(response) => meter(
+            response,
+            build_hook(&state, &vk, endpoint.name(), &requested, &headers, started),
+            Dialect::OpenAi,
+            false,
+        ),
+        Err(err) => {
+            record_failure(
+                &state,
+                &vk,
+                endpoint.name(),
+                &requested,
+                &err,
+                started,
+                &headers,
+            );
+            error_response(&err)
+        }
     }
 }
 
@@ -816,6 +981,7 @@ async fn run_relay(
     headers: &HeaderMap,
     body: Bytes,
     started: Instant,
+    vk: Option<&VkRuntime>,
 ) -> Result<Response, GatewayError> {
     let (model, span) = match json::probe(&body) {
         Some(probe) => (probe.model, Some(probe.model_span)),
@@ -836,6 +1002,9 @@ async fn run_relay(
 
     let table = state.table.load();
     let plan = table.plan(&model)?;
+    if let Some(vk) = vk {
+        vk_gate(vk, &model, &plan)?;
+    }
     let mut attempts = 0u32;
     let mut last_error: Option<GatewayError> = None;
 
@@ -905,6 +1074,308 @@ async fn run_relay(
     Err(last_error.unwrap_or_else(|| {
         GatewayError::new(ErrorClass::NoCapacity, "no route candidates available")
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Streaming media and file relays
+// ---------------------------------------------------------------------------
+
+const MULTIPART_ROUTE_PREFIX_CAP: usize = 1024 * 1024;
+
+/// Relay a multipart request without collecting the upload. For official
+/// SDKs, the small `model` form field is discovered in the multipart
+/// prefix. Callers can always provide `x-caret-model` explicitly.
+pub async fn handle_stream_relay(
+    state: Arc<AppState>,
+    path: &'static str,
+    endpoint: &'static str,
+    headers: HeaderMap,
+    body: Body,
+    vk: Option<Arc<VkRuntime>>,
+    needs_model: bool,
+) -> Response {
+    let started = Instant::now();
+    let model_header = headers
+        .get("x-caret-model")
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_owned);
+    let (model, body) = if needs_model && model_header.is_none() {
+        match read_multipart_model_prefix(body).await {
+            Ok(parts) => parts,
+            Err(err) => {
+                record_failure(&state, &vk, endpoint, "unknown", &err, started, &headers);
+                return error_response(&err);
+            }
+        }
+    } else {
+        (model_header.unwrap_or_default(), body)
+    };
+    let requested = if model.is_empty() {
+        headers
+            .get("x-caret-provider")
+            .and_then(|v| v.to_str().ok())
+            .map(|p| format!("{p}/*"))
+            .unwrap_or_else(|| "default/*".to_owned())
+    } else {
+        model.clone()
+    };
+    match run_stream_relay(
+        &state,
+        http::Method::POST,
+        path,
+        &headers,
+        body,
+        &model,
+        vk.as_deref(),
+    )
+    .await
+    {
+        Ok(response) => meter(
+            response,
+            build_hook(&state, &vk, endpoint, &requested, &headers, started),
+            Dialect::OpenAi,
+            false,
+        ),
+        Err(err) => {
+            record_failure(&state, &vk, endpoint, &requested, &err, started, &headers);
+            error_response(&err)
+        }
+    }
+}
+
+/// Relay a provider-scoped GET without a request body.
+pub async fn handle_provider_relay(
+    state: Arc<AppState>,
+    path: &str,
+    endpoint: &'static str,
+    headers: HeaderMap,
+    vk: Option<Arc<VkRuntime>>,
+) -> Response {
+    let started = Instant::now();
+    let provider = headers
+        .get("x-caret-provider")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default();
+    let requested = if provider.is_empty() {
+        "default/*".to_owned()
+    } else {
+        format!("{provider}/*")
+    };
+    match run_stream_relay(
+        &state,
+        http::Method::GET,
+        path,
+        &headers,
+        Body::empty(),
+        "",
+        vk.as_deref(),
+    )
+    .await
+    {
+        Ok(response) => meter(
+            response,
+            build_hook(&state, &vk, endpoint, &requested, &headers, started),
+            Dialect::OpenAi,
+            false,
+        ),
+        Err(err) => {
+            record_failure(&state, &vk, endpoint, &requested, &err, started, &headers);
+            error_response(&err)
+        }
+    }
+}
+
+async fn read_multipart_model_prefix(mut body: Body) -> Result<(String, Body), GatewayError> {
+    let mut chunks = Vec::<Bytes>::new();
+    let mut prefix = Vec::new();
+    loop {
+        match body.frame().await {
+            Some(Ok(frame)) => {
+                let Ok(data) = frame.into_data() else {
+                    continue;
+                };
+                prefix.extend_from_slice(&data);
+                chunks.push(data);
+                if let Some(model) = multipart_field(&prefix, "model") {
+                    let replay =
+                        futures_util::stream::iter(chunks.into_iter().map(Ok::<_, axum::Error>))
+                            .chain(body.into_data_stream());
+                    return Ok((model, Body::from_stream(replay)));
+                }
+                if prefix.len() > MULTIPART_ROUTE_PREFIX_CAP {
+                    return Err(GatewayError::new(
+                        ErrorClass::InvalidRequest,
+                        "multipart model was not found in the first 1 MiB; send x-caret-model",
+                    )
+                    .with_param("model"));
+                }
+            }
+            Some(Err(err)) => {
+                return Err(GatewayError::new(
+                    ErrorClass::InvalidRequest,
+                    format!("multipart upload failed while reading route metadata: {err}"),
+                ));
+            }
+            None => {
+                return Err(GatewayError::new(
+                    ErrorClass::InvalidRequest,
+                    "multipart request is missing the `model` field",
+                )
+                .with_param("model"));
+            }
+        }
+    }
+}
+
+fn multipart_field(prefix: &[u8], field: &str) -> Option<String> {
+    let needle = format!("name=\"{field}\"");
+    let pos = memchr::memmem::find(prefix, needle.as_bytes())?;
+    let rest = &prefix[pos + needle.len()..];
+    let start = memchr::memmem::find(rest, b"\r\n\r\n")? + 4;
+    let value = &rest[start..];
+    let end = memchr::memmem::find(value, b"\r\n")?;
+    let value = std::str::from_utf8(&value[..end]).ok()?.trim();
+    (!value.is_empty() && value.len() <= 512).then(|| value.to_owned())
+}
+
+async fn run_stream_relay(
+    state: &AppState,
+    method: http::Method,
+    path: &str,
+    headers: &HeaderMap,
+    body: Body,
+    model: &str,
+    vk: Option<&VkRuntime>,
+) -> Result<Response, GatewayError> {
+    let table = state.table.load();
+    let (provider, upstream_model) = if !model.is_empty() {
+        let plan = table.plan(model)?;
+        if let Some(vk) = vk {
+            vk_gate(vk, model, &plan)?;
+        }
+        let route = plan.targets.first().ok_or_else(|| {
+            GatewayError::new(ErrorClass::NotFound, "no media route candidates available")
+        })?;
+        if router_providers::wire_dialect(route.provider.kind) != Some(Dialect::OpenAi) {
+            return Err(GatewayError::new(
+                ErrorClass::InvalidRequest,
+                "this relay endpoint requires an OpenAI-compatible provider",
+            )
+            .with_provider(&route.provider.name));
+        }
+        (route.provider.clone(), route.upstream_model.clone())
+    } else {
+        let selected = headers
+            .get("x-caret-provider")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned);
+        let mut candidates = table
+            .providers()
+            .filter(|p| router_providers::wire_dialect(p.kind) == Some(Dialect::OpenAi))
+            .filter(|p| selected.as_ref().is_none_or(|name| p.name == *name));
+        let provider = candidates.next().cloned().ok_or_else(|| {
+            GatewayError::new(
+                ErrorClass::NotFound,
+                "no OpenAI-compatible provider available",
+            )
+        })?;
+        if selected.is_none() && candidates.next().is_some() {
+            return Err(GatewayError::new(
+                ErrorClass::InvalidRequest,
+                "multiple providers are available; send x-caret-provider",
+            ));
+        }
+        let scope = format!("{}/*", provider.name);
+        if let Some(vk) = vk {
+            if !vk.allows_model(&scope, Some(&scope)) {
+                return Err(GatewayError::new(
+                    ErrorClass::Permission,
+                    "virtual key does not allow this provider",
+                ));
+            }
+            vk.admit(clock::now_ms(), vk.period_ordinal(vkey::unix_now_ms()))
+                .map_err(|deny| {
+                    GatewayError::new(
+                        if deny == VkDeny::BudgetExhausted {
+                            ErrorClass::InsufficientQuota
+                        } else {
+                            ErrorClass::RateLimited
+                        },
+                        "virtual key limit exceeded",
+                    )
+                })?;
+        }
+        (provider, String::new())
+    };
+
+    let choice = provider
+        .admit_key(&upstream_model, clock::now_ms())
+        .ok_or_else(|| GatewayError::new(ErrorClass::NoCapacity, "no healthy provider key"))?;
+    let permit = provider
+        .semaphore
+        .clone()
+        .try_acquire_owned()
+        .map_err(|_| GatewayError::new(ErrorClass::NoCapacity, "provider at max concurrency"))?;
+    let base = provider
+        .base_url
+        .as_deref()
+        .ok_or_else(|| GatewayError::new(ErrorClass::UpstreamError, "provider has no base_url"))?;
+    let url = format!("{}{}", base.trim_end_matches('/'), path);
+    let mut builder = http::Request::builder().method(method).uri(url);
+    for name in [header::CONTENT_TYPE, header::ACCEPT] {
+        if let Some(value) = headers.get(&name) {
+            builder = builder.header(name, value);
+        }
+    }
+    if provider.auth == AuthMode::Key
+        && let Some(key) = choice.key
+    {
+        let mut auth = if provider.azure.is_some() {
+            HeaderValue::from_str(key.secret.expose()).map_err(|_| {
+                GatewayError::new(
+                    ErrorClass::UpstreamError,
+                    "provider key is not a valid header",
+                )
+            })?
+        } else {
+            HeaderValue::from_str(&format!("Bearer {}", key.secret.expose())).map_err(|_| {
+                GatewayError::new(
+                    ErrorClass::UpstreamError,
+                    "provider key is not a valid header",
+                )
+            })?
+        };
+        auth.set_sensitive(true);
+        builder = if provider.azure.is_some() {
+            builder.header("api-key", auth)
+        } else {
+            builder.header(header::AUTHORIZATION, auth)
+        };
+    }
+    let request = builder.body(body).map_err(|err| {
+        GatewayError::new(
+            ErrorClass::InvalidRequest,
+            format!("bad relay request: {err}"),
+        )
+    })?;
+    let response = state
+        .upstream
+        .send(&provider.name, request, provider.timeout)
+        .await?;
+    let mut response = forward_response(response, permit);
+    response.headers_mut().insert(
+        "x-caret-provider",
+        HeaderValue::from_str(&provider.name).expect("validated provider name"),
+    );
+    if !upstream_model.is_empty()
+        && let Ok(value) = HeaderValue::from_str(&upstream_model)
+    {
+        response.headers_mut().insert("x-caret-model", value);
+    }
+    response
+        .headers_mut()
+        .insert("x-caret-attempts", HeaderValue::from_static("1"));
+    Ok(response)
 }
 
 // ---------------------------------------------------------------------------
@@ -1044,11 +1515,41 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
 // The Responses API endpoint
 // ---------------------------------------------------------------------------
 
-pub async fn handle_responses(state: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+pub async fn handle_responses(
+    state: Arc<AppState>,
+    headers: HeaderMap,
+    body: Bytes,
+    vk: Option<Arc<VkRuntime>>,
+) -> Response {
     let started = Instant::now();
-    match run_responses(&state, &headers, body, started).await {
-        Ok(response) => response,
-        Err(err) => error_response_for(RenderTarget::Responses, &err),
+    let value = serde_json::from_slice::<Value>(&body).ok();
+    let requested = value
+        .as_ref()
+        .and_then(|v| v["model"].as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let stream = value
+        .as_ref()
+        .is_some_and(|v| v["stream"] == Value::Bool(true));
+    match run_responses(&state, &headers, body, started, vk.as_deref()).await {
+        Ok(response) => meter(
+            response,
+            build_hook(&state, &vk, "responses", &requested, &headers, started),
+            Dialect::OpenAi,
+            stream,
+        ),
+        Err(err) => {
+            record_failure(
+                &state,
+                &vk,
+                "responses",
+                &requested,
+                &err,
+                started,
+                &headers,
+            );
+            error_response_for(RenderTarget::Responses, &err)
+        }
     }
 }
 
@@ -1057,6 +1558,7 @@ async fn run_responses(
     headers: &HeaderMap,
     body: Bytes,
     started: Instant,
+    vk: Option<&VkRuntime>,
 ) -> Result<Response, GatewayError> {
     let value: Value = serde_json::from_slice(&body).map_err(|err| {
         GatewayError::new(
@@ -1076,6 +1578,9 @@ async fn run_responses(
 
     let table = state.table.load();
     let plan = table.plan(&model)?;
+    if let Some(vk) = vk {
+        vk_gate(vk, &model, &plan)?;
+    }
 
     // Parsed lazily, at most once, only when some target needs translation.
     let mut internal: Option<router_core::chat::ChatRequest> = None;
@@ -1214,6 +1719,7 @@ async fn run_responses(
 /// features work the day they ship. The gateway injects auth, meters the
 /// request, and forwards everything else untouched (single attempt, no
 /// retries, no translation).
+#[allow(clippy::too_many_arguments)] // these are the parts of the request
 pub async fn handle_passthrough(
     state: Arc<AppState>,
     provider_name: String,
@@ -1222,10 +1728,82 @@ pub async fn handle_passthrough(
     query: Option<String>,
     headers: HeaderMap,
     body: Bytes,
+    vk: Option<Arc<VkRuntime>>,
 ) -> Response {
+    let started = Instant::now();
+    let requested = format!("{provider_name}/*");
+    if let Some(key) = vk.as_deref() {
+        if !key.allows_model(&requested, Some(&requested)) {
+            let err = GatewayError::new(
+                ErrorClass::Permission,
+                format!(
+                    "virtual key `{}` does not allow provider passthrough",
+                    key.def.name
+                ),
+            );
+            record_failure(
+                &state,
+                &vk,
+                "passthrough",
+                &requested,
+                &err,
+                started,
+                &headers,
+            );
+            return error_response(&err);
+        }
+        if let Err(deny) = key.admit(clock::now_ms(), key.period_ordinal(vkey::unix_now_ms())) {
+            let class = if deny == VkDeny::BudgetExhausted {
+                ErrorClass::InsufficientQuota
+            } else {
+                ErrorClass::RateLimited
+            };
+            let err = GatewayError::new(class, "virtual key limit exceeded");
+            record_failure(
+                &state,
+                &vk,
+                "passthrough",
+                &requested,
+                &err,
+                started,
+                &headers,
+            );
+            return error_response(&err);
+        }
+    }
     match run_passthrough(&state, &provider_name, &rest, method, query, &headers, body).await {
-        Ok(response) => response,
-        Err(err) => error_response(&err),
+        Ok(response) => {
+            let dialect = state
+                .table
+                .load()
+                .providers()
+                .find(|p| p.name == provider_name)
+                .and_then(|p| router_providers::wire_dialect(p.kind))
+                .unwrap_or(Dialect::OpenAi);
+            let stream = response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .is_some_and(|v| v.contains("text/event-stream"));
+            meter(
+                response,
+                build_hook(&state, &vk, "passthrough", &requested, &headers, started),
+                dialect,
+                stream,
+            )
+        }
+        Err(err) => {
+            record_failure(
+                &state,
+                &vk,
+                "passthrough",
+                &requested,
+                &err,
+                started,
+                &headers,
+            );
+            error_response(&err)
+        }
     }
 }
 
@@ -1333,7 +1911,7 @@ async fn run_passthrough(
         }
     }
 
-    let request = builder.body(Full::new(body)).map_err(|e| {
+    let request = builder.body(Body::from(body)).map_err(|e| {
         GatewayError::new(
             ErrorClass::InvalidRequest,
             format!("bad passthrough request: {e}"),

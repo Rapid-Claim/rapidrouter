@@ -128,18 +128,23 @@ The console should look like a precision instrument: calm, dense, fast.
 ```
 console/
 ├── src/
-│   ├── routes/            # one directory per page (overview/, providers/, …)
-│   ├── components/        # tables, charts, forms, status primitives
-│   ├── lib/api.ts         # typed admin-API client (generated from the server's schema)
-│   ├── lib/events.ts      # SSE subscription + stores
-│   └── styles/tokens.css  # the design system
-├── e2e/                   # Playwright: every page against a seeded gateway
+│   ├── app.tsx            # shell, routing, SSE subscription, the pages
+│   ├── api.ts             # typed admin-API client
+│   ├── tokens.css         # the design system
+│   └── styles.css         # component styles built from the tokens
+├── tests/                 # Playwright: every page against a seeded gateway
+├── scripts/bundle-budget.mjs
 └── vite.config.ts
 ```
 
 CI builds the console, runs axe + bundle-budget + Playwright against a
 gateway with fixture data, and the release job embeds the output — the
-frontend has the same "measured, not asserted" bar as the hot path.
+frontend has the same "measured, not asserted" bar as the hot path. The
+accessibility gate runs every page in both themes at desktop and phone
+viewports, contrast rule included; the bundle gate compares total gzipped
+JS against the budget above. A Rust-only checkout still compiles: with no
+built bundle present, `/console` serves a placeholder telling you how to
+build one, and `--no-default-features` drops the route entirely.
 
 ## Security posture
 

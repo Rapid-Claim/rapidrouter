@@ -61,6 +61,7 @@ impl MockProvider {
             .route("/anything/{*rest}", axum::routing::any(record_anything))
             .route("/v1/messages", post(anthropic_messages))
             .route("/v1beta/models/{model_action}", post(gemini_generate))
+            .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
             .with_state(shared.clone());
 
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();

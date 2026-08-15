@@ -288,13 +288,29 @@ async fn cmd_soak(secs: u64, rps: u64, assert_growth_pct: u64) {
             histogram.value_at_quantile(0.99)
         );
     }
-    let end = *samples.last().unwrap();
-    let growth_pct = end.saturating_sub(baseline) * 100 / baseline.max(1);
-    println!("RSS growth: {growth_pct}% ({baseline} KB -> {end} KB)");
+    // RSS under load is a sawtooth: the allocator holds and releases
+    // arenas, so two instantaneous samples can differ by 2x with no leak
+    // whatsoever. "Flat memory" means the trailing steady state is no
+    // higher than the leading one, so compare medians of the first and
+    // last thirds rather than first-vs-last samples.
+    let third = (samples.len() / 3).max(1);
+    let early = median(&samples[..third]);
+    let late = median(&samples[samples.len() - third..]);
+    let peak = samples.iter().copied().max().unwrap_or(0);
+    let growth_pct = late.saturating_sub(early) * 100 / early.max(1);
+    println!(
+        "RSS: early-median {early} KB, late-median {late} KB, peak {peak} KB -> growth {growth_pct}%"
+    );
     if growth_pct > assert_growth_pct {
         eprintln!("ASSERT FAILED: RSS grew {growth_pct}% > {assert_growth_pct}%");
         std::process::exit(1);
     }
+}
+
+fn median(values: &[u64]) -> u64 {
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    sorted[sorted.len() / 2]
 }
 
 fn main() {

@@ -2,3 +2,10 @@
 **/*.rs.bk
 
 .env
+
+# Console build + tooling artifacts
+console/node_modules/
+console/dist/
+console/test-results/
+console/playwright-report/
+console/tsconfig.tsbuildinfo

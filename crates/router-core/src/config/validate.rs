@@ -32,6 +32,10 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
     let aliases = validate_aliases(&raw, &providers, &mut errors);
     let fallbacks = validate_fallbacks(&raw, &providers, &aliases, &mut errors);
     let reliability = validate_reliability(&raw, &mut errors);
+    let virtual_keys = validate_virtual_keys(&raw, &providers, &aliases, &mut errors);
+    let console = validate_console(&raw, env, &mut errors);
+    let usage = validate_usage(&raw, &mut errors);
+    let pricing = validate_pricing(&raw, &mut errors);
 
     if errors.is_empty() {
         Ok(Config {
@@ -40,6 +44,10 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
             aliases,
             fallbacks,
             reliability,
+            virtual_keys,
+            console,
+            usage,
+            pricing,
         })
     } else {
         Err(errors)
@@ -70,8 +78,216 @@ fn validate_server(
         port: s.port,
         max_body_size: s.max_body_size_mb * 1024 * 1024,
         auth_keys,
+        require_auth: s.require_auth,
         drain_timeout: Duration::from_secs(s.drain_timeout_secs),
     }
+}
+
+fn validate_virtual_keys(
+    raw: &RawConfig,
+    providers: &BTreeMap<String, Provider>,
+    aliases: &BTreeMap<String, TargetModel>,
+    errors: &mut Vec<ConfigError>,
+) -> Vec<crate::vkey::VirtualKeyDef> {
+    use crate::vkey;
+
+    let mut defs = Vec::new();
+    let mut seen_ids = BTreeSet::new();
+    for (i, rk) in raw.virtual_keys.iter().enumerate() {
+        let path = format!("virtual_keys[{i}]");
+        let before = errors.len();
+
+        if rk.name.is_empty() {
+            errors.push(ConfigError::new(
+                format!("{path}.name"),
+                "must not be empty",
+            ));
+        }
+        if rk.id.len() != 6 || !rk.id.bytes().all(|b| b.is_ascii_hexdigit()) {
+            errors.push(ConfigError::new(
+                format!("{path}.id"),
+                "must be 6 hex characters (the id segment of `ck-<id>-…`)",
+            ));
+        } else if !seen_ids.insert(rk.id.clone()) {
+            errors.push(ConfigError::new(
+                format!("{path}.id"),
+                format!("duplicate key id `{}`", rk.id),
+            ));
+        }
+        let hex = rk.secret_hash.strip_prefix("blake3:").unwrap_or("");
+        if hex.len() != 64 || !hex.bytes().all(|b| b.is_ascii_hexdigit()) {
+            errors.push(ConfigError::new(
+                format!("{path}.secret_hash"),
+                "must be `blake3:` followed by 64 hex characters \
+                 (create one with `caret-router key hash`)",
+            ));
+        }
+        for (j, scope) in rk.models.iter().enumerate() {
+            let scope_path = format!("{path}.models[{j}]");
+            if scope.is_empty() {
+                errors.push(ConfigError::new(scope_path, "must not be empty"));
+            } else if let Some((provider, _)) = scope.split_once('/') {
+                if !providers.contains_key(provider) {
+                    errors.push(ConfigError::new(
+                        scope_path,
+                        format!("unknown provider `{provider}`"),
+                    ));
+                }
+            } else if !aliases.contains_key(scope) {
+                errors.push(ConfigError::new(
+                    scope_path,
+                    format!("`{scope}` is not a configured alias (use `provider/model` to scope to a model)"),
+                ));
+            }
+        }
+        let budget = rk.budget.as_ref().and_then(|b| {
+            let period = match b.period.as_str() {
+                "daily" => Some(vkey::BudgetPeriod::Daily),
+                "weekly" => Some(vkey::BudgetPeriod::Weekly),
+                "monthly" => Some(vkey::BudgetPeriod::Monthly),
+                other => {
+                    errors.push(ConfigError::new(
+                        format!("{path}.budget.period"),
+                        format!("unknown period `{other}` (expected daily, weekly, or monthly)"),
+                    ));
+                    None
+                }
+            }?;
+            if !(b.usd.is_finite() && b.usd > 0.0) {
+                errors.push(ConfigError::new(
+                    format!("{path}.budget.usd"),
+                    "must be a positive number",
+                ));
+                return None;
+            }
+            Some(vkey::Budget { usd: b.usd, period })
+        });
+        let rate = rk.rate_limit.as_ref().map(|r| {
+            if r.rpm == Some(0) {
+                errors.push(ConfigError::new(
+                    format!("{path}.rate_limit.rpm"),
+                    "must be > 0",
+                ));
+            }
+            if r.tpm == Some(0) {
+                errors.push(ConfigError::new(
+                    format!("{path}.rate_limit.tpm"),
+                    "must be > 0",
+                ));
+            }
+            if r.rpm.is_none() && r.tpm.is_none() {
+                errors.push(ConfigError::new(
+                    format!("{path}.rate_limit"),
+                    "must set rpm and/or tpm",
+                ));
+            }
+            vkey::RateLimit {
+                rpm: r.rpm,
+                tpm: r.tpm,
+            }
+        });
+        let expires_ms = rk.expires.as_ref().and_then(|s| {
+            let parsed = vkey::parse_rfc3339_utc_ms(s);
+            if parsed.is_none() {
+                errors.push(ConfigError::new(
+                    format!("{path}.expires"),
+                    "must be RFC 3339 UTC, e.g. `2027-01-01T00:00:00Z`",
+                ));
+            }
+            parsed
+        });
+
+        if errors.len() == before {
+            defs.push(vkey::VirtualKeyDef {
+                id: rk.id.clone(),
+                name: rk.name.clone(),
+                secret_hash: rk.secret_hash.clone(),
+                prev_secret: None,
+                models: rk.models.clone(),
+                budget,
+                rate,
+                expires_ms,
+                tags: rk.tags.clone(),
+                enabled: rk.enabled,
+                created_ms: 0,
+            });
+        }
+    }
+    defs
+}
+
+fn validate_console(
+    raw: &RawConfig,
+    env: &dyn EnvSource,
+    errors: &mut Vec<ConfigError>,
+) -> super::ConsoleConfig {
+    let c = &raw.console;
+    let mut admin_keys = Vec::new();
+    for (i, value) in c.admin_keys.iter().enumerate() {
+        match resolve_secret(value, env) {
+            Ok(secret) => admin_keys.push(secret),
+            Err(msg) => errors.push(ConfigError::new(format!("console.admin_keys[{i}]"), msg)),
+        }
+    }
+    if !(60..=604_800).contains(&c.session_ttl_secs) {
+        errors.push(ConfigError::new(
+            "console.session_ttl_secs",
+            "must be between 60 (1 minute) and 604800 (7 days)",
+        ));
+    }
+    super::ConsoleConfig {
+        admin_keys,
+        session_ttl: Duration::from_secs(c.session_ttl_secs),
+    }
+}
+
+fn validate_usage(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> super::UsageConfig {
+    let u = &raw.usage;
+    if !(1..=3650).contains(&u.retention_days) {
+        errors.push(ConfigError::new(
+            "usage.retention_days",
+            "must be between 1 and 3650",
+        ));
+    }
+    if !(1..=300).contains(&u.flush_interval_secs) {
+        errors.push(ConfigError::new(
+            "usage.flush_interval_secs",
+            "must be between 1 and 300",
+        ));
+    }
+    super::UsageConfig {
+        retention_days: u.retention_days,
+        flush_interval: Duration::from_secs(u.flush_interval_secs),
+        per_key_metrics: u.per_key_metrics,
+    }
+}
+
+fn validate_pricing(
+    raw: &RawConfig,
+    errors: &mut Vec<ConfigError>,
+) -> BTreeMap<String, super::Price> {
+    let mut pricing = BTreeMap::new();
+    for (model, p) in &raw.pricing {
+        let ok = p.input_per_mtok.is_finite()
+            && p.input_per_mtok >= 0.0
+            && p.output_per_mtok.is_finite()
+            && p.output_per_mtok >= 0.0;
+        if !ok {
+            errors.push(ConfigError::new(
+                format!("pricing.{model}"),
+                "prices must be non-negative numbers (USD per million tokens)",
+            ));
+            continue;
+        }
+        pricing.insert(
+            model.clone(),
+            super::Price {
+                input_per_mtok: p.input_per_mtok,
+                output_per_mtok: p.output_per_mtok,
+            },
+        );
+    }
+    pricing
 }
 
 fn validate_providers(
@@ -587,8 +803,19 @@ fn resolve_secret(value: &str, env: &dyn EnvSource) -> Result<SecretString, Stri
             Some(_) => Err(format!("environment variable `{var}` is set but empty")),
             None => Err(format!("environment variable `{var}` is not set")),
         }
-    } else if value.strip_prefix("store.").is_some() {
-        Err("`store.*` secrets require managed mode, which is not available yet".into())
+    } else if let Some(name) = value.strip_prefix("store.") {
+        if name.is_empty() {
+            return Err("empty secret name after `store.`".into());
+        }
+        // Managed mode passes a source that also answers `store.<name>`
+        // lookups from the sealed secret store; a plain environment
+        // source answers None.
+        match env.get(value) {
+            Some(v) if !v.is_empty() => Ok(SecretString::new(v)),
+            _ => Err(format!(
+                "store secret `{name}` is not set (managed mode: `caret-router secret set {name}`)"
+            )),
+        }
     } else if value.is_empty() {
         Err("must not be empty".into())
     } else {

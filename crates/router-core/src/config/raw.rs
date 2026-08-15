@@ -14,6 +14,13 @@ pub struct RawConfig {
     pub aliases: BTreeMap<String, String>,
     pub fallbacks: BTreeMap<String, Vec<String>>,
     pub reliability: RawReliability,
+    /// File-mode virtual keys (hash form) — GitOps shops declare them
+    /// here; managed mode keeps them in the store instead.
+    pub virtual_keys: Vec<RawVirtualKey>,
+    pub console: RawConsole,
+    pub usage: RawUsage,
+    /// Price overrides per `provider/model` (USD per million tokens).
+    pub pricing: BTreeMap<String, RawPrice>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -23,6 +30,9 @@ pub struct RawServer {
     pub port: u16,
     pub max_body_size_mb: u64,
     pub auth_keys: Vec<String>,
+    /// Refuse anonymous data-plane requests even when `auth_keys` is
+    /// empty (the multi-tenant posture together with virtual keys).
+    pub require_auth: bool,
     pub drain_timeout_secs: u64,
 }
 
@@ -31,11 +41,98 @@ impl Default for RawServer {
         Self {
             host: "0.0.0.0".into(),
             port: 8080,
-            max_body_size_mb: 50,
+            max_body_size_mb: 100,
             auth_keys: Vec::new(),
+            require_auth: false,
             drain_timeout_secs: 30,
         }
     }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawVirtualKey {
+    pub name: String,
+    pub id: String,
+    /// `blake3:<hex>` — the file never carries secret material.
+    pub secret_hash: String,
+    #[serde(default)]
+    pub models: Vec<String>,
+    #[serde(default)]
+    pub budget: Option<RawBudget>,
+    #[serde(default)]
+    pub rate_limit: Option<RawRateLimit>,
+    /// RFC 3339 UTC, e.g. `2027-01-01T00:00:00Z`.
+    #[serde(default)]
+    pub expires: Option<String>,
+    #[serde(default)]
+    pub tags: BTreeMap<String, String>,
+    #[serde(default = "default_enabled")]
+    pub enabled: bool,
+}
+
+fn default_enabled() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawBudget {
+    pub usd: f64,
+    pub period: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawRateLimit {
+    #[serde(default)]
+    pub rpm: Option<u64>,
+    #[serde(default)]
+    pub tpm: Option<u64>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RawConsole {
+    /// Admin credentials; the console and `/admin/api/*` exist only when
+    /// at least one is configured.
+    pub admin_keys: Vec<String>,
+    pub session_ttl_secs: u64,
+}
+
+impl Default for RawConsole {
+    fn default() -> Self {
+        Self {
+            admin_keys: Vec::new(),
+            session_ttl_secs: 12 * 60 * 60,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RawUsage {
+    pub retention_days: u32,
+    pub flush_interval_secs: u64,
+    /// Emit bounded per-key metrics labels (`vkey=…`).
+    pub per_key_metrics: bool,
+}
+
+impl Default for RawUsage {
+    fn default() -> Self {
+        Self {
+            retention_days: 30,
+            flush_interval_secs: 10,
+            per_key_metrics: false,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawPrice {
+    pub input_per_mtok: f64,
+    pub output_per_mtok: f64,
 }
 
 #[derive(Debug, Deserialize)]

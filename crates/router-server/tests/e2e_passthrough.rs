@@ -444,12 +444,22 @@ keys = [{{ name = "k", value = "sk" }}]
     })
     .await;
     let huge = "x".repeat(2 * 1024 * 1024);
-    let res = chat(
-        &gw,
-        json!({"model": "openai/gpt-4o", "messages": [{"role": "user", "content": huge}]}),
-    )
-    .await;
-    assert_eq!(res.status(), 413);
+    let sent = client()
+        .post(format!("{}/v1/chat/completions", gw.url))
+        .json(&json!({"model": "openai/gpt-4o", "messages": [{"role": "user", "content": huge}]}))
+        .send()
+        .await;
+    // The gateway refuses the oversized body outright. Whether the client
+    // reads the 413 or has its in-flight write reset depends on how much
+    // of the body reached socket buffers before the refusal — both are
+    // the same refusal, and only "upstream accepted it" is a failure.
+    match sent {
+        Ok(res) => assert_eq!(res.status(), 413),
+        Err(err) => assert!(
+            err.is_request() || err.is_body(),
+            "expected a write-side refusal, got: {err}"
+        ),
+    }
 }
 
 #[tokio::test]

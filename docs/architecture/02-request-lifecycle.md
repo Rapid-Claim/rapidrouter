@@ -18,7 +18,7 @@ header.
 
 ### ① Accept
 hyper reads the request; the body arrives as ref-counted `Bytes`.
-Content-Length-bounded, `max_body_size` capped (default 50 MB — inline
+Content-Length-bounded, `max_body_size` capped (default 100 MB — inline
 base64 images and audio are normal traffic).
 
 ### ② Parse — lazily

@@ -4,10 +4,20 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+default = ["console"]
+## Embed the built web console (console/dist) into the binary.
+console = []
+
 [dependencies]
 router-core = { workspace = true }
 router-providers = { workspace = true }
+router-cluster = { workspace = true }
 bytes = { workspace = true }
+fastrand = "2"
+memchr = { workspace = true }
+rust-embed = { workspace = true }
+zstd = { workspace = true }
 futures-util = { workspace = true }
 http = { workspace = true }
 http-body = { workspace = true }
@@ -29,3 +39,4 @@ tracing = { workspace = true }
 tower = { workspace = true }
 mock-provider = { workspace = true }
 reqwest = { workspace = true }
+tempfile = "3"

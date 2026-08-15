@@ -4,8 +4,7 @@
 
 use std::time::Duration;
 
-use bytes::Bytes;
-use http_body_util::Full;
+use axum::body::Body;
 use hyper_util::client::legacy::Client;
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::rt::TokioExecutor;
@@ -14,7 +13,7 @@ use router_core::{ErrorClass, GatewayError};
 type Connector = hyper_rustls::HttpsConnector<HttpConnector>;
 
 pub struct UpstreamClient {
-    inner: Client<Connector, Full<Bytes>>,
+    inner: Client<Connector, Body>,
 }
 
 impl UpstreamClient {
@@ -43,7 +42,7 @@ impl UpstreamClient {
     pub async fn send(
         &self,
         provider: &str,
-        req: http::Request<Full<Bytes>>,
+        req: http::Request<Body>,
         timeout: Duration,
     ) -> Result<http::Response<hyper::body::Incoming>, GatewayError> {
         match tokio::time::timeout(timeout, self.inner.request(req)).await {
