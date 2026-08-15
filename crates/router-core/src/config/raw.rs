@@ -18,6 +18,7 @@ pub struct RawConfig {
     /// here; managed mode keeps them in the store instead.
     pub virtual_keys: Vec<RawVirtualKey>,
     pub console: RawConsole,
+    pub cluster: RawCluster,
     pub usage: RawUsage,
     /// Price overrides per `provider/model` (USD per million tokens).
     pub pricing: BTreeMap<String, RawPrice>,
@@ -107,6 +108,18 @@ impl Default for RawConsole {
             session_ttl_secs: 12 * 60 * 60,
         }
     }
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RawCluster {
+    /// Address the cluster port binds. Absent = single node, no cluster
+    /// port, no behavior change.
+    pub listen: Option<String>,
+    /// Any live subset of the cluster to join through; empty bootstraps.
+    pub join: Vec<String>,
+    /// `env.*` / `store.*` reference or literal join token.
+    pub token: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

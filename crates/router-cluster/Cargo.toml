@@ -5,18 +5,25 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+axum = { workspace = true, features = ["json"] }
 base64 = { workspace = true }
+blake3.workspace = true
 chacha20poly1305 = { workspace = true }
 crc32fast = { workspace = true }
 fastrand = "2"
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 router-core = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+subtle.workspace = true
 thiserror = { workspace = true }
+tokio = { workspace = true, features = ["net", "io-util", "time", "rt", "macros"] }
+tracing.workspace = true
 uuid = { workspace = true }
 
 [target.'cfg(unix)'.dependencies]
 libc = { workspace = true }
 
 [dev-dependencies]
+openraft = { version = "0.9", features = ["storage-v2", "serde"] }
 tempfile = "3"

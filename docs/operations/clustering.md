@@ -41,9 +41,12 @@ token = "env.CARET_CLUSTER_TOKEN"
 | `8080` | data plane + console (as ever) |
 | `9444` | cluster: Raft replication, join, peer scatter-gather APIs |
 
-All cluster traffic is mutually authenticated and encrypted; the join
-token both authorizes membership and pins the cluster identity. Keep 9444
-on your internal network.
+Every cluster RPC carries the join token, which both authorizes the peer
+and pins the cluster identity — a token from another fleet is refused with
+a message that says so rather than a bare 401. The token is a bearer
+credential: whoever holds it can join, so treat it like a password and
+keep 9444 on your internal network or behind a mesh that provides
+transport encryption. Cluster traffic is not itself TLS-encrypted today.
 
 ## What clustering gives you
 
@@ -57,6 +60,12 @@ on your internal network.
 - **Self-adjusting limits**: per-node rate-limit shares track the live
   member count automatically
   ([../architecture/06-state-and-storage.md](../architecture/06-state-and-storage.md)).
+  Liveness is measured by a half-second probe between peers, not by
+  membership, so a dead box's share returns to the fleet within about a
+  second and a half rather than waiting for an operator to remove it.
+- **Writes from any node**: a follower forwards a config or key change to
+  the leader and returns what was committed, so the console behaves the
+  same whichever node your load balancer picked.
 
 And what it deliberately does not do: cluster nodes do not proxy data-plane
 traffic for each other, and there is no built-in virtual IP — put your load
@@ -78,18 +87,30 @@ Every node keeps serving from its last applied state.
 |---|---|
 | Leader dies | Election in ~ms–s; data plane unaffected; writes retry transparently |
 | Minority partition | Minority nodes serve traffic on last state, reject config writes with a clear error; heal → catch up from log/snapshot |
-| Node disk lost | Rejoin with `--join`; store re-syncs by snapshot; only that node's local usage history is gone |
+| Node disk lost | Rejoin with `--join`. The node key went with the disk, so the box comes back under a new id; the cluster retires the old entry for that address automatically and streams the new node a snapshot. Only that node's local usage history is gone |
 | Whole cluster restart | Nodes recover from their WALs; no external dependency in the recovery path |
 | Rolling binary upgrade | Standard: drain (SIGTERM) one node at a time; store format is versioned with N−1 compatibility |
 
 ## Operating commands
 
 ```bash
-caret-router cluster status      # members, roles, lag, applied config version
-caret-router cluster token       # print/rotate join token
-caret-router cluster remove <id> # remove a dead node from membership
-caret-router config export       # replicated store → TOML on stdout
-caret-router secret set <name>   # prompt + seal + replicate a store.* secret
+caret-router cluster token          # print the join token (safe while running)
+caret-router cluster token --rotate # mint a new one; roll members one at a time
+caret-router cluster status         # local applied version and cluster id
+caret-router config export          # replicated store → TOML on stdout
+caret-router secret set <name>      # prompt + seal + replicate a store.* secret
+```
+
+Read-only commands (`cluster token`, `cluster status`, `config export`,
+`key ls`) work against a *running* node's data directory — you never have
+to stop the gateway to read its own configuration back out. Commands that
+change replicated state go through the running leader, so membership
+changes are done from the console's Cluster page or:
+
+```bash
+curl -X POST localhost:8080/admin/api/cluster/remove \
+  -H "authorization: Bearer $ADMIN_SESSION" \
+  -d '{"id": 12345678901234567890}'
 ```
 
 Everything above is also visible on the console's Cluster page — which is

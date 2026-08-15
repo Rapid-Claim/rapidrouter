@@ -52,6 +52,7 @@ pub struct Config {
     /// File-declared virtual keys; managed mode appends store-held keys.
     pub virtual_keys: Vec<crate::vkey::VirtualKeyDef>,
     pub console: ConsoleConfig,
+    pub cluster: ClusterConfig,
     pub usage: UsageConfig,
     /// Price overrides per `provider/model`, merged over the built-ins.
     pub pricing: BTreeMap<String, Price>,
@@ -77,6 +78,21 @@ impl ConsoleConfig {
     /// The console and admin API exist only when credentials do.
     pub fn enabled(&self) -> bool {
         !self.admin_keys.is_empty()
+    }
+}
+
+/// Cluster membership. `listen` absent means single node — the cluster
+/// port is never bound and nothing else changes.
+#[derive(Debug, Default, Clone)]
+pub struct ClusterConfig {
+    pub listen: Option<String>,
+    pub join: Vec<String>,
+    pub token: Option<SecretString>,
+}
+
+impl ClusterConfig {
+    pub fn enabled(&self) -> bool {
+        self.listen.is_some()
     }
 }
 

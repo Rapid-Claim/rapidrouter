@@ -27,6 +27,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage", get(usage))
         .route("/requests", get(requests))
         .route("/fleet", get(fleet))
+        .route("/cluster/token", get(cluster_token))
+        .route("/cluster/remove", post(cluster_remove))
         .route("/events", get(events))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -45,22 +47,44 @@ fn api_error(status: StatusCode, message: impl Into<String>) -> Response {
         .into_response()
 }
 
+/// Control-plane writes need a control plane: a store, or a cluster.
+/// Control-plane writes need a control plane, and file mode does not have
+/// one: the file your deploy tool distributes is the source of truth, so
+/// the console must not write over it.
 #[allow(clippy::result_large_err)] // the Err *is* the response we serve
-fn store_or_error(state: &AppState) -> Result<&router_cluster::Store, Response> {
+fn writable(state: &AppState) -> Result<(), Response> {
     if state.file_managed {
         return Err(api_error(
             StatusCode::FORBIDDEN,
             "file mode is read-only; edit the source file and reload",
         ));
     }
-    state.store.as_deref().ok_or_else(|| {
-        api_error(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "managed store is not configured",
-        )
-    })
+    if state.cluster.get().is_some() || state.store.is_some() {
+        return Ok(());
+    }
+    Err(api_error(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "managed store is not configured",
+    ))
 }
 
+/// Turn a commit failure into the operator-facing distinction that
+/// matters: a visible conflict, a quorum problem, or a real fault.
+fn commit_error(message: String) -> Response {
+    let lower = message.to_lowercase();
+    let status = if lower.contains("conflict") {
+        StatusCode::CONFLICT
+    } else if lower.contains("quorum") || lower.contains("leader") {
+        StatusCode::SERVICE_UNAVAILABLE
+    } else if lower.contains("read-only") {
+        StatusCode::FORBIDDEN
+    } else {
+        StatusCode::INTERNAL_SERVER_ERROR
+    };
+    api_error(status, message)
+}
+
+#[allow(dead_code)]
 fn map_store_error(err: StoreError) -> Response {
     match err {
         StoreError::CasConflict { expected, actual } => api_error(
@@ -152,12 +176,8 @@ async fn admin_auth(State(state): State<Arc<AppState>>, request: Request, next: 
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Response {
     let (text, version) = state
-        .store
-        .as_deref()
-        .map(|store| {
-            let (snapshot, version) = store.read();
-            (snapshot.config_text.unwrap_or_default(), version)
-        })
+        .store_read()
+        .map(|(snapshot, version)| (snapshot.config_text.unwrap_or_default(), version))
         .unwrap_or_default();
     Json(json!({
         "mode": if state.file_managed { "file" } else { "managed" },
@@ -178,13 +198,15 @@ async fn put_config(
     State(state): State<Arc<AppState>>,
     Json(input): Json<ConfigWrite>,
 ) -> Response {
-    let store = match store_or_error(&state) {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
+    if let Err(response) = writable(&state) {
+        return response;
+    }
     let env = |name: &str| {
         if let Some(secret) = name.strip_prefix("store.") {
-            store.resolve_secret(secret)
+            state
+                .store
+                .as_deref()
+                .and_then(|s| s.resolve_secret(secret))
         } else {
             std::env::var(name).ok()
         }
@@ -193,9 +215,12 @@ async fn put_config(
         Ok(config) => config,
         Err(err) => return api_error(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
     };
-    let version = match store.commit(Some(input.version), Command::PutConfig { text: input.text }) {
+    let version = match state
+        .commit(Some(input.version), Command::PutConfig { text: input.text })
+        .await
+    {
         Ok(version) => version,
-        Err(err) => return map_store_error(err),
+        Err(err) => return commit_error(err),
     };
     state.apply_config(config);
     Json(json!({ "version": version })).into_response()
@@ -250,10 +275,9 @@ async fn list_keys(State(state): State<Arc<AppState>>) -> Response {
 }
 
 async fn create_key(State(state): State<Arc<AppState>>, Json(input): Json<KeyInput>) -> Response {
-    let store = match store_or_error(&state) {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
+    if let Err(response) = writable(&state) {
+        return response;
+    }
     if input.name.trim().is_empty() {
         return api_error(StatusCode::UNPROCESSABLE_ENTITY, "name must not be empty");
     }
@@ -271,9 +295,12 @@ async fn create_key(State(state): State<Arc<AppState>>, Json(input): Json<KeyInp
         enabled: true,
         created_ms: vkey::unix_now_ms(),
     };
-    let version = match store.commit(None, Command::PutVirtualKey { def: def.clone() }) {
+    let version = match state
+        .commit(None, Command::PutVirtualKey { def: def.clone() })
+        .await
+    {
         Ok(version) => version,
-        Err(err) => return map_store_error(err),
+        Err(err) => return commit_error(err),
     };
     state.refresh_vkeys();
     Json(json!({
@@ -307,11 +334,12 @@ async fn update_key(
     Path(id): Path<String>,
     Json(input): Json<KeyUpdate>,
 ) -> Response {
-    let store = match store_or_error(&state) {
-        Ok(store) => store,
-        Err(response) => return response,
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let Some((snapshot, version)) = state.store_read() else {
+        return api_error(StatusCode::CONFLICT, "no control-plane store on this node");
     };
-    let (snapshot, version) = store.read();
     let Some(mut def) = snapshot.virtual_keys.get(&id).cloned() else {
         return api_error(StatusCode::NOT_FOUND, "virtual key not found");
     };
@@ -336,21 +364,24 @@ async fn update_key(
     if let Some(enabled) = input.enabled {
         def.enabled = enabled;
     }
-    let new_version = match store.commit(Some(version), Command::PutVirtualKey { def: def.clone() })
+    let new_version = match state
+        .commit(Some(version), Command::PutVirtualKey { def: def.clone() })
+        .await
     {
         Ok(version) => version,
-        Err(err) => return map_store_error(err),
+        Err(err) => return commit_error(err),
     };
     state.refresh_vkeys();
     Json(json!({ "version": new_version, "data": key_view(&def) })).into_response()
 }
 
 async fn rotate_key(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let store = match store_or_error(&state) {
-        Ok(store) => store,
-        Err(response) => return response,
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let Some((snapshot, version)) = state.store_read() else {
+        return api_error(StatusCode::CONFLICT, "no control-plane store on this node");
     };
-    let (snapshot, version) = store.read();
     let Some(mut def) = snapshot.virtual_keys.get(&id).cloned() else {
         return api_error(StatusCode::NOT_FOUND, "virtual key not found");
     };
@@ -360,10 +391,12 @@ async fn rotate_key(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
         valid_until_ms: vkey::unix_now_ms() + 24 * 60 * 60 * 1000,
     });
     def.secret_hash = vkey::hash_secret(&secret);
-    let new_version = match store.commit(Some(version), Command::PutVirtualKey { def: def.clone() })
+    let new_version = match state
+        .commit(Some(version), Command::PutVirtualKey { def: def.clone() })
+        .await
     {
         Ok(version) => version,
-        Err(err) => return map_store_error(err),
+        Err(err) => return commit_error(err),
     };
     state.refresh_vkeys();
     Json(json!({
@@ -375,14 +408,16 @@ async fn rotate_key(State(state): State<Arc<AppState>>, Path(id): Path<String>) 
 }
 
 async fn delete_key(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
-    let store = match store_or_error(&state) {
-        Ok(store) => store,
-        Err(response) => return response,
-    };
-    let version = store.version();
-    let new_version = match store.commit(Some(version), Command::DeleteVirtualKey { id }) {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let version = state.store_read().map(|(_, v)| v).unwrap_or(0);
+    let new_version = match state
+        .commit(Some(version), Command::DeleteVirtualKey { id })
+        .await
+    {
         Ok(version) => version,
-        Err(err) => return map_store_error(err),
+        Err(err) => return commit_error(err),
     };
     state.refresh_vkeys();
     Json(json!({ "version": new_version })).into_response()
@@ -451,15 +486,98 @@ async fn requests(
 }
 
 async fn fleet(State(state): State<Arc<AppState>>) -> Response {
+    let mode = if state.file_managed {
+        "file"
+    } else {
+        "managed"
+    };
+    let Some(cluster) = state.cluster.get() else {
+        // Single node: a cluster of one, described in the same shape so
+        // the console renders one code path.
+        let version = state.store_read().map(|(_, v)| v).unwrap_or(0);
+        return Json(json!({
+            "mode": mode,
+            "node": state.store.as_deref().map(|s| s.node_id()).unwrap_or("local"),
+            "version": version,
+            "role": "single",
+            "members": 1,
+            "live": 1,
+            "quorum": true,
+            "shares": state.live_nodes(),
+            "member_list": [],
+        }))
+        .into_response();
+    };
+
+    let fleet = cluster.fleet().await;
     Json(json!({
-        "mode": if state.file_managed { "file" } else { "managed" },
-        "node": state.store.as_deref().map(|s| s.node_id()).unwrap_or("local"),
-        "version": state.store.as_deref().map(|s| s.version()).unwrap_or(0),
-        "role": "single",
-        "members": 1,
-        "quorum": true,
+        "mode": mode,
+        "node": cluster.id.to_string(),
+        "version": fleet.applied,
+        "role": if fleet.leader == Some(cluster.id) { "leader" } else { "follower" },
+        "term": fleet.term,
+        "members": fleet.voters,
+        "live": fleet.live,
+        "quorum": fleet.quorum,
+        "shares": state.live_nodes(),
+        "leader": fleet.leader.map(|l| l.to_string()),
+        "member_list": fleet.members,
     }))
     .into_response()
+}
+
+/// The join token, for the console's Cluster page. Admin-only, and the
+/// page states plainly that it is a credential.
+async fn cluster_token(State(state): State<Arc<AppState>>) -> Response {
+    let Some(store) = state.store.as_deref() else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "this node has no store, so it cannot be part of a cluster",
+        );
+    };
+    match store.join_token() {
+        Ok(token) => Json(json!({
+            "token": token.encode(),
+            "cluster": token.cluster_id(),
+            "note": "Anyone holding this token can join the cluster.",
+        }))
+        .into_response(),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+#[derive(serde::Deserialize)]
+struct RemoveNode {
+    id: u64,
+}
+
+/// Remove a node that is never coming back. Membership is replicated, so
+/// this must run on the leader; a follower says where to go.
+async fn cluster_remove(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RemoveNode>,
+) -> Response {
+    let Some(cluster) = state.cluster.get() else {
+        return api_error(
+            StatusCode::CONFLICT,
+            "this node is not clustered — there is no membership to change",
+        );
+    };
+    match cluster.remove_voter(body.id).await {
+        Ok(()) => Json(json!({ "removed": body.id })).into_response(),
+        Err(router_cluster::raft::ClusterError::NotLeader { .. }) => {
+            let leader = cluster.leader_addr().await;
+            (
+                StatusCode::CONFLICT,
+                Json(json!({
+                    "error": { "message": "membership changes must go through the leader" },
+                    "leader": leader,
+                })),
+            )
+                .into_response()
+        }
+        Err(err) => api_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
+    }
 }
 
 async fn events(

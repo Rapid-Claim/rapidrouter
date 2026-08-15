@@ -88,4 +88,10 @@ export const api = {
   requests: (errors = false) =>
     request<{ data: UsageRecord[] }>(`/requests?limit=200&errors=${errors}`),
   fleet: () => request<any>("/fleet"),
+  clusterToken: () => request<{ token: string; cluster: string }>("/cluster/token"),
+  removeNode: (id: number | string) =>
+    request<{ removed: number }>("/cluster/remove", {
+      method: "POST",
+      body: JSON.stringify({ id: Number(id) }),
+    }),
 };

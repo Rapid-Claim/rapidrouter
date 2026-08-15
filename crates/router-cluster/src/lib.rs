@@ -18,8 +18,10 @@
 //!     └── snapshot.json   # last compacted state
 //! ```
 
+pub mod raft;
 mod seal;
-mod state;
+pub mod state;
+pub mod token;
 mod wal;
 
 use std::fs;
@@ -44,6 +46,10 @@ pub enum StoreError {
     Locked,
     #[error("secret unseal failed (wrong node key?)")]
     Unseal,
+    #[error(
+        "this data directory is open read-only (the gateway is running); writes must go through it"
+    )]
+    ReadOnly,
 }
 
 struct Inner {
@@ -60,7 +66,8 @@ pub struct Store {
     sealer: seal::Sealer,
     node_id: String,
     inner: Mutex<Inner>,
-    _lock: fs::File,
+    read_only: bool,
+    _lock: Option<fs::File>,
 }
 
 /// Snapshot every N commits; config writes are rare, so compaction mostly
@@ -68,12 +75,32 @@ pub struct Store {
 const SNAPSHOT_EVERY: u64 = 64;
 
 impl Store {
+    /// Open the store without taking the exclusive lock, for commands
+    /// that only read. This is what lets `cluster token`, `config
+    /// export`, and `key ls` work against a *running* node's data dir —
+    /// an operator should not have to stop the gateway to read its
+    /// configuration back out.
+    ///
+    /// Writes through a read-only handle are refused rather than racing
+    /// the running process.
+    pub fn open_read_only(data_dir: &Path) -> Result<Self, StoreError> {
+        Self::open_inner(data_dir, false)
+    }
+
     /// Open (creating if needed) the store in `data_dir`: acquire the
     /// process lock, load or mint the node key, then recover state from
     /// the latest snapshot plus the WAL tail.
     pub fn open(data_dir: &Path) -> Result<Self, StoreError> {
+        Self::open_inner(data_dir, true)
+    }
+
+    fn open_inner(data_dir: &Path, exclusive: bool) -> Result<Self, StoreError> {
         fs::create_dir_all(data_dir.join("raft"))?;
-        let lock = acquire_lock(&data_dir.join("LOCK"))?;
+        let lock = if exclusive {
+            Some(acquire_lock(&data_dir.join("LOCK"))?)
+        } else {
+            None
+        };
         let (sealer, node_id) = seal::Sealer::load_or_create(&data_dir.join("node.key"))?;
 
         let snapshot_path = data_dir.join("raft/snapshot.json");
@@ -110,12 +137,71 @@ impl Store {
                 wal,
                 commits_since_snapshot: replayed,
             }),
+            read_only: !exclusive,
             _lock: lock,
         })
     }
 
     pub fn node_id(&self) -> &str {
         &self.node_id
+    }
+
+    /// The Raft node id: a stable u64 derived from this node's identity,
+    /// so a box keeps its place in membership across restarts.
+    pub fn raft_node_id(&self) -> u64 {
+        let digest = blake3::hash(self.node_id.as_bytes());
+        u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("32-byte digest"))
+    }
+
+    /// The cluster's join credential, minted and persisted on first use so
+    /// every node of a cluster shares one.
+    pub fn join_token(&self) -> Result<crate::token::JoinToken, StoreError> {
+        {
+            let inner = self.inner.lock().unwrap();
+            if let (Some(cluster), Some(secret)) = (
+                inner.state.settings.get("cluster_id"),
+                inner.state.settings.get("cluster_secret"),
+            ) && let Some(token) = crate::token::JoinToken::from_parts(cluster.clone(), secret)
+            {
+                return Ok(token);
+            }
+        }
+        let token = crate::token::JoinToken::generate();
+        self.commit(
+            None,
+            Command::PutSetting {
+                name: "cluster_id".into(),
+                value: token.cluster_id().to_owned(),
+            },
+        )?;
+        self.commit(
+            None,
+            Command::PutSetting {
+                name: "cluster_secret".into(),
+                value: token.secret_b64(),
+            },
+        )?;
+        Ok(token)
+    }
+
+    /// Adopt a token an operator supplied, so a joining node authenticates
+    /// as a member of *their* cluster rather than minting its own.
+    pub fn adopt_join_token(&self, token: &crate::token::JoinToken) -> Result<(), StoreError> {
+        self.commit(
+            None,
+            Command::PutSetting {
+                name: "cluster_id".into(),
+                value: token.cluster_id().to_owned(),
+            },
+        )?;
+        self.commit(
+            None,
+            Command::PutSetting {
+                name: "cluster_secret".into(),
+                value: token.secret_b64(),
+            },
+        )?;
+        Ok(())
     }
 
     pub fn version(&self) -> u64 {
@@ -132,6 +218,9 @@ impl Store {
     /// Commit a command: CAS the version, append to the WAL (fsynced),
     /// apply. Returns the new version.
     pub fn commit(&self, expect: Option<u64>, command: Command) -> Result<u64, StoreError> {
+        if self.read_only {
+            return Err(StoreError::ReadOnly);
+        }
         let mut inner = self.inner.lock().unwrap();
         if let Some(expected) = expect
             && expected != inner.version

@@ -52,6 +52,9 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<String, u64>>,
     /// Config's source of truth is a file: admin writes are disabled.
     pub file_managed: bool,
+    /// The Raft member, when `[cluster]` is configured. Absent means a
+    /// single node, which is the default and changes nothing else.
+    pub cluster: std::sync::OnceLock<Arc<router_cluster::raft::ClusterNode>>,
     pub upstream: upstream::UpstreamClient,
     draining: AtomicBool,
     prometheus: PrometheusHandle,
@@ -105,6 +108,7 @@ impl AppState {
             events,
             sessions: Mutex::new(HashMap::new()),
             file_managed,
+            cluster: std::sync::OnceLock::new(),
             upstream: upstream::UpstreamClient::new(),
             draining: AtomicBool::new(false),
             prometheus: prometheus_handle().clone(),
@@ -132,10 +136,13 @@ impl AppState {
     /// snapshots they resolved against.
     pub fn apply_config(&self, config: Config) {
         let table = RoutingTable::from_config(&config);
-        let defs = Self::collect_vkey_defs(&config, self.store.as_deref());
+        let defs = self.collect_defs(&config);
         let prev = self.vkeys.load();
-        self.vkeys
-            .store(Arc::new(VkTable::build(&defs, Some(&prev))));
+        self.vkeys.store(Arc::new(VkTable::build_with_shares(
+            &defs,
+            Some(&prev),
+            self.live_nodes(),
+        )));
         self.pricing
             .store(Arc::new(usage::Pricing::from_config(&config)));
         self.table.store(Arc::new(table));
@@ -147,10 +154,99 @@ impl AppState {
     /// rotate, revoke) without touching routing.
     pub fn refresh_vkeys(&self) {
         let config = self.config.load();
-        let defs = Self::collect_vkey_defs(&config, self.store.as_deref());
+        let defs = self.collect_defs(&config);
         let prev = self.vkeys.load();
-        self.vkeys
-            .store(Arc::new(VkTable::build(&defs, Some(&prev))));
+        self.vkeys.store(Arc::new(VkTable::build_with_shares(
+            &defs,
+            Some(&prev),
+            self.live_nodes(),
+        )));
+    }
+
+    /// Key definitions from the config plus whichever control plane is
+    /// authoritative — the replicated state when clustered, the local
+    /// store otherwise.
+    fn collect_defs(&self, config: &Config) -> Vec<VirtualKeyDef> {
+        let mut by_id: std::collections::BTreeMap<String, VirtualKeyDef> = config
+            .virtual_keys
+            .iter()
+            .map(|d| (d.id.clone(), d.clone()))
+            .collect();
+        if let Some((state, _)) = self.store_read() {
+            for def in state.virtual_key_defs() {
+                by_id.insert(def.id.clone(), def);
+            }
+        }
+        by_id.into_values().collect()
+    }
+
+    /// Keep per-node limit shares tracking the live member count. Cheap
+    /// enough to poll: it reads one atomic-ish metric and only rebuilds
+    /// the key table when the count actually moves.
+    pub fn spawn_share_tracker(self: &Arc<Self>) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut last = state.live_nodes();
+            loop {
+                tokio::time::sleep(Duration::from_millis(500)).await;
+                let now = state.live_nodes();
+                if now != last {
+                    last = now;
+                    state.refresh_vkeys();
+                    tracing::info!(live_nodes = now, "rate-limit shares rescaled");
+                    let _ = state
+                        .events
+                        .send(json!({ "type": "membership_changed", "live": now }));
+                }
+            }
+        });
+    }
+
+    /// Attach the cluster member once it has started.
+    pub fn attach_cluster(&self, node: Arc<router_cluster::raft::ClusterNode>) {
+        let _ = self.cluster.set(node);
+    }
+
+    /// How many gateway nodes are alive. Rate limits divide by this, so a
+    /// key's `rpm` tracks the fleet without anyone editing configs.
+    pub fn live_nodes(&self) -> usize {
+        self.cluster
+            .get()
+            .map(|c| c.live_members())
+            .unwrap_or(1)
+            .max(1)
+    }
+
+    /// Commit a control-plane change: through consensus when clustered,
+    /// straight to the local store when not.
+    pub async fn commit(
+        &self,
+        expect: Option<u64>,
+        command: router_cluster::Command,
+    ) -> Result<u64, String> {
+        if let Some(cluster) = self.cluster.get() {
+            // Raft owns ordering; the CAS check happens against the
+            // applied version we just read.
+            if let Some(expected) = expect {
+                let (_, current) = cluster.read();
+                if expected != current {
+                    return Err(format!(
+                        "version conflict: expected {expected}, store is at {current}"
+                    ));
+                }
+            }
+            return cluster.commit(command).await.map_err(|e| e.to_string());
+        }
+        let store = self.store.as_deref().ok_or("no store configured")?;
+        store.commit(expect, command).map_err(|e| e.to_string())
+    }
+
+    /// The current control-plane document and the version it reflects.
+    pub fn store_read(&self) -> Option<(router_cluster::StoreState, u64)> {
+        if let Some(cluster) = self.cluster.get() {
+            return Some(cluster.read());
+        }
+        self.store.as_deref().map(|s| s.read())
     }
 
     pub fn set_draining(&self) {

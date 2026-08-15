@@ -27,6 +27,23 @@ jobs:
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
 
+  cluster:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: openraft storage conformance suite
+        run: cargo test -p router-cluster --test raft_storage --release
+      - name: Multi-node behavior (leader kill, minority, rejoin, shares)
+        run: cargo test -p router-cluster --test cluster --release
+      - name: Linearizability and chaos
+        run: cargo test -p router-cluster --test chaos --release
+      # Consensus tests are timing-sensitive; a flake here is a real
+      # signal, so run them twice rather than retrying on failure.
+      - name: Repeat, to catch timing flakes
+        run: cargo test -p router-cluster --release
+
   loom:
     runs-on: ubuntu-latest
     steps:

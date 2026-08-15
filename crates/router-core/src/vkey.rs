@@ -221,10 +221,12 @@ pub struct VkRuntime {
     pub rpm: Option<TokenBucket>,
     pub tpm: Option<TokenBucket>,
     pub spend: Arc<SpendState>,
+    /// Live member count this key's buckets were sized for.
+    shares: u64,
 }
 
 impl VkRuntime {
-    fn new(def: VirtualKeyDef, prev_rt: Option<&VkRuntime>) -> Self {
+    fn new(def: VirtualKeyDef, prev_rt: Option<&VkRuntime>, shares: usize) -> Self {
         let hash = decode_hash(&def.secret_hash);
         let prev = def
             .prev_secret
@@ -233,12 +235,22 @@ impl VkRuntime {
         let rate = def.rate.unwrap_or_default();
         // Buckets carry over only while their limits are unchanged; spend
         // always carries over.
-        let reuse_buckets = prev_rt.is_some_and(|p| p.def.rate == def.rate);
+        // A key's limit is fleet-wide; each node enforces its share of it,
+        // so the denominator is the live member count. One node means one
+        // share, which is the single-box case unchanged.
+        let shares = shares.max(1) as u64;
+        let share = |limit: Option<u64>| limit.map(|l| (l / shares).max(1));
+        let (share_rpm, share_tpm) = (share(rate.rpm), share(rate.tpm));
+
+        let reuse_buckets = prev_rt.is_some_and(|p| p.def.rate == def.rate && p.shares == shares);
         let (rpm, tpm) = if reuse_buckets {
             let p = prev_rt.unwrap();
-            (take_bucket(&p.rpm, rate.rpm), take_bucket(&p.tpm, rate.tpm))
+            (
+                take_bucket(&p.rpm, share_rpm),
+                take_bucket(&p.tpm, share_tpm),
+            )
         } else {
-            (new_bucket(rate.rpm), new_bucket(rate.tpm))
+            (new_bucket(share_rpm), new_bucket(share_tpm))
         };
         let spend = prev_rt
             .map(|p| p.spend.clone())
@@ -250,6 +262,7 @@ impl VkRuntime {
             rpm,
             tpm,
             spend,
+            shares,
         }
     }
 
@@ -289,7 +302,7 @@ impl VkRuntime {
         if let Some(rpm) = &self.rpm
             && !rpm.try_consume(1, mono_ms)
         {
-            let per_min = self.def.rate.and_then(|r| r.rpm).unwrap_or(60).max(1);
+            let per_min = (self.def.rate.and_then(|r| r.rpm).unwrap_or(60) / self.shares).max(1);
             return Err(VkDeny::RateLimited {
                 retry_after_secs: (60 / per_min).clamp(1, 60),
             });
@@ -432,24 +445,52 @@ fn civil_from_days(z: i64) -> (i64, u32, u32) {
 }
 
 /// The immutable lookup table swapped in whole on every config/store apply.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct VkTable {
     by_id: HashMap<String, Arc<VkRuntime>>,
+    shares: usize,
+}
+
+impl Default for VkTable {
+    fn default() -> Self {
+        Self {
+            by_id: HashMap::new(),
+            shares: 1,
+        }
+    }
 }
 
 impl VkTable {
-    /// Build a table, carrying enforcement state (buckets, spend) over from
-    /// the previous table by key id.
+    /// Build a table for a single node.
     pub fn build(defs: &[VirtualKeyDef], prev: Option<&VkTable>) -> Self {
+        Self::build_with_shares(defs, prev, 1)
+    }
+
+    /// Build a table, carrying enforcement state (buckets, spend) over from
+    /// the previous table by key id, with each rate limit divided across
+    /// `shares` live nodes.
+    pub fn build_with_shares(
+        defs: &[VirtualKeyDef],
+        prev: Option<&VkTable>,
+        shares: usize,
+    ) -> Self {
         let mut by_id = HashMap::with_capacity(defs.len());
         for def in defs {
             let prev_rt = prev.and_then(|t| t.by_id.get(&def.id)).map(Arc::as_ref);
             by_id.insert(
                 def.id.clone(),
-                Arc::new(VkRuntime::new(def.clone(), prev_rt)),
+                Arc::new(VkRuntime::new(def.clone(), prev_rt, shares)),
             );
         }
-        Self { by_id }
+        Self {
+            by_id,
+            shares: shares.max(1),
+        }
+    }
+
+    /// The live member count these buckets are sized for.
+    pub fn shares(&self) -> usize {
+        self.shares
     }
 
     pub fn is_empty(&self) -> bool {
@@ -595,12 +636,12 @@ mod tests {
     fn scope_matches_requested_or_resolved() {
         let mut d = def("abc123", "s");
         d.models = vec!["fast".into(), "openai/gpt-4o-mini".into()];
-        let rt = VkRuntime::new(d, None);
+        let rt = VkRuntime::new(d, None, 1);
         assert!(rt.allows_model("fast", Some("anthropic/claude-haiku-4-5")));
         assert!(rt.allows_model("gpt-4o-mini", Some("openai/gpt-4o-mini")));
         assert!(!rt.allows_model("gpt-4.1", Some("openai/gpt-4.1")));
 
-        let unscoped = VkRuntime::new(def("dddddd", "s"), None);
+        let unscoped = VkRuntime::new(def("dddddd", "s"), None, 1);
         assert!(unscoped.allows_model("anything", None));
     }
 
@@ -615,7 +656,7 @@ mod tests {
             usd: 1.0,
             period: BudgetPeriod::Monthly,
         });
-        let rt = VkRuntime::new(d, None);
+        let rt = VkRuntime::new(d, None, 1);
         assert!(rt.admit(0, 0).is_ok());
         assert!(rt.admit(0, 0).is_ok());
         assert!(matches!(rt.admit(0, 0), Err(VkDeny::RateLimited { .. })));
@@ -656,7 +697,7 @@ mod tests {
             rpm: None,
             tpm: Some(1_000),
         });
-        let rt = VkRuntime::new(d, None);
+        let rt = VkRuntime::new(d, None, 1);
         assert!(rt.admit(0, 0).is_ok());
         rt.debit_usage(5_000, 0, 0, 0); // response was huge; drain the bucket
         assert!(matches!(rt.admit(1, 0), Err(VkDeny::RateLimited { .. })));

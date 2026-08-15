@@ -350,7 +350,88 @@ function Playground() {
 
 function Cluster(props: { refresh: () => number }) {
   const [fleet] = createResource(props.refresh, api.fleet);
-  return <div class="stack-lg"><section class="summary-strip"><Metric label="Members" value={String(fleet()?.members ?? 1)} /><Metric label="Role" value={fleet()?.role ?? "single"} /><Metric label="Applied version" value={String(fleet()?.version ?? 0)} /><Metric label="Quorum" value={fleet()?.quorum ? "Available" : "Unavailable"} tone={fleet()?.quorum ? "default" : "danger"} /></section><section class="panel"><SectionTitle title="Fleet members" subtitle="Phase eight expands this view when peers join" /><div class="member-row"><span class="node-icon"><Server size={18} /></span><div><strong>{fleet()?.node ?? "local"}</strong><small>Current node</small></div><Status text="Healthy" tone="success" /><span class="mono">v{fleet()?.version ?? 0}</span></div></section></div>;
+  const [token, setToken] = createSignal("");
+  const [error, setError] = createSignal("");
+  const members = createMemo(() => fleet()?.member_list ?? []);
+  const clustered = createMemo(() => members().length > 0);
+  return <div class="stack-lg">
+    <section class="summary-strip" aria-label="Cluster summary">
+      <Metric label="Live members" value={String(fleet()?.live ?? 1)} />
+      <Metric label="Voters" value={String(fleet()?.members ?? 1)} />
+      <Metric label="Applied version" value={String(fleet()?.version ?? 0)} />
+      <Metric label="Quorum" value={fleet()?.quorum ? "Available" : "Lost"} tone={fleet()?.quorum ? "default" : "danger"} />
+    </section>
+
+    <Show when={fleet() && !fleet()!.quorum}>
+      <div class="notice" role="status">
+        This node cannot reach a quorum. It keeps serving traffic from the configuration it
+        last applied, and refuses configuration changes until enough members are back.
+      </div>
+    </Show>
+
+    <Show when={fleet() && fleet()!.live < fleet()!.members}>
+      <div class="notice" role="status">
+        {fleet()!.members - fleet()!.live} of {fleet()!.members} members are not responding.
+        Rate-limit shares have been redistributed across the {fleet()!.live} that are.
+        A member that is never coming back should be removed.
+      </div>
+    </Show>
+
+    <section class="panel">
+      <SectionTitle
+        title="Fleet members"
+        subtitle={clustered()
+          ? "Every node serves this page; the view is the same from any of them"
+          : "Single node — a cluster of one. Add a node to form a cluster."}
+      />
+      <Show when={clustered()} fallback={<Empty title="No peers" action="Start another node with --join <this-host>:9444 and the cluster token." />}>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+          <table>
+            <thead><tr><th>Node</th><th>Address</th><th>Role</th><th>Applied</th><th>Lag</th><th /></tr></thead>
+            <tbody>
+              <For each={members()}>{(member: any) => <tr>
+                <td><strong>{String(member.id).slice(0, 10)}…</strong><small>{member.is_self ? "this node" : member.voter ? "voter" : "learner"}</small></td>
+                <td class="mono">{member.addr}</td>
+                <td><Status text={member.leader ? "Leader" : "Follower"} tone={member.leader ? "success" : "muted"} /></td>
+                <td>{member.applied ?? "—"}</td>
+                <td>{member.lag === null || member.lag === undefined ? "—" : String(member.lag)}</td>
+                <td class="actions">
+                  <Show when={!member.is_self}>
+                    <button class="icon-button danger" title={"Remove " + member.id} aria-label={"Remove node " + member.id}
+                      onClick={async () => {
+                        if (!confirm("Remove node " + member.id + " from membership?\n\nDo this only for a node that is never coming back. The remaining members must still form a quorum.")) return;
+                        setError("");
+                        try { await api.removeNode(member.id); }
+                        catch (err) { setError(err instanceof Error ? err.message : "Remove failed"); }
+                      }}><Trash2 size={16} /></button>
+                  </Show>
+                </td>
+              </tr>}</For>
+            </tbody>
+          </table>
+        </div>
+      </Show>
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+    </section>
+
+    <section class="panel">
+      <SectionTitle
+        title="Adding a node"
+        subtitle="Same binary, one command — the join streams a snapshot and starts serving"
+        action={<button class="button" onClick={async () => {
+          setError("");
+          try { setToken((await api.clusterToken()).token); }
+          catch (err) { setError(err instanceof Error ? err.message : "Could not read the token"); }
+        }}><KeyRound size={16} />Show join token</button>}
+      />
+      <Show when={token()} fallback={<p class="muted">The join token is a credential: anyone holding it can join this cluster. It is shown only when you ask for it.</p>}>
+        <div class="secret-banner">
+          <div><strong>Join token</strong><code>{token()}</code></div>
+          <button class="icon-button" title="Copy" aria-label="Copy join token" onClick={() => navigator.clipboard?.writeText(token())}><Copy size={16} /></button>
+        </div>
+      </Show>
+    </section>
+  </div>;
 }
 
 function Settings(props: { refresh: () => number }) {

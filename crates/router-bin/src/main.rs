@@ -28,6 +28,18 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
+    /// Bind the cluster port (Raft, join, peer APIs), e.g. 0.0.0.0:9444.
+    #[arg(long, global = true)]
+    cluster_listen: Option<String>,
+
+    /// Join through any live subset of an existing cluster.
+    #[arg(long = "join", global = true)]
+    cluster_join: Vec<String>,
+
+    /// The cluster's join token, or an `env.*` reference to it.
+    #[arg(long, global = true)]
+    cluster_token: Option<String>,
+
     /// Managed mode permits console writes; file mode is read-only.
     #[arg(long, global = true, value_enum, default_value = "managed")]
     mode: Mode,
@@ -63,6 +75,26 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
+    /// Inspect and manage cluster membership.
+    Cluster {
+        #[command(subcommand)]
+        command: ClusterCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum ClusterCommand {
+    /// Print this cluster's join token. Treat it as a secret.
+    Token {
+        /// Mint a new token. Existing members keep working only once they
+        /// are restarted with it, so roll one node at a time.
+        #[arg(long)]
+        rotate: bool,
+    },
+    /// Members, roles, applied version, and lag.
+    Status,
+    /// Remove a node that is never coming back.
+    Remove { id: String },
 }
 
 #[derive(Subcommand)]
@@ -137,6 +169,7 @@ fn main() -> ExitCode {
         Some(Command::Config { command }) => config_command(&cli, command),
         Some(Command::Secret { command }) => secret_command(&cli, command),
         Some(Command::Key { command }) => key_command(&cli, command),
+        Some(Command::Cluster { command }) => cluster_command(&cli, command),
         None => run(cli),
     }
 }
@@ -172,8 +205,24 @@ fn open_store(cli: &Cli) -> Result<Store, ExitCode> {
     Store::open(&data_dir(cli)).map_err(fail)
 }
 
+/// For commands that only read. Falls back to a read-only handle when the
+/// gateway holds the lock, so an operator never has to stop the service to
+/// look at its own configuration.
+fn open_store_for_reading(cli: &Cli) -> Result<Store, ExitCode> {
+    let dir = data_dir(cli);
+    match Store::open(&dir) {
+        Ok(store) => Ok(store),
+        Err(router_cluster::StoreError::Locked) => Store::open_read_only(&dir).map_err(fail),
+        Err(err) => Err(fail(err)),
+    }
+}
+
 fn config_command(cli: &Cli, command: &ConfigCommand) -> ExitCode {
-    let store = match open_store(cli) {
+    let store = match if matches!(command, ConfigCommand::Export) {
+        open_store_for_reading(cli)
+    } else {
+        open_store(cli)
+    } {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -292,7 +341,11 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
         return ExitCode::SUCCESS;
     }
 
-    let store = match open_store(cli) {
+    let store = match if matches!(command, KeyCommand::Ls) {
+        open_store_for_reading(cli)
+    } else {
+        open_store(cli)
+    } {
         Ok(store) => store,
         Err(code) => return code,
     };
@@ -500,6 +553,202 @@ fn parse_budget(spec: &str) -> Result<router_core::vkey::Budget, String> {
     Ok(Budget { usd, period })
 }
 
+fn cluster_command(cli: &Cli, command: &ClusterCommand) -> ExitCode {
+    let needs_write = matches!(command, ClusterCommand::Token { rotate: true });
+    let store = match if needs_write {
+        open_store(cli)
+    } else {
+        open_store_for_reading(cli)
+    } {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    match command {
+        ClusterCommand::Token { rotate } => {
+            if *rotate {
+                let fresh = router_cluster::token::JoinToken::generate();
+                if let Err(err) = store.adopt_join_token(&fresh) {
+                    return fail(err);
+                }
+                println!("{}", fresh.encode());
+                eprintln!(
+                    "Rotated. Restart each member with the new token, one at a time — \
+                     a node still holding the old one cannot be reached by the others."
+                );
+                return ExitCode::SUCCESS;
+            }
+            match store.join_token() {
+                Ok(token) => {
+                    println!("{}", token.encode());
+                    eprintln!(
+                        "This token is a credential: anyone holding it can join the cluster."
+                    );
+                    ExitCode::SUCCESS
+                }
+                Err(err) => fail(err),
+            }
+        }
+        // Status and remove need a running cluster, which holds the data
+        // dir's lock — so they go over the admin API of the local node
+        // rather than opening the store a second time.
+        ClusterCommand::Status => {
+            eprintln!(
+                "Cluster status is served by the running node: \
+                 curl -s localhost:8080/admin/api/fleet (admin key required), \
+                 or open the console's Cluster page."
+            );
+            let (state, version) = store.read();
+            println!("Local applied version: {version}");
+            println!(
+                "Cluster id: {}",
+                state
+                    .settings
+                    .get("cluster_id")
+                    .map(String::as_str)
+                    .unwrap_or("(single node — no cluster configured)")
+            );
+            ExitCode::SUCCESS
+        }
+        ClusterCommand::Remove { id } => {
+            eprintln!(
+                "Removing a member changes replicated membership, so it must go through \
+                 the running leader: POST /admin/api/cluster/remove {{\"id\": {id}}}."
+            );
+            ExitCode::FAILURE
+        }
+    }
+}
+
+/// Bring up the cluster port and join or bootstrap, if configured.
+/// Returns whether this node is clustered. CLI flags win over the config
+/// file, so an operator can cluster a file-managed deployment without
+/// editing the file their deploy tool owns.
+async fn start_cluster(
+    cli: &Cli,
+    state: &Arc<AppState>,
+    store: &Arc<Store>,
+    data_dir: &Path,
+) -> Result<bool, String> {
+    use router_cluster::raft::ClusterNode;
+    use router_cluster::raft::server::{self as cluster_server, JoinRequest};
+    use router_cluster::token::JoinToken;
+
+    let config = state.config.load();
+    let listen = cli
+        .cluster_listen
+        .clone()
+        .or_else(|| config.cluster.listen.clone());
+    let Some(listen) = listen else {
+        return Ok(false); // single node: nothing to bind, nothing to change
+    };
+    let seeds: Vec<String> = if cli.cluster_join.is_empty() {
+        config.cluster.join.clone()
+    } else {
+        cli.cluster_join.clone()
+    };
+
+    // A supplied token means "join their cluster"; none means "be one".
+    let supplied = match cli.cluster_token.as_deref() {
+        Some(value) => Some(resolve_token_arg(value)?),
+        None => config.cluster.token.as_ref().map(|s| s.expose().to_owned()),
+    };
+    let token = match supplied {
+        Some(text) => {
+            let token = JoinToken::parse(&text)
+                .ok_or_else(|| format!("`{text}` is not a caret join token"))?;
+            store.adopt_join_token(&token).map_err(|e| e.to_string())?;
+            token
+        }
+        None => store.join_token().map_err(|e| e.to_string())?,
+    };
+
+    let listener = tokio::net::TcpListener::bind(&listen)
+        .await
+        .map_err(|e| format!("failed to bind cluster port {listen}: {e}"))?;
+    let bound = listener
+        .local_addr()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|_| listen.clone());
+    // Peers dial the advertised address, which must be routable — a
+    // wildcard bind is not.
+    let advertised = advertised_addr(&listen, &bound);
+
+    let node = ClusterNode::start(
+        store.raft_node_id(),
+        advertised.clone(),
+        data_dir,
+        token.clone(),
+    )
+    .await
+    .map_err(|e| format!("cluster start failed: {e}"))?;
+
+    let serving = node.clone();
+    tokio::spawn(async move {
+        let _ = cluster_server::serve(listener, serving, shutdown_signal()).await;
+    });
+
+    if seeds.is_empty() {
+        node.bootstrap()
+            .await
+            .map_err(|e| format!("cluster bootstrap failed: {e}"))?;
+        tracing::info!(cluster = token.cluster_id(), addr = %advertised, "bootstrapped a cluster of one");
+    } else {
+        let me = JoinRequest {
+            node_id: node.id,
+            addr: advertised.clone(),
+        };
+        let response = cluster_server::request_join(&token, &seeds, me).await?;
+        tracing::info!(
+            cluster = response.cluster,
+            members = response.members,
+            "joined cluster"
+        );
+    }
+
+    state.attach_cluster(node.clone());
+    node.spawn_liveness_probe();
+    state.refresh_vkeys();
+    Ok(true)
+}
+
+/// `0.0.0.0:9444` tells a peer nothing about where to dial. Fall back to
+/// the host's own address rather than advertising a wildcard.
+fn advertised_addr(configured: &str, bound: &str) -> String {
+    let wildcard = configured.starts_with("0.0.0.0:")
+        || configured.starts_with("[::]:")
+        || configured.starts_with(":::");
+    if !wildcard {
+        return if configured.ends_with(":0") {
+            bound.to_owned()
+        } else {
+            configured.to_owned()
+        };
+    }
+    let port = bound.rsplit(':').next().unwrap_or("9444");
+    let host = std::env::var("CARET_ADVERTISE_HOST")
+        .ok()
+        .or_else(local_ipv4)
+        .unwrap_or_else(|| "127.0.0.1".into());
+    format!("{host}:{port}")
+}
+
+/// The address a peer would reach us on, discovered by asking the OS which
+/// local interface it would use to leave the box. No packets are sent.
+fn local_ipv4() -> Option<String> {
+    let socket = std::net::UdpSocket::bind("0.0.0.0:0").ok()?;
+    socket.connect("192.0.2.1:9").ok()?; // TEST-NET-1: routable, never real
+    socket.local_addr().ok().map(|a| a.ip().to_string())
+}
+
+fn resolve_token_arg(value: &str) -> Result<String, String> {
+    match value.strip_prefix("env.") {
+        Some(var) => {
+            std::env::var(var).map_err(|_| format!("environment variable {var} is not set"))
+        }
+        None => Ok(value.to_owned()),
+    }
+}
+
 fn run(cli: Cli) -> ExitCode {
     let data_dir = data_dir(&cli);
     let store = match Store::open(&data_dir) {
@@ -530,9 +779,25 @@ fn run(cli: Cli) -> ExitCode {
         if cli.mode == Mode::File {
             spawn_reload_tasks(state.clone(), cli.config.clone(), cli.watch, store.clone());
         }
+
+        let clustered = match start_cluster(&cli, &state, &store, &data_dir).await {
+            Ok(started) => started,
+            Err(message) => return fail(message),
+        };
+        state.spawn_share_tracker();
+
         let app = router_server::build_router(state.clone());
+        let shutdown_state = state.clone();
         let result = router_server::serve(listener, state, app, shutdown_signal()).await;
-        if let Err(err) = store.compact() {
+
+        // A clustered node's state machine owns the snapshot file, so the
+        // single-node store must not write a stale one over it on the way
+        // out.
+        if clustered {
+            if let Some(node) = shutdown_state.cluster.get() {
+                node.shutdown().await;
+            }
+        } else if let Err(err) = store.compact() {
             tracing::warn!(%err, "store compaction failed during shutdown");
         }
         match result {
