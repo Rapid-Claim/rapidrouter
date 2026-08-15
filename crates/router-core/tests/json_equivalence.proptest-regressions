@@ -1,0 +1,7 @@
+# Seeds for failure cases proptest has generated in the past. It is
+# automatically read and these particular cases re-run before any
+# novel cases are generated.
+#
+# It is recommended to check this file in to source control so that
+# everyone who runs the test benefits from these saved cases.
+cc 53e0f00f16942baa0de2820b4efe1320556985d6c492b6651a582888eed6adef # shrinks to request = Object {"_": Object {"": Number(8.249318488895431e+217)}, "model": String("")}, new_model = ""

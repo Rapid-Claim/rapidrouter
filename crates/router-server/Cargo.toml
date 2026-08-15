@@ -1,0 +1,31 @@
+[package]
+name = "router-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+router-core = { workspace = true }
+router-providers = { workspace = true }
+bytes = { workspace = true }
+futures-util = { workspace = true }
+http = { workspace = true }
+http-body = { workspace = true }
+http-body-util = { workspace = true }
+hyper = { workspace = true }
+hyper-rustls = { workspace = true }
+hyper-util = { workspace = true }
+uuid = { workspace = true }
+arc-swap = { workspace = true }
+axum = { workspace = true }
+metrics = { workspace = true }
+metrics-exporter-prometheus = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+tower = { workspace = true }
+mock-provider = { workspace = true }
+reqwest = { workspace = true }

@@ -1,0 +1,54 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/router-core",
+    "crates/router-providers",
+    "crates/router-server",
+    "crates/router-bin",
+    "crates/mock-provider",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/ashutoshxhq/caret-router"
+
+[workspace.dependencies]
+router-core = { path = "crates/router-core" }
+mock-provider = { path = "crates/mock-provider" }
+router-providers = { path = "crates/router-providers" }
+router-server = { path = "crates/router-server" }
+
+arc-swap = "1"
+axum = "0.8"
+bytes = "1"
+clap = { version = "4", features = ["derive"] }
+fastrand = "2"
+futures-util = { version = "0.3", default-features = false }
+http-body = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["client", "http1", "http2"] }
+hyper-rustls = { version = "0.27", default-features = false, features = ["http1", "http2", "ring", "webpki-roots", "tls12"] }
+hyper-util = { version = "0.1", features = ["client", "client-legacy", "http1", "http2", "tokio"] }
+proptest = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "stream", "json"] }
+uuid = { version = "1", features = ["v7"] }
+http = "1"
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.17", default-features = false }
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["float_roundtrip"] }
+subtle = "2"
+thiserror = "2"
+tokio = { version = "1", features = ["full"] }
+toml = "0.9"
+tower = { version = "0.5", features = ["util"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+zeroize = "1"
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+panic = "abort"

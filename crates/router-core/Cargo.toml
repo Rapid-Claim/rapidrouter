@@ -1,0 +1,25 @@
+[package]
+name = "router-core"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+bytes = { workspace = true }
+fastrand = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+subtle = { workspace = true }
+thiserror = { workspace = true }
+toml = { workspace = true }
+zeroize = { workspace = true }
+tokio = { version = "1", default-features = false, features = ["sync"] }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+[target.'cfg(loom)'.dependencies]
+loom = "0.7"
+
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(loom)"] }
