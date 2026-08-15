@@ -52,7 +52,7 @@ pub struct Config {
     /// File-declared virtual keys; managed mode appends store-held keys.
     pub virtual_keys: Vec<crate::vkey::VirtualKeyDef>,
     pub console: ConsoleConfig,
-    pub cluster: ClusterConfig,
+    pub store: StoreConfig,
     pub usage: UsageConfig,
     /// Price overrides per `provider/model`, merged over the built-ins.
     pub pricing: BTreeMap<String, Price>,
@@ -81,18 +81,68 @@ impl ConsoleConfig {
     }
 }
 
-/// Cluster membership. `listen` absent means single node — the cluster
-/// port is never bound and nothing else changes.
-#[derive(Debug, Default, Clone)]
-pub struct ClusterConfig {
-    pub listen: Option<String>,
-    pub join: Vec<String>,
-    pub token: Option<SecretString>,
+/// Read only the `[store]` section, without resolving any `env.*` or
+/// `store.*` reference.
+///
+/// Startup is circular otherwise: the full config may name secrets that
+/// live in the store, but opening the store requires knowing where it is.
+/// The store section is deliberately restricted to literals so it can be
+/// read first.
+pub fn store_section(text: &str, format: Format) -> Result<StoreConfig, LoadError> {
+    let raw: raw::RawConfig = match format {
+        Format::Toml => toml::from_str(text).map_err(|e| LoadError::Parse(e.to_string()))?,
+        Format::Json => serde_json::from_str(text).map_err(|e| LoadError::Parse(e.to_string()))?,
+    };
+    Ok(StoreConfig {
+        backend: raw.store.backend,
+        bucket: raw.store.bucket,
+        prefix: raw.store.prefix,
+        table: raw.store.table,
+        region: raw.store.region,
+        endpoint: raw.store.endpoint,
+        refresh_interval_secs: raw.store.refresh_interval_secs,
+        heartbeat_interval_secs: raw.store.heartbeat_interval_secs,
+        liveness_window_secs: raw.store.liveness_window_secs,
+    })
 }
 
-impl ClusterConfig {
-    pub fn enabled(&self) -> bool {
-        self.listen.is_some()
+/// Where control-plane state lives. Every node pointed at the same
+/// backend is a node of the same fleet; there is no membership beyond
+/// that, and nothing to join.
+#[derive(Debug, Clone)]
+pub struct StoreConfig {
+    pub backend: String,
+    pub bucket: Option<String>,
+    pub prefix: Option<String>,
+    pub table: Option<String>,
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    pub refresh_interval_secs: u64,
+    pub heartbeat_interval_secs: u64,
+    pub liveness_window_secs: u64,
+}
+
+impl Default for StoreConfig {
+    fn default() -> Self {
+        Self {
+            backend: "file".into(),
+            bucket: None,
+            prefix: None,
+            table: None,
+            region: None,
+            endpoint: None,
+            refresh_interval_secs: 3,
+            heartbeat_interval_secs: 5,
+            liveness_window_secs: 15,
+        }
+    }
+}
+
+impl StoreConfig {
+    /// Whether more than one node can reach this store. Shared stores
+    /// require a cluster-wide secret key; a local file does not.
+    pub fn is_shared(&self) -> bool {
+        matches!(self.backend.as_str(), "s3" | "dynamodb")
     }
 }
 

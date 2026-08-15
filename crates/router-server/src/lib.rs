@@ -23,14 +23,18 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use router_cluster::Store;
 use router_core::config::Config;
 use router_core::router::RoutingTable;
 use router_core::vkey::{self, VirtualKeyDef, VkRuntime, VkTable};
 use router_core::{ErrorClass, GatewayError};
+use router_store::{ControlPlaneError, Store};
 use serde_json::json;
 
 pub use proxy::Endpoint;
+
+/// Default seconds of silence after which a node stops counting toward
+/// rate-limit shares. Three missed heartbeats at the default interval.
+const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(15);
 
 /// The authenticated virtual key of a request (None: static key or open
 /// access). Inserted by the auth layer, consumed by dispatch for scope,
@@ -52,9 +56,13 @@ pub struct AppState {
     pub sessions: Mutex<HashMap<String, u64>>,
     /// Config's source of truth is a file: admin writes are disabled.
     pub file_managed: bool,
-    /// The Raft member, when `[cluster]` is configured. Absent means a
-    /// single node, which is the default and changes nothing else.
-    pub cluster: std::sync::OnceLock<Arc<router_cluster::raft::ClusterNode>>,
+    /// How recently a node must have heartbeated to count as live. Read
+    /// by the fleet endpoint and the heartbeat task.
+    pub liveness_window: Duration,
+    /// The config text this node last successfully applied, so the
+    /// refresher can tell "someone edited the config" from "someone
+    /// rotated a key".
+    applied_text: ArcSwap<Option<String>>,
     pub upstream: upstream::UpstreamClient,
     draining: AtomicBool,
     prometheus: PrometheusHandle,
@@ -108,7 +116,8 @@ impl AppState {
             events,
             sessions: Mutex::new(HashMap::new()),
             file_managed,
-            cluster: std::sync::OnceLock::new(),
+            liveness_window: DEFAULT_LIVENESS_WINDOW,
+            applied_text: ArcSwap::from_pointee(None),
             upstream: upstream::UpstreamClient::new(),
             draining: AtomicBool::new(false),
             prometheus: prometheus_handle().clone(),
@@ -180,72 +189,141 @@ impl AppState {
         by_id.into_values().collect()
     }
 
-    /// Keep per-node limit shares tracking the live member count. Cheap
-    /// enough to poll: it reads one atomic-ish metric and only rebuilds
-    /// the key table when the count actually moves.
-    pub fn spawn_share_tracker(self: &Arc<Self>) {
+    /// Adopt whatever the control-plane document currently says: reparse
+    /// the config if it changed, otherwise just rebuild the key table.
+    ///
+    /// A config that no longer parses is *kept out* rather than applied.
+    /// The likely cause is a `store.*` secret or an env var this node
+    /// cannot resolve but the writing node could, and swapping in a
+    /// half-built routing table would take a healthy node down for a
+    /// problem it did not cause.
+    pub fn adopt_store_state(&self) {
+        let Some((snapshot, version)) = self.store_read() else {
+            return;
+        };
+        let Some(text) = snapshot.config_text.clone() else {
+            self.refresh_vkeys();
+            return;
+        };
+        if self.applied_text.load().as_deref() == Some(&text) {
+            self.refresh_vkeys();
+            return;
+        }
+        let env = |name: &str| {
+            if let Some(secret) = name.strip_prefix("store.") {
+                self.store.as_deref().and_then(|s| s.resolve_secret(secret))
+            } else {
+                std::env::var(name).ok()
+            }
+        };
+        match Config::from_str_with_env(&text, router_core::config::Format::Toml, &env) {
+            Ok(config) => {
+                tracing::info!(version, "adopted control-plane config");
+                self.applied_text.store(Arc::new(Some(text)));
+                self.apply_config(config);
+            }
+            Err(err) => {
+                tracing::error!(
+                    version,
+                    %err,
+                    "the control-plane config does not parse on this node; \
+                     keeping the last good one and continuing to serve",
+                );
+                let _ = self.events.send(json!({
+                    "type": "config_rejected",
+                    "version": version,
+                    "error": err.to_string(),
+                }));
+            }
+        }
+    }
+
+    /// Poll the control-plane store for changes another node made.
+    ///
+    /// This is what replaces replication: there is no leader pushing to
+    /// followers, just every node reading the same document on a timer.
+    /// The cost is that a config change takes up to one interval to reach
+    /// the fleet, which for a document a human edits is not a cost worth
+    /// engineering away.
+    pub fn spawn_refresher(self: &Arc<Self>, interval: Duration) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
         let state = self.clone();
         tokio::spawn(async move {
-            let mut last = state.live_nodes();
             loop {
-                tokio::time::sleep(Duration::from_millis(500)).await;
-                let now = state.live_nodes();
-                if now != last {
-                    last = now;
-                    state.refresh_vkeys();
-                    tracing::info!(live_nodes = now, "rate-limit shares rescaled");
-                    let _ = state
-                        .events
-                        .send(json!({ "type": "membership_changed", "live": now }));
+                tokio::time::sleep(interval).await;
+                match store.refresh().await {
+                    Ok(Some(version)) => {
+                        tracing::debug!(version, "control-plane document changed");
+                        state.adopt_store_state();
+                    }
+                    Ok(None) => {}
+                    Err(err) => {
+                        // Traffic is unaffected: the cached document is
+                        // still serving. Say so once per failure rather
+                        // than pretending the node is broken.
+                        tracing::warn!(%err, "could not refresh the control-plane document");
+                    }
                 }
             }
         });
     }
 
-    /// Attach the cluster member once it has started.
-    pub fn attach_cluster(&self, node: Arc<router_cluster::raft::ClusterNode>) {
-        let _ = self.cluster.set(node);
+    /// Announce this node and keep the rate-limit divisor tracking the
+    /// fleet. A node that stops heartbeating ages out of everyone else's
+    /// count within the liveness window, which is the whole of membership
+    /// management in a stateless deployment.
+    pub fn spawn_heartbeat(self: &Arc<Self>, interval: Duration, window: Duration) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        let state = self.clone();
+        tokio::spawn(async move {
+            let mut last = store.live_nodes();
+            loop {
+                match store.beat(window).await {
+                    Ok(live) if live != last => {
+                        last = live;
+                        state.refresh_vkeys();
+                        tracing::info!(live_nodes = live, "rate-limit shares rescaled");
+                        let _ = state
+                            .events
+                            .send(json!({ "type": "fleet_changed", "live": live }));
+                    }
+                    Ok(_) => {}
+                    Err(err) => tracing::warn!(%err, "heartbeat failed"),
+                }
+                tokio::time::sleep(interval).await;
+            }
+        });
     }
 
     /// How many gateway nodes are alive. Rate limits divide by this, so a
     /// key's `rpm` tracks the fleet without anyone editing configs.
     pub fn live_nodes(&self) -> usize {
-        self.cluster
-            .get()
-            .map(|c| c.live_members())
+        self.store
+            .as_deref()
+            .map(|s| s.live_nodes())
             .unwrap_or(1)
             .max(1)
     }
 
-    /// Commit a control-plane change: through consensus when clustered,
-    /// straight to the local store when not.
+    /// Commit a control-plane change through the external store.
     pub async fn commit(
         &self,
         expect: Option<u64>,
-        command: router_cluster::Command,
-    ) -> Result<u64, String> {
-        if let Some(cluster) = self.cluster.get() {
-            // Raft owns ordering; the CAS check happens against the
-            // applied version we just read.
-            if let Some(expected) = expect {
-                let (_, current) = cluster.read();
-                if expected != current {
-                    return Err(format!(
-                        "version conflict: expected {expected}, store is at {current}"
-                    ));
-                }
-            }
-            return cluster.commit(command).await.map_err(|e| e.to_string());
-        }
-        let store = self.store.as_deref().ok_or("no store configured")?;
-        store.commit(expect, command).map_err(|e| e.to_string())
+        command: router_store::Command,
+    ) -> Result<u64, ControlPlaneError> {
+        let store = self.store.as_deref().ok_or_else(|| {
+            ControlPlaneError::Fault("this node has no control-plane store".into())
+        })?;
+        store.commit(expect, command).await
     }
 
     /// The current control-plane document and the version it reflects.
-    pub fn store_read(&self) -> Option<(router_cluster::StoreState, u64)> {
-        if let Some(cluster) = self.cluster.get() {
-            return Some(cluster.read());
-        }
+    /// Served from the node's cache — no I/O, no waiting on the backend.
+    pub fn store_read(&self) -> Option<(router_store::StoreState, u64)> {
         self.store.as_deref().map(|s| s.read())
     }
 

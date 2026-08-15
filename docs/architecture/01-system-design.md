@@ -31,8 +31,8 @@
 ```
 
 Not shown above: the **control plane** — the embedded replicated store
-(`router-cluster`, port 9444) that persists config, virtual keys, and
-sealed secrets, replicating them across nodes in cluster mode. It feeds
+(`router-store`, port 9444) that persists config, virtual keys, and
+sealed secrets, sharing them across nodes through an external store. It feeds
 the routing table but sits entirely off the request path
 ([06-state-and-storage.md](06-state-and-storage.md)).
 
@@ -51,7 +51,7 @@ caret-router/
 │   │       └── error.rs       # unified error taxonomy
 │   ├── router-providers/      # Provider trait + one adapter per dialect
 │   ├── router-server/         # axum surface: routes, dialects, SSE, middleware, hooks
-│   ├── router-cluster/        # embedded replicated store: Raft WAL/snapshots, peer APIs
+│   ├── router-store/        # control plane: backend adapters (file, S3, DynamoDB), sealing
 │   └── router-bin/            # main.rs: CLI, config load, runtime setup
 ├── benches/                   # criterion micro-benches + e2e overhead rigs
 ├── fuzz/                      # cargo-fuzz targets (JSON splice, translators, SSE codec)
@@ -75,7 +75,7 @@ benchmarks, fuzzers, and embedders target. `router-server` is thin by design.
 | Allocator | mimalloc | Measurably better tail latency than the system allocator under our benches |
 | Metrics / tracing | metrics + prometheus exporter; tracing (+ optional OTLP) | Atomic-cheap recording; zero cost when disabled |
 | AWS auth | aws-sigv4 | Bedrock request signing |
-| Consensus | openraft | The embedded replicated store; a single node runs as a cluster of one ([06-state-and-storage.md](06-state-and-storage.md)) |
+| Control plane | S3 / DynamoDB conditional writes | Compare-and-swap on one document; no consensus, no node state ([06-state-and-storage.md](06-state-and-storage.md)) |
 
 ## Design principles
 

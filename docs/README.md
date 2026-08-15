@@ -9,7 +9,7 @@ Point any OpenAI SDK at `http://localhost:8080/v1`, set
 request to Anthropic's wire format, streams the response back in OpenAI chunk
 format, load-balances across your API keys, and fails over to backup
 providers when one degrades — all from a single static binary that carries
-its own storage, web console, and cluster mode: one box works with nothing
+its own storage, web console, and fleet mode: one box works with nothing
 else installed, and three boxes form a fleet with nothing else installed.
 
 ```bash
@@ -65,7 +65,7 @@ curl http://localhost:8080/v1/chat/completions \
 | [providers.md](providers.md) | Supported providers, capability matrix, per-provider notes |
 | [operations/deployment.md](operations/deployment.md) | Binary, Docker, sizing, shutdown, scaling |
 | [operations/scaling.md](operations/scaling.md) | Horizontal scaling on any substrate — LB requirements, scaling signals, platform notes |
-| [operations/clustering.md](operations/clustering.md) | Cluster mode: one binary per box, no external coordination |
+| [operations/fleet.md](operations/fleet.md) | Fleet mode: stateless nodes over a shared S3 or DynamoDB store |
 | [operations/reliability.md](operations/reliability.md) | Timeouts, retries, breakers — operator's view |
 | [operations/benchmarking.md](operations/benchmarking.md) | The in-repo rigs and how we keep the numbers honest |
 | [roadmap.md](roadmap.md) | Release scope and what comes next |

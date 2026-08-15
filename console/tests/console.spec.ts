@@ -14,10 +14,10 @@ test.beforeEach(async ({ page }) => {
   await signIn(page);
 });
 
-const PAGES = ["overview", "providers", "routing", "keys", "usage", "requests", "playground", "cluster", "settings"] as const;
+const PAGES = ["overview", "providers", "routing", "keys", "usage", "requests", "playground", "fleet", "settings"] as const;
 
 test("all eight operator pages are reachable", async ({ page }) => {
-  for (const name of ["Providers", "Routing", "Keys", "Usage", "Requests", "Playground", "Cluster", "Overview"]) {
+  for (const name of ["Providers", "Routing", "Keys", "Usage", "Requests", "Playground", "Fleet", "Overview"]) {
     await page.getByRole("link", { name, exact: true }).click();
     await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
   }

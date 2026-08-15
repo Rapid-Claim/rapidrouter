@@ -10,7 +10,7 @@ path = "src/main.rs"
 
 [dependencies]
 router-core = { workspace = true }
-router-cluster = { workspace = true }
+router-store = { workspace = true }
 mimalloc = { workspace = true }
 router-server = { workspace = true }
 clap = { workspace = true }

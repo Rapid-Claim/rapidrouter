@@ -18,7 +18,7 @@ pub struct RawConfig {
     /// here; managed mode keeps them in the store instead.
     pub virtual_keys: Vec<RawVirtualKey>,
     pub console: RawConsole,
-    pub cluster: RawCluster,
+    pub store: RawStore,
     pub usage: RawUsage,
     /// Price overrides per `provider/model` (USD per million tokens).
     pub pricing: BTreeMap<String, RawPrice>,
@@ -110,16 +110,41 @@ impl Default for RawConsole {
     }
 }
 
-#[derive(Debug, Default, Deserialize)]
+#[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
-pub struct RawCluster {
-    /// Address the cluster port binds. Absent = single node, no cluster
-    /// port, no behavior change.
-    pub listen: Option<String>,
-    /// Any live subset of the cluster to join through; empty bootstraps.
-    pub join: Vec<String>,
-    /// `env.*` / `store.*` reference or literal join token.
-    pub token: Option<String>,
+pub struct RawStore {
+    /// `file`, `s3`, or `dynamodb`. Defaults to `file`.
+    pub backend: String,
+    /// S3 bucket and key prefix.
+    pub bucket: Option<String>,
+    pub prefix: Option<String>,
+    /// DynamoDB table.
+    pub table: Option<String>,
+    /// AWS region and endpoint override; absent means the ambient config.
+    pub region: Option<String>,
+    pub endpoint: Option<String>,
+    /// How often to poll the store for changes another node made.
+    pub refresh_interval_secs: u64,
+    /// How often this node announces itself.
+    pub heartbeat_interval_secs: u64,
+    /// How long after its last heartbeat a node still counts as live.
+    pub liveness_window_secs: u64,
+}
+
+impl Default for RawStore {
+    fn default() -> Self {
+        Self {
+            backend: "file".into(),
+            bucket: None,
+            prefix: None,
+            table: None,
+            region: None,
+            endpoint: None,
+            refresh_interval_secs: 3,
+            heartbeat_interval_secs: 5,
+            liveness_window_secs: 15,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]

@@ -2,11 +2,12 @@ use std::io::Read as _;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::Arc;
+use std::time::Duration;
 
 use clap::{Parser, Subcommand, ValueEnum};
-use router_cluster::{Command as StoreCommand, Store};
 use router_core::config::{Config, Format};
 use router_server::AppState;
+use router_store::{BackendSpec, Command as StoreCommand, Store};
 
 #[global_allocator]
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
@@ -28,17 +29,45 @@ struct Cli {
     #[arg(long, global = true)]
     data_dir: Option<PathBuf>,
 
-    /// Bind the cluster port (Raft, join, peer APIs), e.g. 0.0.0.0:9444.
-    #[arg(long, global = true)]
-    cluster_listen: Option<String>,
+    /// Where control-plane state lives: file, s3, or dynamodb. Every
+    /// node pointed at the same one is a node of the same fleet.
+    #[arg(long, global = true, env = "CARET_STORE_BACKEND")]
+    store_backend: Option<String>,
 
-    /// Join through any live subset of an existing cluster.
-    #[arg(long = "join", global = true)]
-    cluster_join: Vec<String>,
+    /// S3 bucket holding the control-plane document.
+    #[arg(long, global = true, env = "CARET_STORE_BUCKET")]
+    store_bucket: Option<String>,
 
-    /// The cluster's join token, or an `env.*` reference to it.
-    #[arg(long, global = true)]
-    cluster_token: Option<String>,
+    /// Key prefix within the bucket. Defaults to the bucket root.
+    #[arg(long, global = true, env = "CARET_STORE_PREFIX")]
+    store_prefix: Option<String>,
+
+    /// DynamoDB table holding the control-plane document.
+    #[arg(long, global = true, env = "CARET_STORE_TABLE")]
+    store_table: Option<String>,
+
+    /// AWS region for the store. Defaults to the ambient AWS config.
+    #[arg(long, global = true, env = "CARET_STORE_REGION")]
+    store_region: Option<String>,
+
+    /// Override the AWS endpoint, for local testing or a private gateway.
+    #[arg(long, global = true, env = "CARET_STORE_ENDPOINT")]
+    store_endpoint: Option<String>,
+
+    /// Path to the control-plane document for the `file` backend.
+    /// Defaults to `store.json` in the data dir; point several nodes at
+    /// one path on a shared volume to run a fleet without AWS.
+    #[arg(long, global = true, env = "CARET_STORE_PATH")]
+    store_path: Option<PathBuf>,
+
+    /// Override the port from the config. The control-plane document is
+    /// shared, so this is how two nodes run on one host.
+    #[arg(long, global = true, env = "CARET_PORT")]
+    port: Option<u16>,
+
+    /// Address this node advertises to the console's fleet list.
+    #[arg(long, global = true, env = "CARET_ADVERTISE_ADDR")]
+    advertise: Option<String>,
 
     /// Managed mode permits console writes; file mode is read-only.
     #[arg(long, global = true, value_enum, default_value = "managed")]
@@ -75,26 +104,11 @@ enum Command {
         #[command(subcommand)]
         command: KeyCommand,
     },
-    /// Inspect and manage cluster membership.
-    Cluster {
-        #[command(subcommand)]
-        command: ClusterCommand,
-    },
-}
+    /// Show which nodes are currently serving against this store.
+    Fleet,
 
-#[derive(Subcommand)]
-enum ClusterCommand {
-    /// Print this cluster's join token. Treat it as a secret.
-    Token {
-        /// Mint a new token. Existing members keep working only once they
-        /// are restarted with it, so roll one node at a time.
-        #[arg(long)]
-        rotate: bool,
-    },
-    /// Members, roles, applied version, and lag.
-    Status,
-    /// Remove a node that is never coming back.
-    Remove { id: String },
+    /// Generate the cluster-wide key that seals stored secrets.
+    MasterKey,
 }
 
 #[derive(Subcommand)]
@@ -169,7 +183,8 @@ fn main() -> ExitCode {
         Some(Command::Config { command }) => config_command(&cli, command),
         Some(Command::Secret { command }) => secret_command(&cli, command),
         Some(Command::Key { command }) => key_command(&cli, command),
-        Some(Command::Cluster { command }) => cluster_command(&cli, command),
+        Some(Command::Fleet) => fleet_command(&cli),
+        Some(Command::MasterKey) => master_key_command(),
         None => run(cli),
     }
 }
@@ -201,20 +216,58 @@ fn check(path: &Path) -> ExitCode {
     }
 }
 
-fn open_store(cli: &Cli) -> Result<Store, ExitCode> {
-    Store::open(&data_dir(cli)).map_err(fail)
+/// The one-off commands are synchronous from the operator's point of
+/// view but the store is not, so they each get a small runtime.
+///
+/// Only for the subcommands. Calling this from inside the server's
+/// runtime panics — use `.await` there.
+fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to start async runtime")
+        .block_on(future)
 }
 
-/// For commands that only read. Falls back to a read-only handle when the
-/// gateway holds the lock, so an operator never has to stop the service to
-/// look at its own configuration.
-fn open_store_for_reading(cli: &Cli) -> Result<Store, ExitCode> {
-    let dir = data_dir(cli);
-    match Store::open(&dir) {
-        Ok(store) => Ok(store),
-        Err(router_cluster::StoreError::Locked) => Store::open_read_only(&dir).map_err(fail),
+/// The store's write path is async and the one-off commands are not.
+fn commit(
+    store: &Store,
+    expect: Option<u64>,
+    command: StoreCommand,
+) -> Result<u64, router_store::ControlPlaneError> {
+    block_on(store.commit(expect, command))
+}
+
+/// The `[store]` section of `--config`, if one was given. CLI flags and
+/// environment variables layer on top of it in [`backend_spec`].
+fn config_store_section(cli: &Cli) -> Result<Option<router_core::config::StoreConfig>, ExitCode> {
+    let Some(path) = cli.config.as_deref() else {
+        return Ok(None);
+    };
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        // A missing config is diagnosed later, with a better message.
+        Err(_) => return Ok(None),
+    };
+    match router_core::config::store_section(&text, format_for(path)) {
+        Ok(section) => Ok(Some(section)),
         Err(err) => Err(fail(err)),
     }
+}
+
+fn open_store(cli: &Cli) -> Result<Store, ExitCode> {
+    let section = config_store_section(cli)?;
+    let spec = backend_spec(cli, section.as_ref()).map_err(fail)?;
+    let dir = data_dir(cli);
+    let addr = advertise_addr(cli, None);
+    block_on(Store::open(&spec, &dir, &addr)).map_err(fail)
+}
+
+/// Reads and writes now go through the same handle: with an external
+/// store there is no exclusive lock to contend for, so an operator can
+/// inspect or edit a running fleet's configuration from anywhere.
+fn open_store_for_reading(cli: &Cli) -> Result<Store, ExitCode> {
+    open_store(cli)
 }
 
 fn config_command(cli: &Cli, command: &ConfigCommand) -> ExitCode {
@@ -245,7 +298,7 @@ fn config_command(cli: &Cli, command: &ConfigCommand) -> ExitCode {
             if let Err(err) = validate_store_config(&store, &text, format_for(path)) {
                 return fail(err);
             }
-            match store.commit(None, StoreCommand::PutConfig { text }) {
+            match commit(&store, None, StoreCommand::PutConfig { text }) {
                 Ok(version) => {
                     println!("Imported managed configuration at version {version}");
                     ExitCode::SUCCESS
@@ -286,7 +339,8 @@ fn secret_command(cli: &Cli, command: &SecretCommand) -> ExitCode {
                 return fail("secret value must not be empty");
             }
             let sealed = store.seal_secret(&value);
-            match store.commit(
+            match commit(
+                &store,
                 None,
                 StoreCommand::PutSecret {
                     name: name.clone(),
@@ -301,7 +355,11 @@ fn secret_command(cli: &Cli, command: &SecretCommand) -> ExitCode {
             }
         }
         SecretCommand::Delete { name } => {
-            match store.commit(None, StoreCommand::DeleteSecret { name: name.clone() }) {
+            match commit(
+                &store,
+                None,
+                StoreCommand::DeleteSecret { name: name.clone() },
+            ) {
                 Ok(version) => {
                     println!("Deleted {name} at version {version}");
                     ExitCode::SUCCESS
@@ -359,8 +417,7 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
             .cloned()
             .ok_or_else(|| format!("no key with id `{id}`"))?;
         f(&mut def);
-        store
-            .commit(None, StoreCommand::PutVirtualKey { def })
+        commit(&store, None, StoreCommand::PutVirtualKey { def })
             .map(|_| ())
             .map_err(|err| err.to_string())
     };
@@ -405,7 +462,7 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
                 enabled: true,
                 created_ms: vkey::unix_now_ms(),
             };
-            match store.commit(None, StoreCommand::PutVirtualKey { def }) {
+            match commit(&store, None, StoreCommand::PutVirtualKey { def }) {
                 Ok(_) => {
                     println!("{}", generated.full());
                     eprintln!(
@@ -506,7 +563,11 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
             if !state.virtual_keys.contains_key(id) {
                 return fail(format!("no key with id `{id}`"));
             }
-            match store.commit(None, StoreCommand::DeleteVirtualKey { id: id.clone() }) {
+            match commit(
+                &store,
+                None,
+                StoreCommand::DeleteVirtualKey { id: id.clone() },
+            ) {
                 Ok(_) => {
                     println!("Removed {id}");
                     ExitCode::SUCCESS
@@ -553,178 +614,80 @@ fn parse_budget(spec: &str) -> Result<router_core::vkey::Budget, String> {
     Ok(Budget { usd, period })
 }
 
-fn cluster_command(cli: &Cli, command: &ClusterCommand) -> ExitCode {
-    let needs_write = matches!(command, ClusterCommand::Token { rotate: true });
-    let store = match if needs_write {
-        open_store(cli)
-    } else {
-        open_store_for_reading(cli)
-    } {
-        Ok(store) => store,
-        Err(code) => return code,
-    };
-    match command {
-        ClusterCommand::Token { rotate } => {
-            if *rotate {
-                let fresh = router_cluster::token::JoinToken::generate();
-                if let Err(err) = store.adopt_join_token(&fresh) {
-                    return fail(err);
-                }
-                println!("{}", fresh.encode());
-                eprintln!(
-                    "Rotated. Restart each member with the new token, one at a time — \
-                     a node still holding the old one cannot be reached by the others."
-                );
-                return ExitCode::SUCCESS;
-            }
-            match store.join_token() {
-                Ok(token) => {
-                    println!("{}", token.encode());
-                    eprintln!(
-                        "This token is a credential: anyone holding it can join the cluster."
-                    );
-                    ExitCode::SUCCESS
-                }
-                Err(err) => fail(err),
-            }
-        }
-        // Status and remove need a running cluster, which holds the data
-        // dir's lock — so they go over the admin API of the local node
-        // rather than opening the store a second time.
-        ClusterCommand::Status => {
-            eprintln!(
-                "Cluster status is served by the running node: \
-                 curl -s localhost:8080/admin/api/fleet (admin key required), \
-                 or open the console's Cluster page."
-            );
-            let (state, version) = store.read();
-            println!("Local applied version: {version}");
-            println!(
-                "Cluster id: {}",
-                state
-                    .settings
-                    .get("cluster_id")
-                    .map(String::as_str)
-                    .unwrap_or("(single node — no cluster configured)")
-            );
-            ExitCode::SUCCESS
-        }
-        ClusterCommand::Remove { id } => {
-            eprintln!(
-                "Removing a member changes replicated membership, so it must go through \
-                 the running leader: POST /admin/api/cluster/remove {{\"id\": {id}}}."
-            );
-            ExitCode::FAILURE
-        }
-    }
-}
-
-/// Bring up the cluster port and join or bootstrap, if configured.
-/// Returns whether this node is clustered. CLI flags win over the config
-/// file, so an operator can cluster a file-managed deployment without
-/// editing the file their deploy tool owns.
-async fn start_cluster(
+/// Which control-plane backend this invocation should talk to.
+///
+/// CLI flags win over the config file so an operator can point a
+/// file-managed deployment at a shared store without editing the file
+/// their deploy tool owns.
+fn backend_spec(
     cli: &Cli,
-    state: &Arc<AppState>,
-    store: &Arc<Store>,
-    data_dir: &Path,
-) -> Result<bool, String> {
-    use router_cluster::raft::ClusterNode;
-    use router_cluster::raft::server::{self as cluster_server, JoinRequest};
-    use router_cluster::token::JoinToken;
-
-    let config = state.config.load();
-    let listen = cli
-        .cluster_listen
+    from_config: Option<&router_core::config::StoreConfig>,
+) -> Result<BackendSpec, String> {
+    let kind = cli
+        .store_backend
         .clone()
-        .or_else(|| config.cluster.listen.clone());
-    let Some(listen) = listen else {
-        return Ok(false); // single node: nothing to bind, nothing to change
-    };
-    let seeds: Vec<String> = if cli.cluster_join.is_empty() {
-        config.cluster.join.clone()
-    } else {
-        cli.cluster_join.clone()
-    };
+        .or_else(|| from_config.map(|s| s.backend.clone()))
+        .unwrap_or_else(|| "file".into());
 
-    // A supplied token means "join their cluster"; none means "be one".
-    let supplied = match cli.cluster_token.as_deref() {
-        Some(value) => Some(resolve_token_arg(value)?),
-        None => config.cluster.token.as_ref().map(|s| s.expose().to_owned()),
-    };
-    let token = match supplied {
-        Some(text) => {
-            let token = JoinToken::parse(&text)
-                .ok_or_else(|| format!("`{text}` is not a caret join token"))?;
-            store.adopt_join_token(&token).map_err(|e| e.to_string())?;
-            token
+    let region = cli
+        .store_region
+        .clone()
+        .or_else(|| from_config.and_then(|s| s.region.clone()));
+    let endpoint = cli
+        .store_endpoint
+        .clone()
+        .or_else(|| from_config.and_then(|s| s.endpoint.clone()));
+
+    match kind.as_str() {
+        "file" => Ok(BackendSpec::File {
+            path: cli
+                .store_path
+                .clone()
+                .unwrap_or_else(|| data_dir(cli).join("store.json")),
+        }),
+        "memory" => Ok(BackendSpec::Memory),
+        "s3" => {
+            let bucket = cli
+                .store_bucket
+                .clone()
+                .or_else(|| from_config.and_then(|s| s.bucket.clone()))
+                .ok_or("the s3 store needs a bucket: --store-bucket or [store] bucket")?;
+            Ok(BackendSpec::S3 {
+                bucket,
+                prefix: cli
+                    .store_prefix
+                    .clone()
+                    .or_else(|| from_config.and_then(|s| s.prefix.clone()))
+                    .unwrap_or_default(),
+                region,
+                endpoint,
+            })
         }
-        None => store.join_token().map_err(|e| e.to_string())?,
-    };
-
-    let listener = tokio::net::TcpListener::bind(&listen)
-        .await
-        .map_err(|e| format!("failed to bind cluster port {listen}: {e}"))?;
-    let bound = listener
-        .local_addr()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|_| listen.clone());
-    // Peers dial the advertised address, which must be routable — a
-    // wildcard bind is not.
-    let advertised = advertised_addr(&listen, &bound);
-
-    let node = ClusterNode::start(
-        store.raft_node_id(),
-        advertised.clone(),
-        data_dir,
-        token.clone(),
-    )
-    .await
-    .map_err(|e| format!("cluster start failed: {e}"))?;
-
-    let serving = node.clone();
-    tokio::spawn(async move {
-        let _ = cluster_server::serve(listener, serving, shutdown_signal()).await;
-    });
-
-    if seeds.is_empty() {
-        node.bootstrap()
-            .await
-            .map_err(|e| format!("cluster bootstrap failed: {e}"))?;
-        tracing::info!(cluster = token.cluster_id(), addr = %advertised, "bootstrapped a cluster of one");
-    } else {
-        let me = JoinRequest {
-            node_id: node.id,
-            addr: advertised.clone(),
-        };
-        let response = cluster_server::request_join(&token, &seeds, me).await?;
-        tracing::info!(
-            cluster = response.cluster,
-            members = response.members,
-            "joined cluster"
-        );
+        "dynamodb" => {
+            let table = cli
+                .store_table
+                .clone()
+                .or_else(|| from_config.and_then(|s| s.table.clone()))
+                .ok_or("the dynamodb store needs a table: --store-table or [store] table")?;
+            Ok(BackendSpec::DynamoDb {
+                table,
+                region,
+                endpoint,
+            })
+        }
+        other => Err(format!(
+            "unknown store backend `{other}` — expected file, s3, or dynamodb"
+        )),
     }
-
-    state.attach_cluster(node.clone());
-    node.spawn_liveness_probe();
-    state.refresh_vkeys();
-    Ok(true)
 }
 
-/// `0.0.0.0:9444` tells a peer nothing about where to dial. Fall back to
-/// the host's own address rather than advertising a wildcard.
-fn advertised_addr(configured: &str, bound: &str) -> String {
-    let wildcard = configured.starts_with("0.0.0.0:")
-        || configured.starts_with("[::]:")
-        || configured.starts_with(":::");
-    if !wildcard {
-        return if configured.ends_with(":0") {
-            bound.to_owned()
-        } else {
-            configured.to_owned()
-        };
+/// The address this node reports to the console's fleet list. Nothing
+/// dials it; it is there so an operator can tell two tasks apart.
+fn advertise_addr(cli: &Cli, port: Option<u16>) -> String {
+    if let Some(addr) = &cli.advertise {
+        return addr.clone();
     }
-    let port = bound.rsplit(':').next().unwrap_or("9444");
+    let port = port.unwrap_or(8080);
     let host = std::env::var("CARET_ADVERTISE_HOST")
         .ok()
         .or_else(local_ipv4)
@@ -740,30 +703,79 @@ fn local_ipv4() -> Option<String> {
     socket.local_addr().ok().map(|a| a.ip().to_string())
 }
 
-fn resolve_token_arg(value: &str) -> Result<String, String> {
-    match value.strip_prefix("env.") {
-        Some(var) => {
-            std::env::var(var).map_err(|_| format!("environment variable {var} is not set"))
-        }
-        None => Ok(value.to_owned()),
+fn fleet_command(cli: &Cli) -> ExitCode {
+    let store = match open_store(cli) {
+        Ok(store) => store,
+        Err(code) => return code,
+    };
+    let window = Duration::from_secs(15);
+    let peers = match block_on(store.peers(window)) {
+        Ok(peers) => peers,
+        Err(err) => return fail(err),
+    };
+    println!("Store:   {}", store.describe());
+    println!("Version: {}", store.version());
+    if peers.is_empty() {
+        println!("Nodes:   none heartbeating (this store is not shared, or the fleet is down)");
+        return ExitCode::SUCCESS;
     }
+    let now = router_store::backend::now_ms_for_tests();
+    println!("Nodes:   {}", peers.len());
+    for beat in peers {
+        println!(
+            "  {:<38} {:<22} last seen {}s ago",
+            beat.id,
+            beat.addr,
+            beat.age(now).as_secs()
+        );
+    }
+    ExitCode::SUCCESS
+}
+
+fn master_key_command() -> ExitCode {
+    println!("{}", router_store::Sealer::generate_master_key());
+    eprintln!(
+        "Set this as {} on every node. It seals stored secrets, so nodes that \
+         disagree about it cannot read each other's. Keep it in your platform's \
+         secret manager, not in the config file.",
+        router_store::MASTER_KEY_ENV,
+    );
+    ExitCode::SUCCESS
 }
 
 fn run(cli: Cli) -> ExitCode {
     let data_dir = data_dir(&cli);
-    let store = match Store::open(&data_dir) {
-        Ok(store) => Arc::new(store),
-        Err(err) => return fail(err),
-    };
-    let config = match load_initial_config(&cli, &store) {
-        Ok(config) => config,
+    let section = match config_store_section(&cli) {
+        Ok(section) => section,
         Err(code) => return code,
     };
+    let spec = match backend_spec(&cli, section.as_ref()) {
+        Ok(spec) => spec,
+        Err(message) => return fail(message),
+    };
+    let tuning = section.unwrap_or_default();
+
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("failed to start async runtime");
+
     runtime.block_on(async move {
+        let store = match Store::open(&spec, &data_dir, &advertise_addr(&cli, None)).await {
+            Ok(store) => Arc::new(store),
+            Err(err) => return fail(err),
+        };
+        tracing::info!(store = %store.describe(), node = store.node_id(), "control plane");
+
+        let mut config = match load_initial_config(&cli, &store).await {
+            Ok(config) => config,
+            Err(code) => return code,
+        };
+        if let Some(port) = cli.port {
+            config.server.port = port;
+        }
+        store.set_addr(advertise_addr(&cli, Some(config.server.port)));
+
         let addr = format!("{}:{}", config.server.host, config.server.port);
         let providers: Vec<String> = config.providers.keys().cloned().collect();
         let state = if cli.mode == Mode::Managed {
@@ -771,35 +783,32 @@ fn run(cli: Cli) -> ExitCode {
         } else {
             AppState::file_with_data_dir(config, store.clone(), data_dir.clone())
         };
+
         let listener = match tokio::net::TcpListener::bind(&addr).await {
             Ok(listener) => listener,
             Err(err) => return fail(format!("failed to bind {addr}: {err}")),
         };
         tracing::info!(%addr, ?providers, mode = ?cli.mode, "caret-router listening");
+
         if cli.mode == Mode::File {
             spawn_reload_tasks(state.clone(), cli.config.clone(), cli.watch, store.clone());
         }
 
-        let clustered = match start_cluster(&cli, &state, &store, &data_dir).await {
-            Ok(started) => started,
-            Err(message) => return fail(message),
-        };
-        state.spawn_share_tracker();
+        // The two timers that stand in for a cluster: one to notice what
+        // other nodes wrote, one to tell them we are here.
+        state.spawn_refresher(Duration::from_secs(tuning.refresh_interval_secs));
+        state.spawn_heartbeat(
+            Duration::from_secs(tuning.heartbeat_interval_secs),
+            Duration::from_secs(tuning.liveness_window_secs),
+        );
 
         let app = router_server::build_router(state.clone());
-        let shutdown_state = state.clone();
         let result = router_server::serve(listener, state, app, shutdown_signal()).await;
 
-        // A clustered node's state machine owns the snapshot file, so the
-        // single-node store must not write a stale one over it on the way
-        // out.
-        if clustered {
-            if let Some(node) = shutdown_state.cluster.get() {
-                node.shutdown().await;
-            }
-        } else if let Err(err) = store.compact() {
-            tracing::warn!(%err, "store compaction failed during shutdown");
-        }
+        // Leaving cleanly returns this node's share of every rate limit
+        // to the fleet now, rather than after the liveness window.
+        store.depart().await;
+
         match result {
             Ok(()) => {
                 tracing::info!("shutdown complete");
@@ -810,7 +819,7 @@ fn run(cli: Cli) -> ExitCode {
     })
 }
 
-fn load_initial_config(cli: &Cli, store: &Store) -> Result<Config, ExitCode> {
+async fn load_initial_config(cli: &Cli, store: &Store) -> Result<Config, ExitCode> {
     if cli.mode == Mode::Managed {
         let (snapshot, _) = store.read();
         if let Some(text) = snapshot.config_text {
@@ -821,13 +830,14 @@ fn load_initial_config(cli: &Cli, store: &Store) -> Result<Config, ExitCode> {
             let config = validate_store_config(store, &text, format_for(path)).map_err(fail)?;
             store
                 .commit(None, StoreCommand::PutConfig { text })
+                .await
                 .map_err(fail)?;
             return Ok(config);
         }
         if let Some(config) = Config::discover_from_env(&|name: &str| std::env::var(name).ok()) {
             return Ok(config);
         }
-        return bootstrap(store).map_err(fail);
+        return bootstrap(store).await.map_err(fail);
     }
     match cli.config.as_deref() {
         Some(path) => load_file_config(store, path).map_err(fail),
@@ -837,18 +847,20 @@ fn load_initial_config(cli: &Cli, store: &Store) -> Result<Config, ExitCode> {
     }
 }
 
-fn bootstrap(store: &Store) -> Result<Config, Box<dyn std::error::Error>> {
+async fn bootstrap(store: &Store) -> Result<Config, Box<dyn std::error::Error>> {
     let secret = router_core::vkey::generate_secret();
-    store.commit(
-        None,
-        StoreCommand::PutSecret {
-            name: "bootstrap_admin".into(),
-            sealed: store.seal_secret(&secret),
-        },
-    )?;
+    store
+        .commit(
+            None,
+            StoreCommand::PutSecret {
+                name: "bootstrap_admin".into(),
+                sealed: store.seal_secret(&secret),
+            },
+        )
+        .await?;
     let text = "[console]\nadmin_keys = [\"store.bootstrap_admin\"]\n".to_owned();
     let config = validate_store_config(store, &text, Format::Toml)?;
-    store.commit(None, StoreCommand::PutConfig { text })?;
+    store.commit(None, StoreCommand::PutConfig { text }).await?;
     eprintln!("Bootstrap admin key (shown once): {secret}");
     eprintln!("Open http://127.0.0.1:8080/console");
     Ok(config)

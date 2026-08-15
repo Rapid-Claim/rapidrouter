@@ -4,7 +4,7 @@ members = [
     "crates/router-core",
     "crates/router-providers",
     "crates/router-server",
-    "crates/router-cluster",
+    "crates/router-store",
     "crates/router-bin",
     "crates/mock-provider",
     "crates/rig",
@@ -21,7 +21,7 @@ router-core = { path = "crates/router-core" }
 mock-provider = { path = "crates/mock-provider" }
 router-providers = { path = "crates/router-providers" }
 router-server = { path = "crates/router-server" }
-router-cluster = { path = "crates/router-cluster" }
+router-store = { path = "crates/router-store" }
 
 arc-swap = "1"
 axum = "0.8"
@@ -32,7 +32,7 @@ chacha20poly1305 = "0.10"
 libc = "0.2"
 rust-embed = "8"
 zstd = "0.13"
-clap = { version = "4", features = ["derive"] }
+clap = { version = "4", features = ["derive", "env"] }
 fastrand = "2"
 futures-util = { version = "0.3", default-features = false }
 http-body = "1"

@@ -90,4 +90,4 @@ survives an OpenAI incident without your application noticing — check the
 
 - Route coding agents through the gateway: [coding-agents.md](coding-agents.md)
 - Understand the receipt headers: [../components/observability.md](../components/observability.md)
-- Going multi-box? One command per node: [../operations/clustering.md](../operations/clustering.md)
+- Going multi-node? Point them at one bucket or table: [../operations/fleet.md](../operations/fleet.md)

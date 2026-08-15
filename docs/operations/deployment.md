@@ -57,7 +57,7 @@ replicas that ship usage to an external sink can run without it.
   either as stateless replicas (`file` config mode, your tooling
   distributes config and secrets) or in **cluster mode**, where nodes
   replicate config, keys, and secrets among themselves with no external
-  services ([clustering.md](clustering.md)). Signals and LB requirements:
+  services ([fleet.md](fleet.md)). Signals and LB requirements:
   [scaling.md](scaling.md); state model:
   [../architecture/06-state-and-storage.md](../architecture/06-state-and-storage.md).
 
@@ -75,4 +75,4 @@ bodies up to your configured `max_body_size`.
 | `GET /health` | liveness/readiness (reports draining state) |
 | `GET /metrics` | Prometheus scrape |
 | `/console`, `/admin/api/*` | embedded console + admin API (only when admin keys are configured) |
-| `:9444` | cluster port — Raft + peer APIs, internal network only ([clustering.md](clustering.md)) |
+| — | no second port: nodes never talk to each other, only to the shared store ([fleet.md](fleet.md)) |

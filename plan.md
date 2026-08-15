@@ -25,7 +25,7 @@ Guiding rules:
 
 **Build**
 - Cargo workspace: `router-core`, `router-providers`, `router-server`,
-  `router-bin` (+ empty `router-cluster`, `console/` placeholders).
+  `router-bin` (+ empty `router-store`, `console/` placeholders).
 - Config schema + total validation + `caret-router check`; `env.*` secret
   references; `SecretString`.
 - axum server: `/health`, `/metrics` stub, graceful drain.
@@ -215,7 +215,7 @@ flamegraph baseline committed.
 ## Phase 7 — Managed store, console, virtual keys (v1.x) (weeks 16–20)
 
 **Build**
-- Embedded store (openraft, cluster-of-one), `managed`/`file` modes,
+- Embedded store (single-node document + CAS), `managed`/`file` modes,
   `config export`, `store.*` sealed secrets, usage pipeline + retention.
 - Virtual keys end-to-end (hash storage, scopes, budgets, limits,
   rotation grace) per [docs/components/virtual-keys.md](docs/components/virtual-keys.md).
@@ -241,27 +241,39 @@ e2e test.
 
 ---
 
-## Phase 8 — Cluster mode (v2) (weeks 21–26)
+## Phase 8 — Stateless fleet (v2) (weeks 21–26)
+
+Originally specced as in-process Raft. Built that way, then replaced:
+consensus gave every node a durable identity and a disk that mattered,
+which is the opposite of what an autoscaling group, an ECS service, or a
+Kubernetes Deployment wants. The control plane is now an external store
+with compare-and-swap, and a node holds nothing worth keeping.
 
 **Build**
-- Multi-node raft (join tokens, joint consensus membership, snapshot
-  streaming), peer scatter-gather APIs, live-N limit shares, cluster page,
-  `cluster` CLI.
+- `ControlPlane` adapter trait; `file`, `s3`, `dynamodb`, `memory`
+  backends. One document, one version, conditional writes.
+- Fleet-wide `CARET_MASTER_KEY` sealing secrets, so any node can read
+  what any other node wrote.
+- Poll-based propagation and heartbeat-based liveness replacing
+  replication and membership; live-N limit shares kept.
+- Fleet page, `fleet` and `master-key` CLI, `[store]` config section.
 
 **Tests**
-- 3/5-node harness (in-process multi-node + docker-compose variant):
-  leader kill, minority partition (writes rejected, traffic flows),
-  heal/catch-up, node disk loss + rejoin, rolling upgrade N−1.
-- Jepsen-style linearizability check on config writes (or porcupine-rust
-  equivalent) — budgeted, nightly.
-- Chaos suite: clock skew, slow disk, dropped cluster packets — data
-  plane latency must stay flat (the "consensus off the hot path" claim,
-  tested).
-- Limit-share convergence test: kill a node, assert shares rescale within
-  the heartbeat bound.
+- Backend conformance suite run against all four backends, with S3 and
+  DynamoDB exercised over their real wire protocols against in-process
+  doubles: round trip, concurrent-writer conflict, concurrent-create
+  conflict, full-document fidelity, liveness.
+- Store facade: cached reads, operator CAS vs versionless retry,
+  cross-node secret round trip, refusal to start unshared.
+- Fleet behavior: propagation between nodes, shares tracking liveness,
+  serving through a store outage, two operators conflicting, a cold node
+  matching a warm one, and a config that fails to build being declined
+  rather than taking the node down.
+- Two real binaries over one store: propagation, clean-departure share
+  reclaim, cold join with no config file.
 
-**Exit**: v2 ships — 3-node cluster survives the full chaos suite with
-zero data-plane errors.
+**Exit**: v2 ships — scaling the node count up or down requires no
+coordination, and no node holds state whose loss matters.
 
 ---
 

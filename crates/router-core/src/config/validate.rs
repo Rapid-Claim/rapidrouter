@@ -34,7 +34,7 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
     let reliability = validate_reliability(&raw, &mut errors);
     let virtual_keys = validate_virtual_keys(&raw, &providers, &aliases, &mut errors);
     let console = validate_console(&raw, env, &mut errors);
-    let cluster = validate_cluster(&raw, env, &mut errors);
+    let store = validate_store(&raw, &mut errors);
     let usage = validate_usage(&raw, &mut errors);
     let pricing = validate_pricing(&raw, &mut errors);
 
@@ -47,7 +47,7 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
             reliability,
             virtual_keys,
             console,
-            cluster,
+            store,
             usage,
             pricing,
         })
@@ -243,55 +243,59 @@ fn validate_console(
     }
 }
 
-fn validate_cluster(
-    raw: &RawConfig,
-    env: &dyn EnvSource,
-    errors: &mut Vec<ConfigError>,
-) -> super::ClusterConfig {
-    let c = &raw.cluster;
-    if let Some(listen) = &c.listen
-        && listen.parse::<std::net::SocketAddr>().is_err()
-        && !listen.contains(':')
-    {
-        errors.push(ConfigError::new(
-            "cluster.listen",
-            "must be host:port, e.g. `0.0.0.0:9444`",
-        ));
-    }
-    for (i, peer) in c.join.iter().enumerate() {
-        if peer.is_empty() || !peer.contains(':') {
-            errors.push(ConfigError::new(
-                format!("cluster.join[{i}]"),
-                "must be host:port of a cluster peer, e.g. `box1.internal:9444`",
-            ));
-        }
-    }
-    if !c.join.is_empty() && c.listen.is_none() {
-        errors.push(ConfigError::new(
-            "cluster.listen",
-            "required when `cluster.join` is set — a joining node must be reachable by its peers",
-        ));
-    }
-    if c.listen.is_some() && c.token.is_none() {
-        errors.push(ConfigError::new(
-            "cluster.token",
-            "required when clustering is enabled (generate one with `caret-router cluster token`)",
-        ));
-    }
-    let token = c
-        .token
-        .as_ref()
-        .and_then(|value| match resolve_secret(value, env) {
-            Ok(secret) => Some(secret),
-            Err(msg) => {
-                errors.push(ConfigError::new("cluster.token", msg));
-                None
+fn validate_store(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> super::StoreConfig {
+    let s = &raw.store;
+    match s.backend.as_str() {
+        "file" | "memory" => {}
+        "s3" => {
+            if s.bucket.as_deref().unwrap_or("").is_empty() {
+                errors.push(ConfigError::new(
+                    "store.bucket",
+                    "required when `store.backend` is `s3`",
+                ));
             }
-        });
-    super::ClusterConfig {
-        listen: c.listen.clone(),
-        join: c.join.clone(),
-        token,
+        }
+        "dynamodb" => {
+            if s.table.as_deref().unwrap_or("").is_empty() {
+                errors.push(ConfigError::new(
+                    "store.table",
+                    "required when `store.backend` is `dynamodb`",
+                ));
+            }
+        }
+        other => errors.push(ConfigError::new(
+            "store.backend",
+            format!("unknown backend `{other}` — expected `file`, `s3`, or `dynamodb`"),
+        )),
+    }
+    // A liveness window shorter than the heartbeat means every node ages
+    // itself out between beats and the fleet count oscillates.
+    if s.liveness_window_secs <= s.heartbeat_interval_secs {
+        errors.push(ConfigError::new(
+            "store.liveness_window_secs",
+            format!(
+                "must be greater than store.heartbeat_interval_secs ({}s), or nodes age out \
+                 between their own heartbeats",
+                s.heartbeat_interval_secs
+            ),
+        ));
+    }
+    if s.refresh_interval_secs == 0 || s.heartbeat_interval_secs == 0 {
+        errors.push(ConfigError::new(
+            "store.refresh_interval_secs",
+            "intervals must be at least 1 second",
+        ));
+    }
+    super::StoreConfig {
+        backend: s.backend.clone(),
+        bucket: s.bucket.clone(),
+        prefix: s.prefix.clone(),
+        table: s.table.clone(),
+        region: s.region.clone(),
+        endpoint: s.endpoint.clone(),
+        refresh_interval_secs: s.refresh_interval_secs,
+        heartbeat_interval_secs: s.heartbeat_interval_secs,
+        liveness_window_secs: s.liveness_window_secs,
     }
 }
 

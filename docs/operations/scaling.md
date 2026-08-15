@@ -20,7 +20,7 @@ Two ways to run N instances:
 - **Cluster mode** (`managed` config): nodes replicate config/keys/secrets
   among themselves; the console edits the whole fleet from any node.
   The natural choice on VMs and for anyone who wants the console
-  read-write. See [clustering.md](clustering.md).
+  read-write. See [fleet.md](fleet.md).
 - **Stateless replicas** (`file` config): every instance gets the same
   config file and env secrets from your deploy tooling; instances don't
   talk to each other at all. The natural choice for GitOps and for

@@ -12,7 +12,7 @@ console = []
 [dependencies]
 router-core = { workspace = true }
 router-providers = { workspace = true }
-router-cluster = { workspace = true }
+router-store = { workspace = true }
 bytes = { workspace = true }
 fastrand = "2"
 memchr = { workspace = true }

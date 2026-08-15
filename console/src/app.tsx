@@ -32,7 +32,7 @@ import {
 import uPlot from "uplot";
 import { api, clearSession, login, sessionToken, type UsageRecord, type VirtualKey } from "./api";
 
-type Page = "overview" | "providers" | "routing" | "keys" | "usage" | "requests" | "playground" | "cluster" | "settings";
+type Page = "overview" | "providers" | "routing" | "keys" | "usage" | "requests" | "playground" | "fleet" | "settings";
 
 const navigation: Array<{ id: Page; label: string; icon: typeof CircleGauge }> = [
   { id: "overview", label: "Overview", icon: CircleGauge },
@@ -42,7 +42,7 @@ const navigation: Array<{ id: Page; label: string; icon: typeof CircleGauge }> =
   { id: "usage", label: "Usage", icon: ChartNoAxesCombined },
   { id: "requests", label: "Requests", icon: Activity },
   { id: "playground", label: "Playground", icon: Play },
-  { id: "cluster", label: "Cluster", icon: Network },
+  { id: "fleet", label: "Fleet", icon: Network },
 ];
 
 /// Settings is deliberately not a first-class page: it lives in the nav
@@ -58,7 +58,7 @@ const jumps: Record<string, Page> = {
   u: "usage",
   q: "requests",
   y: "playground",
-  c: "cluster",
+  c: "fleet",
   ",": "settings",
 };
 
@@ -163,7 +163,7 @@ export function App() {
             <Match when={page() === "usage"}><Usage refresh={refresh} /></Match>
             <Match when={page() === "requests"}><Requests refresh={refresh} /></Match>
             <Match when={page() === "playground"}><Playground /></Match>
-            <Match when={page() === "cluster"}><Cluster refresh={refresh} /></Match>
+            <Match when={page() === "fleet"}><Fleet refresh={refresh} /></Match>
             <Match when={page() === "settings"}><Settings refresh={refresh} /></Match>
           </Switch>
         </div>
@@ -211,7 +211,7 @@ function Overview(props: { refresh: () => number }) {
     </section>
     <div class="two-column">
       <section class="panel"><SectionTitle title="Gateway state" subtitle="Current local control-plane status" />
-        <dl class="facts"><Fact label="Mode" value={fleet()?.mode ?? "—"} /><Fact label="Store version" value={String(fleet()?.version ?? "—")} /><Fact label="Quorum" value={fleet()?.quorum ? "Available" : "Unavailable"} /></dl>
+        <dl class="facts"><Fact label="Mode" value={fleet()?.mode ?? "—"} /><Fact label="Store version" value={String(fleet()?.version ?? "—")} /><Fact label="Live nodes" value={String(fleet()?.live ?? 1)} /></dl>
       </section>
       <section class="panel"><SectionTitle title="Recent activity" subtitle="Latest metadata-only requests" />
         <RequestRows records={(requests()?.data ?? []).slice(0, 6)} compact />
@@ -348,88 +348,68 @@ function Playground() {
   }}><Play size={16} />{pending() ? "Running…" : "Run"}</button></section><section class="playground-output" aria-live="polite"><div><p class="eyebrow">Response</p><span>{meta()}</span></div><pre>{output() || "The model response will appear here."}</pre></section></div>;
 }
 
-function Cluster(props: { refresh: () => number }) {
+function Fleet(props: { refresh: () => number }) {
   const [fleet] = createResource(props.refresh, api.fleet);
-  const [token, setToken] = createSignal("");
-  const [error, setError] = createSignal("");
-  const members = createMemo(() => fleet()?.member_list ?? []);
-  const clustered = createMemo(() => members().length > 0);
+  const nodes = createMemo(() => fleet()?.nodes ?? []);
+  const shared = createMemo(() => nodes().length > 0);
+  const age = (ms: number) => ms < 1000 ? "just now" : Math.round(ms / 1000) + "s ago";
   return <div class="stack-lg">
-    <section class="summary-strip" aria-label="Cluster summary">
-      <Metric label="Live members" value={String(fleet()?.live ?? 1)} />
-      <Metric label="Voters" value={String(fleet()?.members ?? 1)} />
-      <Metric label="Applied version" value={String(fleet()?.version ?? 0)} />
-      <Metric label="Quorum" value={fleet()?.quorum ? "Available" : "Lost"} tone={fleet()?.quorum ? "default" : "danger"} />
+    <section class="summary-strip" aria-label="Fleet summary">
+      <Metric label="Live nodes" value={String(fleet()?.live ?? 1)} />
+      <Metric label="Rate-limit shares" value={String(fleet()?.shares ?? 1)} />
+      <Metric label="Store version" value={String(fleet()?.version ?? 0)} />
+      <Metric
+        label="Store"
+        value={fleet()?.reachable === false ? "Unreachable" : "Reachable"}
+        tone={fleet()?.reachable === false ? "danger" : "default"}
+      />
     </section>
 
-    <Show when={fleet() && !fleet()!.quorum}>
+    <Show when={fleet() && fleet()!.reachable === false}>
       <div class="notice" role="status">
-        This node cannot reach a quorum. It keeps serving traffic from the configuration it
-        last applied, and refuses configuration changes until enough members are back.
-      </div>
-    </Show>
-
-    <Show when={fleet() && fleet()!.live < fleet()!.members}>
-      <div class="notice" role="status">
-        {fleet()!.members - fleet()!.live} of {fleet()!.members} members are not responding.
-        Rate-limit shares have been redistributed across the {fleet()!.live} that are.
-        A member that is never coming back should be removed.
+        This node cannot reach the control-plane store. It keeps serving traffic from the
+        configuration it last loaded, and refuses configuration changes until the store
+        is back. Nothing needs to be done to the node itself.
       </div>
     </Show>
 
     <section class="panel">
       <SectionTitle
-        title="Fleet members"
-        subtitle={clustered()
-          ? "Every node serves this page; the view is the same from any of them"
-          : "Single node — a cluster of one. Add a node to form a cluster."}
+        title="Nodes"
+        subtitle="Every node is identical and serves this page; the view is the same from any of them"
       />
-      <Show when={clustered()} fallback={<Empty title="No peers" action="Start another node with --join <this-host>:9444 and the cluster token." />}>
+      <dl class="facts">
+        <Fact label="Backend" value={fleet()?.backend ?? "—"} />
+        <Fact label="This node" value={fleet()?.node ?? "local"} />
+      </dl>
+      <Show
+        when={shared()}
+        fallback={<Empty
+          title="No shared store"
+          action="This node keeps its configuration locally. Point several nodes at the same S3 bucket or DynamoDB table to run a fleet."
+        />}
+      >
         <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
           <table>
-            <thead><tr><th>Node</th><th>Address</th><th>Role</th><th>Applied</th><th>Lag</th><th /></tr></thead>
+            <thead><tr><th>Node</th><th>Address</th><th>Last heartbeat</th></tr></thead>
             <tbody>
-              <For each={members()}>{(member: any) => <tr>
-                <td><strong>{String(member.id).slice(0, 10)}…</strong><small>{member.is_self ? "this node" : member.voter ? "voter" : "learner"}</small></td>
-                <td class="mono">{member.addr}</td>
-                <td><Status text={member.leader ? "Leader" : "Follower"} tone={member.leader ? "success" : "muted"} /></td>
-                <td>{member.applied ?? "—"}</td>
-                <td>{member.lag === null || member.lag === undefined ? "—" : String(member.lag)}</td>
-                <td class="actions">
-                  <Show when={!member.is_self}>
-                    <button class="icon-button danger" title={"Remove " + member.id} aria-label={"Remove node " + member.id}
-                      onClick={async () => {
-                        if (!confirm("Remove node " + member.id + " from membership?\n\nDo this only for a node that is never coming back. The remaining members must still form a quorum.")) return;
-                        setError("");
-                        try { await api.removeNode(member.id); }
-                        catch (err) { setError(err instanceof Error ? err.message : "Remove failed"); }
-                      }}><Trash2 size={16} /></button>
-                  </Show>
+              <For each={nodes()}>{(node: any) => <tr>
+                <td>
+                  <strong>{String(node.id).slice(0, 13)}…</strong>
+                  <Show when={node.self}><small>this node</small></Show>
                 </td>
+                <td class="mono">{node.addr || "—"}</td>
+                <td>{age(node.age_ms ?? 0)}</td>
               </tr>}</For>
             </tbody>
           </table>
         </div>
       </Show>
-      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
-    </section>
-
-    <section class="panel">
-      <SectionTitle
-        title="Adding a node"
-        subtitle="Same binary, one command — the join streams a snapshot and starts serving"
-        action={<button class="button" onClick={async () => {
-          setError("");
-          try { setToken((await api.clusterToken()).token); }
-          catch (err) { setError(err instanceof Error ? err.message : "Could not read the token"); }
-        }}><KeyRound size={16} />Show join token</button>}
-      />
-      <Show when={token()} fallback={<p class="muted">The join token is a credential: anyone holding it can join this cluster. It is shown only when you ask for it.</p>}>
-        <div class="secret-banner">
-          <div><strong>Join token</strong><code>{token()}</code></div>
-          <button class="icon-button" title="Copy" aria-label="Copy join token" onClick={() => navigator.clipboard?.writeText(token())}><Copy size={16} /></button>
-        </div>
-      </Show>
+      <p class="hint">
+        Nodes appear here by writing a heartbeat to the store and disappear when they stop.
+        There is nothing to join and nothing to remove — scale the service and the fleet
+        follows. Rate limits are divided by the number of live nodes.
+      </p>
     </section>
   </div>;
 }

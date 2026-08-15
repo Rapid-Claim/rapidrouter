@@ -2,57 +2,96 @@
 
 Two rules govern the storage design:
 
-1. **The binary is the whole system.** One box, one binary, no external
-   services: the gateway runs, the console works, configuration changes
-   persist. Three boxes, the same binary: they form a cluster and
-   everything still works. Nothing else to deploy — no database, no object
-   store, no secrets manager *required* (all of them optionally pluggable).
+1. **A node holds nothing worth keeping.** Everything that must survive
+   lives in a control-plane store the node points at; everything on the
+   node itself is a cache it can rebuild by reading that store once. A
+   task can be destroyed mid-request and replaced by one that has never
+   run, and the replacement is indistinguishable from the original.
 2. **The data plane never depends on the control plane.** Routing traffic
-   requires only the local, already-applied state snapshot. Cluster
-   consensus, disk, even the entire control plane can be degraded and
-   requests keep flowing.
+   requires only the in-memory snapshot. The store can be unreachable,
+   the disk can be gone, and requests keep flowing.
+
+The first rule is what the second one buys. Because reads never touch the
+store, the store is allowed to be a remote service that occasionally
+fails — and once that is true, it can be S3 or DynamoDB instead of
+something running on the node.
 
 ## The state inventory
 
 | State | Nature | Home |
 |---|---|---|
-| Config document (providers, aliases, fallbacks, limits, virtual keys) | small, rarely written, must converge | **embedded replicated store** (below) — or a plain file in `file` mode |
-| Provider secrets | sensitive | `env.*` references (your platform injects), or `store.*` references (entered once, encrypted at rest, replicated) |
+| Config document (providers, aliases, fallbacks, limits, virtual keys) | small, rarely written, must converge | **the control-plane store** (below) — or a plain file in `file` mode |
+| Provider secrets | sensitive | `env.*` references (your platform injects), or `store.*` references (entered once, encrypted under the fleet's master key) |
 | Breaker / health / in-flight | ephemeral, hot | in-memory per node, deliberately never shared |
-| Usage & spend records | append-only events | local JSONL partitions in the data dir; cluster-wide views by scatter-gather; optional external sink |
+| Usage & spend records | append-only events | local JSONL partitions in the data dir; fleet-wide views by scatter-gather; optional external sink |
 | Metrics | time series | your Prometheus — `/metrics` per node |
 | Console assets | static | embedded in the binary |
 
-## The embedded replicated store
+## The control-plane store
 
-The control-plane state lives in a Raft-replicated document store built
-into the binary (`router-cluster` crate; WAL + snapshots under
-`--data-dir`, default `/var/lib/caret-router`).
+All control-plane state is **one small JSON document** — config text,
+virtual keys, sealed secrets, settings — plus a version. Where that
+document lives is a backend choice behind one trait
+(`router-store::backend::ControlPlane`):
 
-**A single node is simply a cluster of one.** Same code path, no special
-mode: the Raft log has one voter, writes commit instantly, and the
-overhead is a WAL append on config changes — i.e., almost never. This is
-what makes "spin up a binary in one box and it works" and "three boxes
-form a cluster" the *same* product rather than two products.
+| Backend | Document | Concurrency |
+|---|---|---|
+| `file` | `store.json` under `--data-dir` | version re-read under a rename |
+| `s3` | one object in a bucket | `If-Match` / `If-None-Match` |
+| `dynamodb` | one item in a table | `ConditionExpression` on `version` |
 
-What is replicated: the config document (versioned), virtual keys,
-`store.*` secrets (as ciphertext), and console/admin settings. What is
-not: anything ephemeral or high-write — breakers, in-flight counts, and
-usage events stay node-local by design.
+Adding Postgres or anything else means implementing that trait; nothing
+above it changes.
+
+**There is no consensus.** Ordering comes from the backend's conditional
+write, not a replicated log. For a document that changes when a human
+edits it, that is the right trade — and it is what removes per-node
+state, node identity, membership, quorum, and the join flow all at once.
+
+What lives in the document: the config (versioned), virtual keys,
+`store.*` secrets as ciphertext, and console settings. What does not:
+anything ephemeral or high-write — breakers, in-flight counts, and usage
+events stay node-local by design.
 
 ### Write path
+
 A change (console, admin API, or CLI) is validated **totally** first, then
-committed through the leader to a majority, then applied on every node via
-the same atomic routing-table swap as a file reload. Any node accepts a
-write and forwards it to the leader transparently. Every write carries the
-version it was based on — concurrent edits conflict visibly instead of
-last-write-wins.
+written back with a compare-and-swap on the version it was based on. A
+losing write gets a visible conflict instead of a silent overwrite: if the
+caller supplied the version it was looking at, the conflict is reported to
+them; if it did not, the node re-reads and retries. Any node accepts a
+write — there is no leader to forward to.
 
 ### Read path
-Every node holds a full replica; data-plane reads are the usual lock-free
-snapshot loads. **Loss of quorum stops config *writes*, never traffic**:
-nodes continue serving from their last applied state until the cluster
-heals.
+
+Reads never leave the process. Each node keeps the document in memory and
+refreshes it on a timer (default 3s), swapping the routing table
+atomically the same way a file reload does. That is the whole propagation
+mechanism: no leader, no push, no replication stream.
+
+A config that fails to build on a particular node — most often an `env.*`
+or `store.*` reference it cannot resolve mid-rollout — is **not adopted**.
+The node logs why and keeps serving the last good one, rather than taking
+itself down over a problem it did not cause.
+
+**Store unavailable stops config *writes*, never traffic.** Nodes serve
+from the last document they read until it returns.
+
+### Secrets and the master key
+
+Secrets are sealed with XChaCha20-Poly1305 before they reach the store,
+so the bucket or table holds only ciphertext. The key is fleet-wide and
+supplied out of band as `CARET_MASTER_KEY`; a node pointed at a shared
+store without one refuses to start, because sealing under a key no other
+node holds fails silently and presents as a bad API key.
+
+### Liveness
+
+Nodes announce themselves by writing a heartbeat to the same store and
+count the recent ones to size rate-limit shares. A node that stops
+beating ages out; one that shuts down cleanly removes its own heartbeat
+immediately. That is the entirety of membership — see
+[../operations/fleet.md](../operations/fleet.md).
 
 ## Config modes
 

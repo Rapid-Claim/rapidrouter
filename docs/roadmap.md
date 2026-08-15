@@ -40,17 +40,17 @@ The surface documented throughout these docs:
   multipart.
 - `/v1/images/generations`, `/v1/files` (relay).
 
-## v2 — realtime & cluster
+## v2 — realtime & fleet
 
 - `/v1/realtime`: WebSocket proxy mode + WebRTC ephemeral-token mode
   (audio bypasses the gateway; governance stays), per-session metering.
-- **Cluster mode**: multi-node replication of the managed store (Raft),
+- **Fleet mode**: stateless nodes over a shared external store (S3, DynamoDB),
   join tokens, peer scatter-gather for fleet views, live-N rate-limit
-  shares ([operations/clustering.md](operations/clustering.md)).
+  shares ([operations/fleet.md](operations/fleet.md)).
 - Gateway-side Responses statefulness (`store`, `previous_response_id` for
   translated targets) — persisted in the replicated store; decided
   deliberately.
-- Idle-share quota rebalancing across cluster members (strict global
+- Idle-share quota rebalancing across fleet nodes (strict global
   limits stay permanently out of scope — consensus never belongs on the
   hot path).
 

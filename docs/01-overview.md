@@ -31,7 +31,7 @@ routes, translates, load-balances, meters, and protects.
    verified properties (loom, proptest), not intentions.
 4. **Operational simplicity.** One static binary that is the whole system —
    gateway, console, and storage. One box works with nothing else
-   installed; three boxes form a cluster with nothing else installed.
+   installed; N boxes share one S3 bucket or DynamoDB table and nothing else.
    Config changes can never take the gateway down.
 5. **Trust.** The gateway holds every provider key you own. Minimal audited
    dependencies, signed releases, SBOM, no telemetry.
@@ -51,7 +51,7 @@ routes, translates, load-balances, meters, and protects.
 | Config | Single TOML/JSON file or console-managed; `env.*`/`store.*` secret references; atomic hot reload |
 | Virtual keys | Scoped gateway credentials with budgets and rate limits — provider keys never leave the gateway ([components/virtual-keys.md](components/virtual-keys.md)) |
 | Web console | Embedded single-page app at `/console` — dashboards, config editing, keys, playground; no separate deployment ([components/console.md](components/console.md)) |
-| Cluster mode | N boxes, same binary: replicated config/keys/secrets, no external services ([operations/clustering.md](operations/clustering.md)) |
+| Fleet mode | N stateless nodes, same binary, sharing one external store — S3 or DynamoDB ([operations/fleet.md](operations/fleet.md)) |
 | Observability | Prometheus metrics, structured JSON logs, optional OTLP traces, `x-caret-overhead-us` receipt header |
 
 ## Non-goals
@@ -66,5 +66,5 @@ routes, translates, load-balances, meters, and protects.
 
 See [roadmap.md](roadmap.md) for the release plan: the v1.0 surface above;
 then the managed config store, web console, governance (virtual keys,
-budgets), and audio endpoints; then multi-node cluster mode and realtime
+budgets), and audio endpoints; then the stateless fleet model and realtime
 audio-to-audio.

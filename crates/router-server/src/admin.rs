@@ -10,9 +10,9 @@ use axum::response::sse::{Event, KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
-use router_cluster::{Command, StoreError};
 use router_core::config::{Config, Format};
 use router_core::vkey::{self, Budget, RateLimit, VirtualKeyDef};
+use router_store::{Command, ControlPlaneError};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
@@ -27,8 +27,6 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage", get(usage))
         .route("/requests", get(requests))
         .route("/fleet", get(fleet))
-        .route("/cluster/token", get(cluster_token))
-        .route("/cluster/remove", post(cluster_remove))
         .route("/events", get(events))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -59,7 +57,7 @@ fn writable(state: &AppState) -> Result<(), Response> {
             "file mode is read-only; edit the source file and reload",
         ));
     }
-    if state.cluster.get().is_some() || state.store.is_some() {
+    if state.store.is_some() {
         return Ok(());
     }
     Err(api_error(
@@ -69,30 +67,15 @@ fn writable(state: &AppState) -> Result<(), Response> {
 }
 
 /// Turn a commit failure into the operator-facing distinction that
-/// matters: a visible conflict, a quorum problem, or a real fault.
-fn commit_error(message: String) -> Response {
-    let lower = message.to_lowercase();
-    let status = if lower.contains("conflict") {
-        StatusCode::CONFLICT
-    } else if lower.contains("quorum") || lower.contains("leader") {
-        StatusCode::SERVICE_UNAVAILABLE
-    } else if lower.contains("read-only") {
-        StatusCode::FORBIDDEN
-    } else {
-        StatusCode::INTERNAL_SERVER_ERROR
+/// matters: an edit that raced someone else, a store that is down, or a
+/// configuration problem only a human can fix.
+fn commit_error(err: ControlPlaneError) -> Response {
+    let status = match err {
+        ControlPlaneError::Conflict { .. } => StatusCode::CONFLICT,
+        ControlPlaneError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
+        ControlPlaneError::Fault(_) => StatusCode::INTERNAL_SERVER_ERROR,
     };
-    api_error(status, message)
-}
-
-#[allow(dead_code)]
-fn map_store_error(err: StoreError) -> Response {
-    match err {
-        StoreError::CasConflict { expected, actual } => api_error(
-            StatusCode::CONFLICT,
-            format!("version conflict: expected {expected}, current version is {actual}"),
-        ),
-        other => api_error(StatusCode::INTERNAL_SERVER_ERROR, other.to_string()),
-    }
+    api_error(status, err.to_string())
 }
 
 #[derive(Deserialize)]
@@ -211,10 +194,11 @@ async fn put_config(
             std::env::var(name).ok()
         }
     };
-    let config = match Config::from_str_with_env(&input.text, Format::Toml, &env) {
-        Ok(config) => config,
-        Err(err) => return api_error(StatusCode::UNPROCESSABLE_ENTITY, err.to_string()),
-    };
+    // Validate before committing, so a bad config is rejected instead of
+    // stored and then rejected by every node that reads it.
+    if let Err(err) = Config::from_str_with_env(&input.text, Format::Toml, &env) {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, err.to_string());
+    }
     let version = match state
         .commit(Some(input.version), Command::PutConfig { text: input.text })
         .await
@@ -222,7 +206,9 @@ async fn put_config(
         Ok(version) => version,
         Err(err) => return commit_error(err),
     };
-    state.apply_config(config);
+    // Adopt through the same path a remote change takes, so there is one
+    // place where a config becomes live on a node.
+    state.adopt_store_state();
     Json(json!({ "version": version })).into_response()
 }
 
@@ -485,99 +471,66 @@ async fn requests(
     .into_response()
 }
 
+/// What the console's Fleet page reads: which store is authoritative,
+/// and who else is currently serving traffic against it.
+///
+/// There are no roles, no terms and no quorum here, because there is no
+/// consensus — every node is identical and the list is simply whoever has
+/// heartbeated recently.
 async fn fleet(State(state): State<Arc<AppState>>) -> Response {
     let mode = if state.file_managed {
         "file"
     } else {
         "managed"
     };
-    let Some(cluster) = state.cluster.get() else {
-        // Single node: a cluster of one, described in the same shape so
-        // the console renders one code path.
-        let version = state.store_read().map(|(_, v)| v).unwrap_or(0);
+    let Some(store) = state.store.as_deref() else {
         return Json(json!({
             "mode": mode,
-            "node": state.store.as_deref().map(|s| s.node_id()).unwrap_or("local"),
-            "version": version,
-            "role": "single",
-            "members": 1,
+            "node": "local",
+            "backend": "none",
+            "version": 0,
             "live": 1,
-            "quorum": true,
-            "shares": state.live_nodes(),
-            "member_list": [],
+            "shares": 1,
+            "nodes": [],
         }))
         .into_response();
     };
 
-    let fleet = cluster.fleet().await;
+    let window = state.liveness_window;
+    let (nodes, reachable) = match store.peers(window).await {
+        Ok(peers) => (peers, true),
+        // The store being unreachable is worth showing, but it is not an
+        // error for this endpoint: this node is still serving.
+        Err(err) => {
+            tracing::warn!(%err, "could not list the fleet");
+            (Vec::new(), false)
+        }
+    };
+
+    let now = router_store::backend::now_ms_for_tests();
+    let listed: Vec<serde_json::Value> = nodes
+        .iter()
+        .map(|beat| {
+            json!({
+                "id": beat.id,
+                "addr": beat.addr,
+                "age_ms": beat.age(now).as_millis() as u64,
+                "self": beat.id == store.node_id(),
+            })
+        })
+        .collect();
+
     Json(json!({
         "mode": mode,
-        "node": cluster.id.to_string(),
-        "version": fleet.applied,
-        "role": if fleet.leader == Some(cluster.id) { "leader" } else { "follower" },
-        "term": fleet.term,
-        "members": fleet.voters,
-        "live": fleet.live,
-        "quorum": fleet.quorum,
+        "node": store.node_id(),
+        "backend": store.describe(),
+        "reachable": reachable,
+        "version": store.version(),
+        "live": store.live_nodes(),
         "shares": state.live_nodes(),
-        "leader": fleet.leader.map(|l| l.to_string()),
-        "member_list": fleet.members,
+        "nodes": listed,
     }))
     .into_response()
-}
-
-/// The join token, for the console's Cluster page. Admin-only, and the
-/// page states plainly that it is a credential.
-async fn cluster_token(State(state): State<Arc<AppState>>) -> Response {
-    let Some(store) = state.store.as_deref() else {
-        return api_error(
-            StatusCode::CONFLICT,
-            "this node has no store, so it cannot be part of a cluster",
-        );
-    };
-    match store.join_token() {
-        Ok(token) => Json(json!({
-            "token": token.encode(),
-            "cluster": token.cluster_id(),
-            "note": "Anyone holding this token can join the cluster.",
-        }))
-        .into_response(),
-        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-    }
-}
-
-#[derive(serde::Deserialize)]
-struct RemoveNode {
-    id: u64,
-}
-
-/// Remove a node that is never coming back. Membership is replicated, so
-/// this must run on the leader; a follower says where to go.
-async fn cluster_remove(
-    State(state): State<Arc<AppState>>,
-    Json(body): Json<RemoveNode>,
-) -> Response {
-    let Some(cluster) = state.cluster.get() else {
-        return api_error(
-            StatusCode::CONFLICT,
-            "this node is not clustered — there is no membership to change",
-        );
-    };
-    match cluster.remove_voter(body.id).await {
-        Ok(()) => Json(json!({ "removed": body.id })).into_response(),
-        Err(router_cluster::raft::ClusterError::NotLeader { .. }) => {
-            let leader = cluster.leader_addr().await;
-            (
-                StatusCode::CONFLICT,
-                Json(json!({
-                    "error": { "message": "membership changes must go through the leader" },
-                    "leader": leader,
-                })),
-            )
-                .into_response()
-        }
-        Err(err) => api_error(StatusCode::SERVICE_UNAVAILABLE, err.to_string()),
-    }
 }
 
 async fn events(

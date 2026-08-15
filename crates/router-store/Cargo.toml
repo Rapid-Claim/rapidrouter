@@ -1,0 +1,33 @@
+[package]
+name = "router-store"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+arc-swap = { workspace = true }
+async-trait = "0.1"
+aws-config = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "sso"] }
+aws-sdk-dynamodb = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio"] }
+aws-sdk-s3 = { version = "1", default-features = false, features = ["behavior-version-latest", "rt-tokio", "sigv4a"] }
+aws-smithy-http-client = { version = "1", default-features = false, features = ["rustls-ring"] }
+aws-smithy-runtime-api = "1"
+base64 = { workspace = true }
+chacha20poly1305 = { workspace = true }
+fastrand = "2"
+router-core = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true, features = ["time", "rt", "macros", "sync"] }
+tracing.workspace = true
+uuid = { workspace = true }
+
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+aws-smithy-types = "1"
+axum = { workspace = true, features = ["json"] }
+tempfile = "3"
+tokio = { workspace = true, features = ["net", "rt-multi-thread"] }

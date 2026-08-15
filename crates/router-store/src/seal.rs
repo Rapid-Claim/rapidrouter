@@ -1,7 +1,18 @@
-//! Sealed secrets: XChaCha20-Poly1305 under a data-encryption key minted
-//! at first boot (`node.key`, mode 0600). Values are decrypted only in
-//! memory; the store, its backups, and the replication stream carry
+//! Sealed secrets: XChaCha20-Poly1305 under a data-encryption key.
+//! Values are decrypted only in memory; the store and its backups carry
 //! ciphertext.
+//!
+//! Where the key comes from is the whole design question, because every
+//! node has to derive the *same* one. A key minted per node works for a
+//! single box and silently breaks the moment a second node reads a secret
+//! the first one sealed — it holds different bytes, so the unseal returns
+//! `None` and a provider looks unconfigured.
+//!
+//! So a shared backend requires `CARET_MASTER_KEY`: 32 bytes of base64
+//! that the operator supplies to every task, from Secrets Manager, SSM,
+//! or whatever their platform uses. Only the single-node file backend
+//! falls back to minting a key on disk, where "every node" is one node
+//! and there is nothing to disagree with.
 
 use std::fs;
 use std::io;
@@ -24,6 +35,25 @@ pub struct Sealer {
     cipher: XChaCha20Poly1305,
 }
 
+/// The environment variable holding the cluster-wide key.
+pub const MASTER_KEY_ENV: &str = "CARET_MASTER_KEY";
+
+#[derive(Debug, thiserror::Error)]
+pub enum KeyError {
+    #[error(
+        "{MASTER_KEY_ENV} is not set. A shared control-plane store needs one key across every \
+         node, or secrets sealed by one node cannot be read by the others. Generate one with \
+         `caret-router master-key` and supply it to every node."
+    )]
+    Missing,
+    #[error(
+        "{MASTER_KEY_ENV} is not 32 bytes of base64. Generate one with `caret-router master-key`."
+    )]
+    Malformed,
+    #[error("reading the node key: {0}")]
+    Io(#[from] io::Error),
+}
+
 #[derive(Serialize, Deserialize)]
 struct NodeKeyFile {
     node_id: String,
@@ -31,8 +61,36 @@ struct NodeKeyFile {
 }
 
 impl Sealer {
-    /// Load the node key, creating one on first boot. Returns the sealer
-    /// and the node's stable identity.
+    /// Mint a fresh master key in the form the environment variable wants.
+    pub fn generate_master_key() -> String {
+        let mut key = [0u8; 32];
+        fastrand::fill(&mut key);
+        B64.encode(key)
+    }
+
+    /// The cluster-wide key from the environment. Required whenever more
+    /// than one node can reach the store.
+    pub fn from_env() -> Result<Self, KeyError> {
+        let raw = std::env::var(MASTER_KEY_ENV)
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+            .ok_or(KeyError::Missing)?;
+        Self::from_master_key(raw.trim())
+    }
+
+    pub fn from_master_key(b64: &str) -> Result<Self, KeyError> {
+        let key = B64
+            .decode(b64)
+            .ok()
+            .filter(|b| b.len() == 32)
+            .ok_or(KeyError::Malformed)?;
+        Ok(Self {
+            cipher: XChaCha20Poly1305::new_from_slice(&key).expect("32-byte key"),
+        })
+    }
+
+    /// Single-node fallback: the key lives beside the data, minted on
+    /// first boot. Never used with a shared backend.
     pub fn load_or_create(path: &Path) -> io::Result<(Self, String)> {
         let parsed: NodeKeyFile = match fs::read(path) {
             Ok(bytes) => serde_json::from_slice(&bytes).map_err(|e| {

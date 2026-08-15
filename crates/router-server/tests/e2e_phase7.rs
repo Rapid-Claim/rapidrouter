@@ -1,7 +1,28 @@
 use std::sync::Arc;
 
 use mock_provider::MockProvider;
-use router_cluster::{Command, Store};
+use router_store::{BackendSpec, Command, Store};
+
+/// Tests run against the file backend: real compare-and-swap semantics,
+/// no AWS, nothing shared between tests.
+async fn open_test_store(dir: &std::path::Path) -> Store {
+    Store::open(
+        &BackendSpec::File {
+            path: dir.join("store.json"),
+        },
+        dir,
+        "127.0.0.1:0",
+    )
+    .await
+    .expect("the file backend opens")
+}
+
+async fn commit(store: &Store, expect: Option<u64>, command: Command) -> u64 {
+    store
+        .commit(expect, command)
+        .await
+        .expect("commit succeeds")
+}
 use router_core::config::{Config, Format};
 use router_server::{AppState, build_router};
 use serde_json::{Value, json};
@@ -14,7 +35,7 @@ struct Harness {
 
 async fn managed_gateway(mock: &MockProvider) -> Harness {
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store = Arc::new(open_test_store(dir.path()).await);
     let text = format!(
         r#"
 [server]
@@ -29,9 +50,7 @@ keys = [{{ name = "main", value = "sk-mock", models = ["gpt-4o", "gpt-4o-mini"] 
 "#,
         mock.base_url()
     );
-    store
-        .commit(None, Command::PutConfig { text: text.clone() })
-        .unwrap();
+    commit(&store, None, Command::PutConfig { text: text.clone() }).await;
     let config = Config::from_str_with_env(&text, Format::Toml, &|_: &str| None).unwrap();
     let state = AppState::managed(config, store.clone(), dir.path().to_owned());
     let app = build_router(state.clone());
@@ -152,7 +171,7 @@ async fn config_writes_use_cas_and_file_mode_is_read_only() {
     assert_eq!(stale.status(), 409);
 
     let dir = tempfile::tempdir().unwrap();
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store = Arc::new(open_test_store(dir.path()).await);
     let config_text = format!(
         "[console]\nadmin_keys=[\"admin-test-key\"]\n[providers.openai]\nbase_url=\"{}\"\nkeys=[{{name=\"main\",value=\"x\"}}]\n",
         mock.base_url()
@@ -330,15 +349,15 @@ fast = "openai/gpt-4o"
     );
 
     // Managed: the store owns the document.
-    let store = Arc::new(Store::open(dir.path()).unwrap());
-    store
-        .commit(
-            None,
-            Command::PutConfig {
-                text: original.clone(),
-            },
-        )
-        .unwrap();
+    let store = Arc::new(open_test_store(dir.path()).await);
+    commit(
+        &store,
+        None,
+        Command::PutConfig {
+            text: original.clone(),
+        },
+    )
+    .await;
     let exported = store.read().0.config_text.expect("managed document");
     assert_eq!(
         exported, original,
@@ -354,11 +373,9 @@ fast = "openai/gpt-4o"
 
     // Managed again: importing the same file reproduces the document, and
     // a second import is a new version rather than a conflict.
-    let store = Arc::new(Store::open(dir.path()).unwrap());
+    let store = Arc::new(open_test_store(dir.path()).await);
     let reimported = std::fs::read_to_string(&path).unwrap();
-    let version = store
-        .commit(None, Command::PutConfig { text: reimported })
-        .unwrap();
+    let version = commit(&store, None, Command::PutConfig { text: reimported }).await;
     assert!(version >= 2);
     assert_eq!(
         store.read().0.config_text.as_deref(),
