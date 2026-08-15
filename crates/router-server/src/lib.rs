@@ -79,6 +79,7 @@ pub fn build_router(state: Arc<AppState>) -> Router {
 
     let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/responses", post(responses))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/models", get(proxy::models))
@@ -152,6 +153,14 @@ async fn genai_generate(
         Ok(inbound) => proxy::handle_chat(state, inbound, headers).await,
         Err(err) => proxy::error_response_in(dialect, &err),
     }
+}
+
+async fn responses(
+    State(state): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
+    proxy::handle_responses(state, headers, body).await
 }
 
 async fn completions(

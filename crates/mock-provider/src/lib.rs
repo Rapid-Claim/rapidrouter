@@ -50,6 +50,7 @@ impl MockProvider {
             .route("/chat/completions", post(chat_completions))
             .route("/completions", post(completions))
             .route("/embeddings", post(embeddings))
+            .route("/responses", post(openai_responses))
             .route("/v1/messages", post(anthropic_messages))
             .route("/v1beta/models/{model_action}", post(gemini_generate))
             .with_state(shared.clone());
@@ -539,4 +540,143 @@ fn paced_sse(frames: Vec<String>) -> Response {
         .header(header::CONTENT_TYPE, "text/event-stream")
         .body(Body::from_stream(stream))
         .unwrap()
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Responses-dialect upstream (native relay target)
+// ---------------------------------------------------------------------------
+
+async fn openai_responses(
+    State(shared): State<Shared>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed = record(&shared, "/responses", &headers, &body).await;
+    let model = parsed["model"].as_str().unwrap_or("unknown").to_owned();
+    if let Some(failure) = scripted_failure(&shared, &model).await {
+        return failure;
+    }
+    let with_tools = parsed.get("tools").is_some();
+
+    if parsed["stream"] == json!(true) {
+        let ev = |name: &str, data: Value| format!("event: {name}\ndata: {data}\n\n");
+        let frames = if with_tools {
+            vec![
+                ev(
+                    "response.created",
+                    json!({"type": "response.created", "sequence_number": 0,
+                    "response": {"id": "resp_mock", "object": "response", "status": "in_progress", "model": model, "output": []}}),
+                ),
+                ev(
+                    "response.output_item.added",
+                    json!({"type": "response.output_item.added", "sequence_number": 1,
+                    "output_index": 0, "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                    "name": "get_weather", "arguments": "", "status": "in_progress"}}),
+                ),
+                ev(
+                    "response.function_call_arguments.delta",
+                    json!({"type": "response.function_call_arguments.delta",
+                    "sequence_number": 2, "item_id": "fc_1", "output_index": 0, "delta": "{\"city\":"}),
+                ),
+                ev(
+                    "response.function_call_arguments.delta",
+                    json!({"type": "response.function_call_arguments.delta",
+                    "sequence_number": 3, "item_id": "fc_1", "output_index": 0, "delta": "\"Paris\"}"}),
+                ),
+                ev(
+                    "response.function_call_arguments.done",
+                    json!({"type": "response.function_call_arguments.done",
+                    "sequence_number": 4, "item_id": "fc_1", "output_index": 0, "arguments": "{\"city\":\"Paris\"}"}),
+                ),
+                ev(
+                    "response.output_item.done",
+                    json!({"type": "response.output_item.done", "sequence_number": 5,
+                    "output_index": 0, "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                    "name": "get_weather", "arguments": "{\"city\":\"Paris\"}", "status": "completed"}}),
+                ),
+                ev(
+                    "response.completed",
+                    json!({"type": "response.completed", "sequence_number": 6,
+                    "response": {"id": "resp_mock", "object": "response", "status": "completed", "model": model,
+                    "output": [{"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                    "name": "get_weather", "arguments": "{\"city\":\"Paris\"}", "status": "completed"}],
+                    "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}}}),
+                ),
+            ]
+        } else {
+            vec![
+                ev(
+                    "response.created",
+                    json!({"type": "response.created", "sequence_number": 0,
+                    "response": {"id": "resp_mock", "object": "response", "status": "in_progress", "model": model, "output": []}}),
+                ),
+                ev(
+                    "response.output_item.added",
+                    json!({"type": "response.output_item.added", "sequence_number": 1,
+                    "output_index": 0, "item": {"type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "in_progress", "content": []}}),
+                ),
+                ev(
+                    "response.content_part.added",
+                    json!({"type": "response.content_part.added", "sequence_number": 1,
+                    "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                    "part": {"type": "output_text", "text": "", "annotations": []}}),
+                ),
+                ev(
+                    "response.output_text.delta",
+                    json!({"type": "response.output_text.delta", "sequence_number": 2,
+                    "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": "mock "}),
+                ),
+                ev(
+                    "response.output_text.delta",
+                    json!({"type": "response.output_text.delta", "sequence_number": 3,
+                    "item_id": "msg_1", "output_index": 0, "content_index": 0, "delta": "stream"}),
+                ),
+                ev(
+                    "response.output_text.done",
+                    json!({"type": "response.output_text.done", "sequence_number": 4,
+                    "item_id": "msg_1", "output_index": 0, "content_index": 0, "text": "mock stream"}),
+                ),
+                ev(
+                    "response.content_part.done",
+                    json!({"type": "response.content_part.done", "sequence_number": 4,
+                    "item_id": "msg_1", "output_index": 0, "content_index": 0,
+                    "part": {"type": "output_text", "text": "mock stream", "annotations": []}}),
+                ),
+                ev(
+                    "response.output_item.done",
+                    json!({"type": "response.output_item.done", "sequence_number": 5,
+                    "output_index": 0, "item": {"type": "message", "id": "msg_1", "role": "assistant",
+                    "status": "completed", "content": [{"type": "output_text", "text": "mock stream", "annotations": []}]}}),
+                ),
+                ev(
+                    "response.completed",
+                    json!({"type": "response.completed", "sequence_number": 6,
+                    "response": {"id": "resp_mock", "object": "response", "status": "completed", "model": model,
+                    "output": [{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                    "content": [{"type": "output_text", "text": "mock stream", "annotations": []}]}],
+                    "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10}}}),
+                ),
+            ]
+        };
+        return paced_sse(frames);
+    }
+
+    let output = if with_tools {
+        json!([{"type": "function_call", "id": "fc_1", "call_id": "call_1",
+                "name": "get_weather", "arguments": "{\"city\":\"Paris\"}", "status": "completed"}])
+    } else {
+        json!([{"type": "message", "id": "msg_1", "role": "assistant", "status": "completed",
+                "content": [{"type": "output_text", "text": "mock response", "annotations": []}]}])
+    };
+    axum::Json(json!({
+        "id": "resp_mock",
+        "object": "response",
+        "status": "completed",
+        "model": model,
+        "output": output,
+        "usage": {"input_tokens": 7, "output_tokens": 3, "total_tokens": 10},
+        "error": null,
+    }))
+    .into_response()
 }

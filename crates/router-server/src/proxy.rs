@@ -19,7 +19,7 @@ use router_core::config::{AuthMode, RetryOn};
 use router_core::router::{KeyRuntime, ResolvedRoute, RoutePlan};
 use router_core::sse::SseParser;
 use router_core::{ErrorClass, GatewayError, clock, json};
-use router_providers::{Dialect, InboundStream, UpstreamStream};
+use router_providers::{Dialect, InboundStream, RenderTarget, UpstreamStream};
 use serde_json::Value;
 
 use crate::AppState;
@@ -330,7 +330,8 @@ async fn run_chat(
                 &plan,
                 is_last_candidate,
                 TranslationCtx {
-                    in_dialect,
+                    passthrough: out_dialect == in_dialect,
+                    render: RenderTarget::Dialect(in_dialect),
                     out_dialect,
                     stream,
                     emulated,
@@ -362,7 +363,10 @@ async fn run_chat(
 
 #[derive(Clone, Copy)]
 struct TranslationCtx {
-    in_dialect: Dialect,
+    /// Raw forward: no translation on the response path.
+    passthrough: bool,
+    /// The shape the client is owed when translating.
+    render: RenderTarget,
     out_dialect: Dialect,
     stream: bool,
     emulated: bool,
@@ -418,7 +422,7 @@ async fn attempt(
                 );
             }
 
-            if ctx.in_dialect == ctx.out_dialect {
+            if ctx.passthrough {
                 return AttemptOutcome::Serve(forward_response(response, permit));
             }
             translated_response(route, response, permit, ctx).await
@@ -453,7 +457,7 @@ async fn translated_response(
             .with_provider(&route.provider.name)
             .with_upstream_status(status.as_u16());
         drop(permit);
-        let mut response = error_response_in(ctx.in_dialect, &err);
+        let mut response = error_response_for(ctx.render, &err);
         // Preserve the upstream's status; class mapping may coarsen it.
         *response.status_mut() = status;
         return AttemptOutcome::Serve(response);
@@ -464,7 +468,7 @@ async fn translated_response(
             Ok(body) => body,
             Err(err) => {
                 drop(permit);
-                return AttemptOutcome::Serve(error_response_in(ctx.in_dialect, &err));
+                return AttemptOutcome::Serve(error_response_for(ctx.render, &err));
             }
         };
         drop(permit);
@@ -475,15 +479,15 @@ async fn translated_response(
             ctx.emulated,
         ) {
             Ok(v) => v,
-            Err(err) => return AttemptOutcome::Serve(error_response_in(ctx.in_dialect, &err)),
+            Err(err) => return AttemptOutcome::Serve(error_response_for(ctx.render, &err)),
         };
-        let rendered = router_providers::render_response(ctx.in_dialect, &openai);
+        let rendered = router_providers::render_for(ctx.render, &openai);
         return AttemptOutcome::Serve((StatusCode::OK, axum::Json(rendered)).into_response());
     }
 
     // Streaming: upstream SSE -> internal chunks -> inbound frames.
     let translator = UpstreamStream::new(ctx.out_dialect, &route.upstream_model, ctx.emulated);
-    let formatter = InboundStream::new(ctx.in_dialect);
+    let formatter = InboundStream::new_for(ctx.render);
     let body = translated_stream_body(response.into_body(), permit, translator, formatter);
     let response = Response::builder()
         .status(StatusCode::OK)
@@ -763,7 +767,8 @@ async fn run_relay(
                 upstream_body,
             )?;
             let ctx = TranslationCtx {
-                in_dialect: Dialect::OpenAi,
+                passthrough: true,
+                render: RenderTarget::Dialect(Dialect::OpenAi),
                 out_dialect: Dialect::OpenAi,
                 stream: false,
                 emulated: false,
@@ -860,9 +865,13 @@ pub fn error_response(err: &GatewayError) -> Response {
 }
 
 pub fn error_response_in(dialect: Dialect, err: &GatewayError) -> Response {
+    error_response_for(RenderTarget::Dialect(dialect), err)
+}
+
+pub fn error_response_for(render: RenderTarget, err: &GatewayError) -> Response {
     let status =
         StatusCode::from_u16(err.class.http_status()).expect("taxonomy statuses are valid");
-    let body = router_providers::render_error(dialect, err);
+    let body = router_providers::render_error_for(render, err);
     let mut response = (status, axum::Json(body)).into_response();
     if err.class == ErrorClass::RateLimited || err.class == ErrorClass::NoCapacity {
         response
@@ -909,4 +918,170 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
         }));
     }
     axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
+}
+
+// ---------------------------------------------------------------------------
+// The Responses API endpoint
+// ---------------------------------------------------------------------------
+
+pub async fn handle_responses(state: Arc<AppState>, headers: HeaderMap, body: Bytes) -> Response {
+    let started = Instant::now();
+    match run_responses(&state, &headers, body, started).await {
+        Ok(response) => response,
+        Err(err) => error_response_for(RenderTarget::Responses, &err),
+    }
+}
+
+async fn run_responses(
+    state: &AppState,
+    headers: &HeaderMap,
+    body: Bytes,
+    started: Instant,
+) -> Result<Response, GatewayError> {
+    let value: Value = serde_json::from_slice(&body).map_err(|err| {
+        GatewayError::new(
+            ErrorClass::InvalidRequest,
+            format!("invalid request body: {err}"),
+        )
+    })?;
+    let model = value["model"]
+        .as_str()
+        .ok_or_else(|| {
+            GatewayError::new(ErrorClass::InvalidRequest, "`model` is required").with_param("model")
+        })?
+        .to_owned();
+    let stream = value["stream"] == Value::Bool(true);
+    let wants_state =
+        value["store"] == Value::Bool(true) || !value["previous_response_id"].is_null();
+
+    let table = state.table.load();
+    let plan = table.plan(&model)?;
+
+    // Parsed lazily, at most once, only when some target needs translation.
+    let mut internal: Option<router_core::chat::ChatRequest> = None;
+
+    let mut attempts: u32 = 0;
+    let mut last_error: Option<GatewayError> = None;
+
+    let n_targets = plan.targets.len();
+    for (t_idx, route) in plan.targets.iter().enumerate() {
+        let Some(out_dialect) = router_providers::wire_dialect(route.provider.kind) else {
+            last_error = Some(
+                GatewayError::new(
+                    ErrorClass::InvalidRequest,
+                    format!(
+                        "provider `{}` ({:?}) is configured but its adapter is not available yet",
+                        route.provider.name, route.provider.kind
+                    ),
+                )
+                .with_param("model")
+                .with_provider(&route.provider.name),
+            );
+            continue;
+        };
+
+        // OpenAI-dialect targets relay the Responses surface natively;
+        // everything else translates the stateless core.
+        let relay = out_dialect == Dialect::OpenAi;
+        let (out_body, path, emulated) = if relay {
+            let rewritten = match json::probe(&body) {
+                Some(probe) => json::splice_model(&body, probe.model_span, &route.upstream_model),
+                None => {
+                    let mut v = value.clone();
+                    v["model"] = Value::String(route.upstream_model.clone());
+                    Bytes::from(serde_json::to_vec(&v).expect("serializable"))
+                }
+            };
+            (rewritten, "/responses".to_owned(), false)
+        } else {
+            if wants_state {
+                return Err(GatewayError::new(
+                    ErrorClass::InvalidRequest,
+                    "`store` and `previous_response_id` require a provider that relays the \
+                     Responses API natively; this target is translated statelessly",
+                )
+                .with_param("store")
+                .with_provider(&route.provider.name));
+            }
+            let req = match &internal {
+                Some(r) => r,
+                None => {
+                    let parsed = router_providers::responses::request_to_internal(&value)?;
+                    for param in &parsed.dropped_params {
+                        metrics::counter!("caret_dropped_params_total",
+                            "param" => param.clone(),
+                            "provider" => route.provider.name.clone())
+                        .increment(1);
+                    }
+                    internal.insert(parsed.internal)
+                }
+            };
+            let built =
+                router_providers::build_outbound(out_dialect, req, &route.upstream_model, stream)?;
+            (built.body, built.path, built.json_schema_emulated)
+        };
+
+        for a_idx in 0..plan.max_attempts_per_target {
+            let is_last_candidate =
+                t_idx + 1 == n_targets && a_idx + 1 == plan.max_attempts_per_target;
+            let now = clock::now_ms();
+            let Some(choice) = route.provider.admit_key(&route.upstream_model, now) else {
+                last_error = Some(
+                    GatewayError::new(ErrorClass::NoCapacity, "no healthy key")
+                        .with_provider(&route.provider.name),
+                );
+                break;
+            };
+            let Ok(permit) = route.provider.semaphore.clone().try_acquire_owned() else {
+                last_error = Some(
+                    GatewayError::new(ErrorClass::NoCapacity, "provider at max concurrency")
+                        .with_provider(&route.provider.name),
+                );
+                break;
+            };
+            attempts += 1;
+            let breaker = route.provider.breaker_for(choice.key);
+            let request = build_upstream_request(
+                route,
+                out_dialect,
+                &path,
+                headers,
+                choice.key,
+                out_body.clone(),
+            )?;
+            let ctx = TranslationCtx {
+                passthrough: relay,
+                render: RenderTarget::Responses,
+                out_dialect,
+                stream,
+                emulated,
+            };
+            match attempt(
+                state,
+                route,
+                request,
+                breaker,
+                permit,
+                &plan,
+                is_last_candidate,
+                ctx,
+            )
+            .await
+            {
+                AttemptOutcome::Serve(mut response) => {
+                    finalize(&mut response, route, attempts, started);
+                    if emulated {
+                        response
+                            .headers_mut()
+                            .insert("x-caret-emulated", HeaderValue::from_static("json_schema"));
+                    }
+                    return Ok(response);
+                }
+                AttemptOutcome::Retry(err) => last_error = Some(err),
+            }
+        }
+    }
+    Err(last_error.unwrap_or_else(|| {
+        GatewayError::new(ErrorClass::NoCapacity, "no route candidates available")
+    }))
 }

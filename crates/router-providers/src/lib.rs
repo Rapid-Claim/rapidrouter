@@ -7,6 +7,7 @@
 
 pub mod anthropic;
 pub mod gemini;
+pub mod responses;
 
 use bytes::Bytes;
 use router_core::chat::ChatRequest;
@@ -178,11 +179,36 @@ impl UpstreamStream {
     }
 }
 
-/// Internal OpenAI chunks -> inbound-dialect wire frames.
+/// What shape the client is owed: a wire dialect's chat surface, or the
+/// Responses API surface.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RenderTarget {
+    Dialect(Dialect),
+    Responses,
+}
+
+/// Render an internal (OpenAI-shaped) sync response for the client.
+pub fn render_for(target: RenderTarget, openai: &Value) -> Value {
+    match target {
+        RenderTarget::Dialect(d) => render_response(d, openai),
+        RenderTarget::Responses => responses::openai_response_to_responses(openai),
+    }
+}
+
+/// Render an error for the client (Responses errors use the OpenAI shape).
+pub fn render_error_for(target: RenderTarget, err: &GatewayError) -> Value {
+    match target {
+        RenderTarget::Dialect(d) => render_error(d, err),
+        RenderTarget::Responses => err.to_openai_body(),
+    }
+}
+
+/// Internal OpenAI chunks -> client-facing wire frames.
 pub enum InboundStream {
     OpenAi,
     Anthropic(anthropic::OpenAiToAnthropicStream),
     Gemini(gemini::OpenAiToGeminiStream),
+    Responses(Box<responses::ChunksToResponses>),
 }
 
 impl InboundStream {
@@ -191,6 +217,15 @@ impl InboundStream {
             Dialect::OpenAi => Self::OpenAi,
             Dialect::Anthropic => Self::Anthropic(anthropic::OpenAiToAnthropicStream::new()),
             Dialect::Gemini => Self::Gemini(gemini::OpenAiToGeminiStream::new()),
+        }
+    }
+
+    pub fn new_for(target: RenderTarget) -> Self {
+        match target {
+            RenderTarget::Dialect(d) => Self::new(d),
+            RenderTarget::Responses => {
+                Self::Responses(Box::new(responses::ChunksToResponses::new()))
+            }
         }
     }
 
@@ -206,6 +241,7 @@ impl InboundStream {
                 .on_chunk(chunk)
                 .map(|v| vec![format!("data: {v}\n\n")])
                 .unwrap_or_default(),
+            Self::Responses(state) => state.on_chunk(chunk),
         }
     }
 
@@ -219,6 +255,7 @@ impl InboundStream {
                 .map(|(event, data)| format!("event: {event}\ndata: {data}\n\n"))
                 .collect(),
             Self::Gemini(_) => Vec::new(),
+            Self::Responses(state) => state.finish(),
         }
     }
 }

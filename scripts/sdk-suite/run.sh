@@ -47,3 +47,4 @@ sleep 0.8
 
 "$PY" scripts/sdk-suite/openai_suite.py http://127.0.0.1:18091
 "$PY" scripts/sdk-suite/anthropic_suite.py http://127.0.0.1:18091
+"$PY" scripts/sdk-suite/responses_suite.py http://127.0.0.1:18091

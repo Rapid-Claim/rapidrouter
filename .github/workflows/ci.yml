@@ -4,10 +4,10 @@ on:
   push:
     branches: [main]
   pull_request:
+  workflow_dispatch:
 
 env:
   CARGO_TERM_COLOR: always
-  RUSTFLAGS: -D warnings
 
 jobs:
   test:
@@ -15,6 +15,8 @@ jobs:
       matrix:
         os: [ubuntu-latest, macos-latest]
     runs-on: ${{ matrix.os }}
+    env:
+      RUSTFLAGS: -D warnings
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -24,6 +26,31 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
+
+  loom:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Model-check breaker and token bucket
+        run: RUSTFLAGS="--cfg loom" cargo test -p router-core --test loom_models --release
+
+  sdk-suite:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Install official SDKs
+        run: |
+          python -m venv /tmp/sdkvenv
+          /tmp/sdkvenv/bin/pip install --quiet openai anthropic
+      - name: Run SDK scenario suites against gateway + mock
+        run: scripts/sdk-suite/run.sh /tmp/sdkvenv/bin/python
 
   musl-build:
     runs-on: ubuntu-latest
@@ -44,3 +71,24 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo install cargo-audit --locked || true
       - run: cargo audit
+
+  # Runs the conformance shapes against REAL provider APIs. Requires
+  # provider keys as repository secrets; each test skips gracefully when
+  # its key is absent, so partial key sets are fine. Triggered manually
+  # (workflow_dispatch) and on main pushes when secrets are configured.
+  live-validation:
+    if: github.event_name == 'workflow_dispatch' || github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    env:
+      OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+      ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+      GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
+      LIVE_OPENAI_MODEL: ${{ vars.LIVE_OPENAI_MODEL }}
+      LIVE_ANTHROPIC_MODEL: ${{ vars.LIVE_ANTHROPIC_MODEL }}
+      LIVE_GEMINI_MODEL: ${{ vars.LIVE_GEMINI_MODEL }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Validate against live providers (skips per missing key)
+        run: cargo test -p router-server --test live_validation -- --ignored --nocapture
