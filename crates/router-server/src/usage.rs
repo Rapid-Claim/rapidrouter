@@ -79,7 +79,9 @@ pub fn extract_sync(dialect: Dialect, body: &[u8]) -> TokenUsage {
 
 fn usage_from_value(dialect: Dialect, v: &Value) -> TokenUsage {
     match dialect {
-        Dialect::OpenAi => {
+        // Codex answers in the Responses shape, which the OpenAI arm
+        // already reads from both the flat and the nested position.
+        Dialect::OpenAi | Dialect::CodexResponses => {
             // Chat completions (prompt/completion), Responses (input/output),
             // and nested `response.usage` from stream-completed events.
             let usage = if v["usage"].is_object() {

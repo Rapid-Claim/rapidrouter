@@ -51,6 +51,18 @@ pub struct Breaker {
     word: AtomicU64,
     failures: AtomicU32,
     window_start_ms: AtomicU64,
+    /// Bench deadline: a hard "not before" the provider gave us, in the
+    /// same millisecond epoch as `admit`. `0` means not benched.
+    ///
+    /// Deliberately a second word rather than more bits in `word`. The
+    /// invariant `word` protects is *exactly one* half-open probe, and
+    /// that needs a single CAS; a bench deadline needs no such agreement.
+    /// The worst a race here can do is let one request through as a bench
+    /// is being applied, or apply a bench a moment late — both of which
+    /// the next response corrects. Widening `word` to carry a deadline
+    /// would shrink the timestamp and complicate the probe CAS to protect
+    /// something that does not need protecting.
+    bench_until_ms: AtomicU64,
     config: BreakerConfig,
 }
 
@@ -60,17 +72,58 @@ impl Breaker {
             word: AtomicU64::new(pack(0, CLOSED)),
             failures: AtomicU32::new(0),
             window_start_ms: AtomicU64::new(0),
+            bench_until_ms: AtomicU64::new(0),
             config,
         }
     }
 
     /// Non-mutating view: selection uses this to prefer healthy keys
     /// without consuming anyone's probe slot.
+    ///
+    /// A benched key never looks healthy, so selection skips it without
+    /// needing to know why it is out.
     pub fn looks_healthy(&self) -> bool {
         unpack(self.word.load(Ordering::Acquire)).1 == CLOSED
+            && self.bench_until_ms.load(Ordering::Acquire) == 0
+    }
+
+    /// Bench this key until `until_ms`, no matter what the breaker's own
+    /// cooldown would have said.
+    ///
+    /// This is the subscription path: a rate-limited seat is out until the
+    /// provider's rolling window rolls, which can be hours. The deadline
+    /// only ever moves later — two concurrent 429s reporting different
+    /// windows must not let the shorter one shorten the bench.
+    pub fn bench_until(&self, until_ms: u64) {
+        self.bench_until_ms.fetch_max(until_ms, Ordering::AcqRel);
+    }
+
+    /// When this key comes off the bench, or `None` if it is not benched.
+    /// Observability only — `admit` is the authority.
+    pub fn benched_until_ms(&self) -> Option<u64> {
+        match self.bench_until_ms.load(Ordering::Acquire) {
+            0 => None,
+            deadline => Some(deadline),
+        }
     }
 
     pub fn admit(&self, now_ms: u64) -> Admission {
+        // A provider-declared bench outranks the breaker's own state: no
+        // probe, no half-open slot, nothing until the window rolls.
+        // Probing early is not free — it costs the caller a retry
+        // attempt and earns another 429.
+        let bench = self.bench_until_ms.load(Ordering::Acquire);
+        if bench != 0 {
+            if now_ms < bench {
+                return Admission::No;
+            }
+            // Expired. Clear it so the key rejoins on the breaker's own
+            // terms; losing this CAS means another thread cleared it
+            // first, which is the same outcome.
+            let _ =
+                self.bench_until_ms
+                    .compare_exchange(bench, 0, Ordering::AcqRel, Ordering::Acquire);
+        }
         let mut current = self.word.load(Ordering::Acquire);
         loop {
             let (since, state) = unpack(current);
@@ -100,6 +153,10 @@ impl Breaker {
     pub fn record_success(&self, _now_ms: u64) {
         self.failures.store(0, Ordering::Release);
         self.word.store(pack(0, CLOSED), Ordering::Release);
+        // A success means the window rolled early (or the bench was for a
+        // different reason than we thought); either way the provider just
+        // served us, so stop holding the key out.
+        self.bench_until_ms.store(0, Ordering::Release);
     }
 
     pub fn record_failure(&self, now_ms: u64) {
@@ -231,6 +288,63 @@ mod tests {
         assert_eq!(b.admit(600), Admission::Probe);
         // The prober vanished; a cooldown later someone else may probe.
         assert_eq!(b.admit(1200), Admission::Probe);
+    }
+
+    #[test]
+    fn bench_outranks_a_closed_breaker() {
+        let b = breaker();
+        assert_eq!(b.admit(0), Admission::Yes);
+        b.bench_until(5_000);
+        assert!(!b.looks_healthy(), "a benched key must not look healthy");
+        assert_eq!(b.admit(100), Admission::No);
+        // Not even a probe — the breaker's cooldown is irrelevant here.
+        assert_eq!(b.admit(4_999), Admission::No);
+        assert_eq!(b.admit(5_000), Admission::Yes);
+    }
+
+    #[test]
+    fn bench_outranks_an_open_breaker_and_its_probe_slot() {
+        let b = breaker();
+        for t in [0, 1, 2] {
+            b.record_failure(t);
+        }
+        b.bench_until(10_000);
+        // The breaker alone would have offered a probe at 500ms.
+        assert_eq!(b.admit(600), Admission::No);
+        assert_eq!(b.admit(9_999), Admission::No);
+        // Once the bench expires the breaker's own logic resumes.
+        assert_eq!(b.admit(10_000), Admission::Probe);
+    }
+
+    #[test]
+    fn bench_deadline_only_moves_later() {
+        let b = breaker();
+        b.bench_until(9_000);
+        b.bench_until(2_000); // a shorter window must not shorten the bench
+        assert_eq!(b.admit(3_000), Admission::No);
+        assert_eq!(b.benched_until_ms(), Some(9_000));
+        b.bench_until(12_000);
+        assert_eq!(b.admit(9_500), Admission::No);
+        assert_eq!(b.benched_until_ms(), Some(12_000));
+    }
+
+    #[test]
+    fn success_clears_the_bench() {
+        let b = breaker();
+        b.bench_until(60_000);
+        b.record_success(100);
+        assert_eq!(b.benched_until_ms(), None);
+        assert_eq!(b.admit(200), Admission::Yes);
+    }
+
+    #[test]
+    fn an_unbenched_key_reports_no_deadline() {
+        let b = breaker();
+        assert_eq!(b.benched_until_ms(), None);
+        b.bench_until(1_000);
+        // Expiry is observed through admit, which clears it.
+        assert_eq!(b.admit(1_000), Admission::Yes);
+        assert_eq!(b.benched_until_ms(), None);
     }
 
     #[test]

@@ -277,6 +277,67 @@ coordination, and no node holds state whose loss matters.
 
 ---
 
+## Phase 9 — Agent subscriptions (built; partially verified)
+
+Serving traffic from Claude Code and Codex **subscription seats** as
+ordinary provider keys, so a pool of flat-cost seats becomes a bulk
+capacity tier behind the same router, with the metered API as its
+fallback chain. Full design, including the prior art it is drawn from,
+in [docs/components/agent-subscriptions.md](docs/components/agent-subscriptions.md).
+
+**Gate — passed (2026-08-16).** A Claude Code OAuth token serves full
+Messages traffic: text, streaming, and tool calls all verified live through
+the built gateway on `claude-sonnet-4-5`, with the caller's system prompt
+still steering the answer. The CLI-transport fallback is not needed.
+
+One measured surprise decided the design: the Claude Code identity block is
+**required** on Sonnet — without it the backend answers `429
+rate_limit_error` on a fresh quota window — while Haiku serves either way.
+The `anthropic-beta` OAuth flag, assumed to be what admits the token,
+turns out to change nothing. The Codex loop, including OAuth refresh with
+write-back, was verified end to end; its success path was not, for want of
+quota.
+
+**Build**
+- `Credential` behind `ApiKey`: static + refreshable, published through
+  arc-swap; proactive (pre-`exp`) and reactive (401) OAuth refresh,
+  single-flight per key, atomic write-back, store-mediated in a fleet.
+- Breaker `open_until(deadline)` fed by provider-reported reset windows
+  (Codex: header, then body top level **and** nested under `error`;
+  Claude: `anthropic-ratelimit-unified-*-reset`), clamped to [1 s, 24 h]
+  with 0–10% one-sided jitter.
+- `claude_subscription` kind: OAuth bearer + `anthropic-beta`, Claude Code
+  identity pinning, existing Anthropic adapter otherwise.
+- `codex_subscription` kind: auth.json credentials, Codex CLI header set
+  with configurable `Version`, Responses body (`store: false`, no
+  `max_output_tokens`), tool calls from `response.output_item.done`.
+- Console seat view + per-seat quota metrics; sealed seat credentials in
+  the store.
+
+**Tests**
+- Loom/proptest on the refreshable-credential swap and deadline breaker
+  (no request ever reads a torn credential; a benched seat is never
+  admitted early).
+- Recorded-transcript mock for both backends, including the empty-`output`
+  `response.completed` and the header-less nested 429 — the two silent
+  failures that cost AGI Gateway production incidents.
+- Existing Anthropic conformance + tool matrix re-run against the
+  subscription provider unchanged.
+- Fleet: two nodes, one seat, one refresh — exactly one winner, and the
+  refresh token survives.
+
+**Exit — met for Claude, partially for Codex.** Built and green: the
+credential layer, deadline benching with jitter, both provider kinds,
+Codex OAuth renewal with atomic write-back and single-flight, an
+end-to-end suite over a mock that reproduces the backend's two
+silent-failure shapes, and a live suite that passes against the real
+Anthropic backend. **Not met**: Claude token renewal, a live-verified
+Codex success path, fleet-safe credential ownership, and amortized seat
+cost attribution.
+Tracked in [docs/components/agent-subscriptions.md](docs/components/agent-subscriptions.md) §5.
+
+---
+
 ## The test pyramid (cumulative, all phases)
 
 | Layer | Tooling | Gates |

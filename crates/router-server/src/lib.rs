@@ -5,6 +5,7 @@ mod admin;
 #[cfg(feature = "console")]
 mod console;
 mod proxy;
+pub mod refresh;
 mod upstream;
 pub mod usage;
 
@@ -64,6 +65,9 @@ pub struct AppState {
     /// rotated a key".
     applied_text: ArcSwap<Option<String>>,
     pub upstream: upstream::UpstreamClient,
+    /// In-flight subscription-credential renewals, so concurrent requests
+    /// against one seat share a single OAuth round trip.
+    pub refreshes: refresh::RefreshRegistry,
     draining: AtomicBool,
     prometheus: PrometheusHandle,
 }
@@ -119,6 +123,7 @@ impl AppState {
             liveness_window: DEFAULT_LIVENESS_WINDOW,
             applied_text: ArcSwap::from_pointee(None),
             upstream: upstream::UpstreamClient::new(),
+            refreshes: refresh::RefreshRegistry::default(),
             draining: AtomicBool::new(false),
             prometheus: prometheus_handle().clone(),
         })

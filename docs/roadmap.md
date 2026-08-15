@@ -56,6 +56,11 @@ The surface documented throughout these docs:
 
 ## Exploratory
 
+- **Agent subscriptions** ([components/agent-subscriptions.md](components/agent-subscriptions.md)):
+  serving traffic from Claude Code and Codex subscription seats as ordinary
+  provider keys, with quota-aware cooldowns and metered-API fallback. Both
+  transports are built and off by default; Claude token renewal, fleet-safe
+  credential ownership, and amortized seat cost attribution are outstanding.
 - Sandboxed plugin runtime (WASM) at the Hook seam.
 - Semantic/response caching as a plugin.
 - MCP tool injection.

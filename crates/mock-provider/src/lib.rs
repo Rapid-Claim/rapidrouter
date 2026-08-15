@@ -28,6 +28,16 @@ pub struct RecordedRequest {
     /// `x-api-key` (Anthropic) or `x-goog-api-key` (Gemini).
     pub api_key: Option<String>,
     pub body: Value,
+    /// Every request header, lowercased. The subscription transports are
+    /// defined largely by the headers they send, so asserting on them is
+    /// asserting on the feature.
+    pub headers: std::collections::BTreeMap<String, String>,
+}
+
+impl RecordedRequest {
+    pub fn header(&self, name: &str) -> Option<&str> {
+        self.headers.get(name).map(String::as_str)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -61,6 +71,7 @@ impl MockProvider {
             .route("/anything/{*rest}", axum::routing::any(record_anything))
             .route("/v1/messages", post(anthropic_messages))
             .route("/v1beta/models/{model_action}", post(gemini_generate))
+            .route("/backend-api/codex/responses", post(codex_responses))
             .layer(axum::extract::DefaultBodyLimit::max(128 * 1024 * 1024))
             .with_state(shared.clone());
 
@@ -120,6 +131,15 @@ async fn record(shared: &Shared, path: &str, headers: &HeaderMap, body: &[u8]) -
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
         body: parsed.clone(),
+        headers: headers
+            .iter()
+            .filter_map(|(name, value)| {
+                value
+                    .to_str()
+                    .ok()
+                    .map(|v| (name.as_str().to_ascii_lowercase(), v.to_owned()))
+            })
+            .collect(),
     });
     parsed
 }
@@ -164,6 +184,44 @@ async fn scripted_failure(shared: &Shared, model: &str) -> Option<Response> {
                 axum::Json(
                     json!({"error": {"message": "rate limited", "type": "rate_limit_error"}}),
                 ),
+            )
+                .into_response(),
+        ),
+        // A subscription seat out of quota, with the header shapes the
+        // real backends send. Note what is NOT here: Codex sends no
+        // `retry-after` at all, so a gateway that reads only that header
+        // learns nothing and re-probes an exhausted seat forever.
+        "quota-codex" => Some(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    ("x-codex-primary-used-percent", "100"),
+                    ("x-codex-primary-reset-after-seconds", "380613"),
+                    ("x-codex-primary-window-minutes", "10080"),
+                    ("x-codex-plan-type", "pro"),
+                ],
+                axum::Json(json!({"error": {
+                    "type": "usage_limit_reached",
+                    "message": "The usage limit has been reached",
+                    "resets_in_seconds": 380612
+                }})),
+            )
+                .into_response(),
+        ),
+        "quota-claude" => Some(
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                [
+                    ("retry-after", "3311"),
+                    ("anthropic-ratelimit-unified-5h-utilization", "1.01"),
+                    ("anthropic-ratelimit-unified-5h-status", "rejected"),
+                    ("anthropic-ratelimit-unified-7d-utilization", "0.22"),
+                    ("anthropic-ratelimit-unified-7d-status", "allowed"),
+                ],
+                axum::Json(json!({"type": "error", "error": {
+                    "type": "rate_limit_error",
+                    "message": "This request would exceed your account's rate limit."
+                }})),
             )
                 .into_response(),
         ),
@@ -872,4 +930,64 @@ async fn vertex_generate(
 ) -> Response {
     let full = format!("vertex/{project}/{location}/{model_action}");
     gemini_generate_inner(shared, model_action, full, headers, body).await
+}
+
+/// The ChatGPT Codex backend, reproduced closely enough to catch the two
+/// ways a naive client silently gets it wrong.
+///
+/// It answers only in SSE (there is no non-streaming mode), and its
+/// terminal `response.completed` carries an **empty** `output` array — so
+/// a tool call is visible only on `response.output_item.done`. A client
+/// that reads the terminal event alone gets a well-formed 200 with the
+/// tool call missing, which is exactly the bug this mock exists to fail.
+async fn codex_responses(
+    State(shared): State<Shared>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed = record(&shared, "/backend-api/codex/responses", &headers, &body).await;
+    let model = parsed["model"].as_str().unwrap_or("gpt-5.5").to_owned();
+    if let Some(failure) = scripted_failure(&shared, &model).await {
+        return failure;
+    }
+
+    let mut events = vec![format!(
+        "event: response.created\ndata: {}\n\n",
+        json!({"type": "response.created",
+               "response": {"id": "resp_mock", "model": model}})
+    )];
+
+    if parsed.get("tools").is_some() {
+        events.push(format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            json!({"type": "response.output_item.done", "output_index": 1,
+                   "item": {"type": "function_call", "call_id": "call_mock",
+                            "name": "get_weather", "arguments": "{\"city\":\"SF\"}"}})
+        ));
+    } else {
+        for delta in ["Hello", " from", " Codex"] {
+            events.push(format!(
+                "event: response.output_text.delta\ndata: {}\n\n",
+                json!({"type": "response.output_text.delta", "delta": delta})
+            ));
+        }
+    }
+
+    events.push(format!(
+        "event: response.completed\ndata: {}\n\n",
+        json!({"type": "response.completed", "response": {
+            // EMPTY, as the real backend sends it.
+            "output": [],
+            "usage": {"input_tokens": 11, "output_tokens": 3, "total_tokens": 14,
+                      "input_tokens_details": {"cached_tokens": 4},
+                      "output_tokens_details": {"reasoning_tokens": 2}}
+        }})
+    ));
+    events.push("data: [DONE]\n\n".to_owned());
+
+    (
+        [(header::CONTENT_TYPE, "text/event-stream")],
+        events.concat(),
+    )
+        .into_response()
 }

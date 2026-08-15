@@ -9,9 +9,10 @@ use tokio::sync::Semaphore;
 
 use crate::breaker::{Admission, Breaker, BreakerConfig};
 use crate::config::{
-    AuthMode, AzureSettings, BedrockSettings, Config, ProviderKind, Retries, RetryOn, TargetModel,
-    VertexSettings,
+    AuthMode, AzureSettings, BedrockSettings, CodexSettings, Config, ProviderKind, Retries,
+    RetryOn, TargetModel, VertexSettings,
 };
+use crate::credential::{self, Credential, Seat};
 use crate::error::{ErrorClass, GatewayError};
 use crate::secret::SecretString;
 
@@ -39,16 +40,41 @@ pub struct ProviderRuntime {
     pub azure: Option<AzureSettings>,
     pub bedrock: Option<BedrockSettings>,
     pub vertex: Option<VertexSettings>,
+    pub codex: Option<CodexSettings>,
 }
 
 #[derive(Debug)]
 pub struct KeyRuntime {
     pub name: String,
-    pub secret: SecretString,
+    /// What this key presents upstream. A metered key is a constant; a
+    /// subscription seat's credential rotates underneath, which is why
+    /// this is read through [`KeyRuntime::token`] per request rather than
+    /// borrowed once.
+    pub credential: Credential,
     pub weight: f64,
     /// `None` = serves every model of this provider.
     pub models: Option<BTreeSet<String>>,
     pub breaker: Breaker,
+    /// Where a rotated credential is persisted; see
+    /// [`crate::config::ApiKey::source_path`].
+    pub source_path: Option<String>,
+}
+
+impl KeyRuntime {
+    /// The credential value for this request.
+    ///
+    /// Owned rather than borrowed: a seat may be renewed while the caller
+    /// is still assembling the request, and a request must use one
+    /// consistent token from first byte to last.
+    pub fn token(&self) -> SecretString {
+        self.credential.token()
+    }
+
+    /// The seat behind this key, for the paths that must renew it or read
+    /// its account id. `None` for every metered key.
+    pub fn seat(&self) -> Option<&Arc<Seat>> {
+        self.credential.seat()
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -90,7 +116,8 @@ impl RoutingTable {
                 .iter()
                 .map(|k| KeyRuntime {
                     name: k.name.clone(),
-                    secret: k.secret.clone(),
+                    credential: build_credential(p.kind, &k.secret),
+                    source_path: k.source_path.clone(),
                     weight: k.weight,
                     models: k.models.as_ref().map(|m| m.iter().cloned().collect()),
                     breaker: Breaker::new(breaker_config),
@@ -115,6 +142,7 @@ impl RoutingTable {
                     azure: p.azure.clone(),
                     bedrock: p.bedrock.clone(),
                     vertex: p.vertex.clone(),
+                    codex: p.codex.clone(),
                 }),
             );
         }
@@ -265,6 +293,24 @@ impl ProviderRuntime {
         None
     }
 
+    /// Whether every eligible key for `model` is benched on a quota
+    /// window the provider itself declared.
+    ///
+    /// This distinguishes the two ways a provider can have nothing to
+    /// offer, which deserve different answers: a broken provider is a
+    /// capacity problem the caller should retry against, while an
+    /// exhausted subscription pool is a rate limit with a known reset —
+    /// and telling a caller "no capacity" when the truth is "out of quota
+    /// until Tuesday" sends them into a retry loop that cannot succeed.
+    pub fn all_keys_benched(&self, model: &str) -> bool {
+        let mut eligible = self
+            .keys
+            .iter()
+            .filter(|k| k.models.as_ref().is_none_or(|m| m.contains(model)))
+            .peekable();
+        eligible.peek().is_some() && eligible.all(|k| k.breaker.benched_until_ms().is_some())
+    }
+
     /// The breaker an attempt outcome should be recorded against.
     pub fn breaker_for<'a>(&'a self, key: Option<&'a KeyRuntime>) -> &'a Breaker {
         key.map(|k| &k.breaker).unwrap_or(&self.provider_breaker)
@@ -300,6 +346,33 @@ fn weighted_pick<'a>(keys: &[&'a KeyRuntime]) -> &'a KeyRuntime {
             }
             keys.last().expect("non-empty by construction")
         }
+    }
+}
+
+/// Turn a configured key value into the credential the provider needs.
+///
+/// A metered provider's key is used verbatim. A subscription provider's
+/// key is a *document* — a Codex `auth.json`, a Claude Code credential —
+/// and is parsed into a renewable seat. A document we cannot parse
+/// degrades to an inline, non-renewable token rather than failing the
+/// whole config: an operator who pasted a bare `claude setup-token` value
+/// has given us something perfectly usable, just not something that can
+/// refresh itself.
+fn build_credential(kind: ProviderKind, secret: &SecretString) -> Credential {
+    let raw = secret.expose();
+    let parsed = match kind {
+        ProviderKind::CodexSubscription => credential::parse_codex_auth_json(raw),
+        ProviderKind::ClaudeSubscription => {
+            credential::parse_claude_oauth_json(raw).or_else(|_| credential::inline_token(raw))
+        }
+        _ => return Credential::Static(secret.clone()),
+    };
+    match parsed.or_else(|_| credential::inline_token(raw)) {
+        Ok(state) => Credential::Seat(Arc::new(Seat::new(state))),
+        // An empty value; config validation already rejects those, so this
+        // is unreachable in practice and a static credential is the least
+        // surprising fallback.
+        Err(_) => Credential::Static(secret.clone()),
     }
 }
 

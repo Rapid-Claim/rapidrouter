@@ -21,6 +21,20 @@
 Presets pre-fill base URL, auth style, and parameter quirks (fields to strip,
 streaming idiosyncrasies); every preset value is overridable in config.
 
+## Subscription seats
+
+Two providers are backed by a *subscription* rather than a metered API key.
+They are off unless configured, and carry caveats an operator must read
+first — see [components/agent-subscriptions.md](components/agent-subscriptions.md).
+
+| Provider | `type` | Credential | Notes |
+|---|---|---|---|
+| Claude Code | `claude_subscription` | `claude setup-token` output — long-lived (the CLI says "valid for 1 year"); `env.`, `file:`, or `store.` | Ordinary Messages API with an OAuth bearer. The Claude Code identity block is **required** — without it Sonnet answers `429` on a fresh quota window (Haiku does not, so test on Sonnet). No refresh flow: renewal is an annual operator task |
+| Codex | `codex_subscription` | Codex CLI `auth.json`, `file:`-referenced so a rotated token can be persisted | Private Responses endpoint; CLI header set with a configurable `Version` (a model gate); `max_tokens` cannot be carried; reasoning/verbosity floor configurable |
+
+A rate-limited seat is benched for the window the provider reports, and a
+pool with every seat exhausted answers `429`, not `503`.
+
 ## Capability matrix
 
 The authoritative matrix is **generated from the adapters' capability
