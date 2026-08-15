@@ -16,6 +16,7 @@ use http_body_util::Full;
 use router_core::breaker::Breaker;
 use router_core::chat::ChatRequest;
 use router_core::config::{AuthMode, RetryOn};
+use router_core::eventstream::EventStreamParser;
 use router_core::router::{KeyRuntime, ResolvedRoute, RoutePlan};
 use router_core::sse::SseParser;
 use router_core::{ErrorClass, GatewayError, clock, json};
@@ -199,6 +200,11 @@ fn rewrite_model_value(body: &Bytes, model: &str) -> Bytes {
     value["model"] = Value::String(model.to_owned());
     Bytes::from(serde_json::to_vec(&value).expect("serializable"))
 }
+
+/// Time spent waiting on the upstream, carried via response extensions
+/// so `finalize` can report gateway-added time rather than total time.
+#[derive(Clone, Copy)]
+struct UpstreamTime(std::time::Duration);
 
 /// One upstream try, described precisely enough for the dispatch loop to
 /// decide between forwarding, retrying, and advancing the chain.
@@ -388,8 +394,9 @@ async fn attempt(
         .upstream
         .send(&route.provider.name, request, route.provider.timeout)
         .await;
+    let upstream_elapsed = upstream_started.elapsed();
     metrics::histogram!("caret_upstream_duration_seconds", "provider" => route.provider.name.clone())
-        .record(upstream_started.elapsed().as_secs_f64());
+        .record(upstream_elapsed.as_secs_f64());
 
     match result {
         Err(err) => {
@@ -422,10 +429,17 @@ async fn attempt(
                 );
             }
 
-            if ctx.passthrough {
-                return AttemptOutcome::Serve(forward_response(response, permit));
+            let mut served = if ctx.passthrough {
+                AttemptOutcome::Serve(forward_response(response, permit))
+            } else {
+                translated_response(route, response, permit, ctx).await
+            };
+            if let AttemptOutcome::Serve(response) = &mut served {
+                response
+                    .extensions_mut()
+                    .insert(UpstreamTime(upstream_elapsed));
             }
-            translated_response(route, response, permit, ctx).await
+            served
         }
     }
 }
@@ -488,7 +502,8 @@ async fn translated_response(
     // Streaming: upstream SSE -> internal chunks -> inbound frames.
     let translator = UpstreamStream::new(ctx.out_dialect, &route.upstream_model, ctx.emulated);
     let formatter = InboundStream::new_for(ctx.render);
-    let body = translated_stream_body(response.into_body(), permit, translator, formatter);
+    let parser = WireParser::for_dialect(ctx.out_dialect);
+    let body = translated_stream_body(response.into_body(), permit, parser, translator, formatter);
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -498,15 +513,39 @@ async fn translated_response(
     AttemptOutcome::Serve(response)
 }
 
+/// Upstream wire framing: SSE for most dialects, AWS event-stream for
+/// Bedrock. Both produce the same event shape for the translators.
+enum WireParser {
+    Sse(SseParser),
+    EventStream(EventStreamParser),
+}
+
+impl WireParser {
+    fn for_dialect(dialect: Dialect) -> Self {
+        match dialect {
+            Dialect::Bedrock => Self::EventStream(EventStreamParser::new()),
+            _ => Self::Sse(SseParser::new()),
+        }
+    }
+
+    fn push(&mut self, chunk: &[u8]) -> Vec<router_core::sse::SseEvent> {
+        match self {
+            Self::Sse(parser) => parser.push(chunk),
+            Self::EventStream(parser) => parser.push(chunk),
+        }
+    }
+}
+
 fn translated_stream_body(
     upstream: hyper::body::Incoming,
     permit: tokio::sync::OwnedSemaphorePermit,
+    parser: WireParser,
     translator: UpstreamStream,
     formatter: InboundStream,
 ) -> Body {
     struct StreamState {
         upstream: hyper::body::Incoming,
-        parser: SseParser,
+        parser: WireParser,
         translator: UpstreamStream,
         formatter: InboundStream,
         done: bool,
@@ -515,7 +554,7 @@ fn translated_stream_body(
 
     let state = StreamState {
         upstream,
-        parser: SseParser::new(),
+        parser,
         translator,
         formatter,
         done: false,
@@ -586,6 +625,16 @@ fn extract_upstream_error(body: &[u8]) -> Option<String> {
 }
 
 fn finalize(response: &mut Response, route: &ResolvedRoute, attempts: u32, started: Instant) {
+    // Gateway-added time: total elapsed minus the upstream wait of the
+    // serving attempt. (Earlier failed attempts' upstream waits count
+    // against us — retries are our choice.)
+    let upstream = response
+        .extensions()
+        .get::<UpstreamTime>()
+        .map(|t| t.0)
+        .unwrap_or_default();
+    let overhead = started.elapsed().saturating_sub(upstream);
+
     let headers = response.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&route.provider.name) {
         headers.insert("x-caret-provider", v);
@@ -596,10 +645,10 @@ fn finalize(response: &mut Response, route: &ResolvedRoute, attempts: u32, start
     if let Ok(v) = HeaderValue::from_str(&attempts.to_string()) {
         headers.insert("x-caret-attempts", v);
     }
-    let overhead = started.elapsed();
     if let Ok(v) = HeaderValue::from_str(&overhead.as_micros().to_string()) {
         headers.insert("x-caret-overhead-us", v);
     }
+    metrics::histogram!("caret_gateway_overhead_seconds").record(overhead.as_secs_f64());
     record_request_metrics(&route.provider.name, response.status());
 }
 
@@ -617,7 +666,38 @@ fn build_upstream_request(
             format!("provider `{}` has no base_url", route.provider.name),
         )
     })?;
-    let url = format!("{}{}", base.trim_end_matches('/'), path);
+
+    // Azure keeps the OpenAI dialect but addresses deployments:
+    // {endpoint}/openai/deployments/{deployment}{path}?api-version=…
+    let url = if let Some(azure) = &route.provider.azure {
+        let deployment = azure
+            .deployments
+            .get(&route.upstream_model)
+            .map(String::as_str)
+            .unwrap_or(&route.upstream_model);
+        format!(
+            "{}/openai/deployments/{deployment}{path}?api-version={}",
+            base.trim_end_matches('/'),
+            azure.api_version
+        )
+    } else if let Some(vertex) = &route.provider.vertex {
+        // Vertex serves the Gemini dialect under project/location paths;
+        // reuse the action (`generateContent` / `streamGenerateContent…`)
+        // from the dialect path.
+        let action = path
+            .rsplit_once(':')
+            .map(|(_, a)| a)
+            .unwrap_or("generateContent");
+        format!(
+            "{}/v1/projects/{}/locations/{}/publishers/google/models/{}:{action}",
+            base.trim_end_matches('/'),
+            vertex.project,
+            vertex.location,
+            route.upstream_model
+        )
+    } else {
+        format!("{}{}", base.trim_end_matches('/'), path)
+    };
 
     let mut builder = http::Request::post(&url).header(header::CONTENT_TYPE, "application/json");
     if let Some(accept) = inbound.get(header::ACCEPT) {
@@ -642,25 +722,65 @@ fn build_upstream_request(
             v.set_sensitive(true);
             Ok(v)
         };
-        match out_dialect {
-            Dialect::OpenAi => {
-                builder = builder.header(
-                    header::AUTHORIZATION,
-                    sensitive(format!("Bearer {}", key.secret.expose()))?,
-                );
-            }
-            Dialect::Anthropic => {
-                builder = builder
-                    .header("x-api-key", sensitive(key.secret.expose().to_owned())?)
-                    .header("anthropic-version", router_providers::ANTHROPIC_VERSION);
-                // Anthropic beta features requested by the client ride along.
-                if let Some(beta) = inbound.get("anthropic-beta") {
-                    builder = builder.header("anthropic-beta", beta);
+
+        if route.provider.azure.is_some() {
+            builder = builder.header("api-key", sensitive(key.secret.expose().to_owned())?);
+        } else if route.provider.vertex.is_some() {
+            // OAuth access token (or express-mode key) as a bearer.
+            builder = builder.header(
+                header::AUTHORIZATION,
+                sensitive(format!("Bearer {}", key.secret.expose()))?,
+            );
+        } else if let Some(bedrock) = &route.provider.bedrock {
+            // SigV4: the signature covers host, date, and the payload hash.
+            let uri: http::Uri = url
+                .parse()
+                .map_err(|_| GatewayError::new(ErrorClass::UpstreamError, "invalid bedrock url"))?;
+            let host = uri
+                .authority()
+                .map(|a| a.as_str().to_owned())
+                .unwrap_or_default();
+            let amz_date = router_providers::sigv4::amz_date_now();
+            let signature =
+                router_providers::sigv4::sign(&router_providers::sigv4::SigningParams {
+                    access_key_id: &bedrock.access_key_id,
+                    secret_access_key: key.secret.expose(),
+                    region: &bedrock.region,
+                    service: "bedrock",
+                    amz_date: &amz_date,
+                    host: &host,
+                    method: "POST",
+                    canonical_path: uri.path(),
+                    query: uri.query().unwrap_or(""),
+                    payload: &body,
+                });
+            builder = builder
+                .header("host", host)
+                .header("x-amz-date", amz_date)
+                .header("x-amz-content-sha256", signature.amz_content_sha256)
+                .header(header::AUTHORIZATION, sensitive(signature.authorization)?);
+        } else {
+            match out_dialect {
+                Dialect::OpenAi => {
+                    builder = builder.header(
+                        header::AUTHORIZATION,
+                        sensitive(format!("Bearer {}", key.secret.expose()))?,
+                    );
                 }
-            }
-            Dialect::Gemini => {
-                builder =
-                    builder.header("x-goog-api-key", sensitive(key.secret.expose().to_owned())?);
+                Dialect::Anthropic => {
+                    builder = builder
+                        .header("x-api-key", sensitive(key.secret.expose().to_owned())?)
+                        .header("anthropic-version", router_providers::ANTHROPIC_VERSION);
+                    // Anthropic beta features requested by the client ride along.
+                    if let Some(beta) = inbound.get("anthropic-beta") {
+                        builder = builder.header("anthropic-beta", beta);
+                    }
+                }
+                Dialect::Gemini => {
+                    builder = builder
+                        .header("x-goog-api-key", sensitive(key.secret.expose().to_owned())?);
+                }
+                Dialect::Bedrock => unreachable!("bedrock providers always carry settings"),
             }
         }
     }
@@ -1084,4 +1204,155 @@ async fn run_responses(
     Err(last_error.unwrap_or_else(|| {
         GatewayError::new(ErrorClass::NoCapacity, "no route candidates available")
     }))
+}
+
+// ---------------------------------------------------------------------------
+// Passthrough: verbatim forward with gateway-managed auth
+// ---------------------------------------------------------------------------
+
+/// `ANY /passthrough/{provider}/{path…}` — the escape hatch: new provider
+/// features work the day they ship. The gateway injects auth, meters the
+/// request, and forwards everything else untouched (single attempt, no
+/// retries, no translation).
+pub async fn handle_passthrough(
+    state: Arc<AppState>,
+    provider_name: String,
+    rest: String,
+    method: http::Method,
+    query: Option<String>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> Response {
+    match run_passthrough(&state, &provider_name, &rest, method, query, &headers, body).await {
+        Ok(response) => response,
+        Err(err) => error_response(&err),
+    }
+}
+
+async fn run_passthrough(
+    state: &AppState,
+    provider_name: &str,
+    rest: &str,
+    method: http::Method,
+    query: Option<String>,
+    headers: &HeaderMap,
+    body: Bytes,
+) -> Result<Response, GatewayError> {
+    let table = state.table.load();
+    let provider = table
+        .providers()
+        .find(|p| p.name == provider_name)
+        .cloned()
+        .ok_or_else(|| {
+            GatewayError::new(
+                ErrorClass::NotFound,
+                format!("unknown provider `{provider_name}`"),
+            )
+        })?;
+
+    let base = provider
+        .base_url
+        .as_deref()
+        .ok_or_else(|| GatewayError::new(ErrorClass::UpstreamError, "provider has no base_url"))?;
+    let mut url = format!("{}/{}", base.trim_end_matches('/'), rest);
+    if let Some(q) = &query {
+        url.push('?');
+        url.push_str(q);
+    }
+
+    let Ok(permit) = provider.semaphore.clone().try_acquire_owned() else {
+        return Err(
+            GatewayError::new(ErrorClass::NoCapacity, "provider at max concurrency")
+                .with_provider(provider_name),
+        );
+    };
+
+    let mut builder = http::Request::builder().method(method).uri(&url);
+    for name in [header::CONTENT_TYPE, header::ACCEPT] {
+        if let Some(value) = headers.get(&name) {
+            builder = builder.header(name, value);
+        }
+    }
+    // Auth by provider kind, same material the routed paths use.
+    if provider.auth == AuthMode::Key
+        && let Some(key) = provider.keys.first()
+    {
+        let sensitive = |value: String| {
+            let mut v = HeaderValue::from_str(&value).expect("key material is ascii");
+            v.set_sensitive(true);
+            v
+        };
+        if provider.azure.is_some() {
+            builder = builder.header("api-key", sensitive(key.secret.expose().to_owned()));
+        } else if let Some(bedrock) = &provider.bedrock {
+            let uri: http::Uri = url.parse().map_err(|_| {
+                GatewayError::new(ErrorClass::InvalidRequest, "invalid passthrough path")
+            })?;
+            let host = uri
+                .authority()
+                .map(|a| a.as_str().to_owned())
+                .unwrap_or_default();
+            let amz_date = router_providers::sigv4::amz_date_now();
+            let method = builder.method_ref().expect("set above").as_str().to_owned();
+            let signature =
+                router_providers::sigv4::sign(&router_providers::sigv4::SigningParams {
+                    access_key_id: &bedrock.access_key_id,
+                    secret_access_key: key.secret.expose(),
+                    region: &bedrock.region,
+                    service: "bedrock",
+                    amz_date: &amz_date,
+                    host: &host,
+                    method: &method,
+                    canonical_path: uri.path(),
+                    query: uri.query().unwrap_or(""),
+                    payload: &body,
+                });
+            builder = builder
+                .header("host", host)
+                .header("x-amz-date", amz_date)
+                .header("x-amz-content-sha256", signature.amz_content_sha256)
+                .header(header::AUTHORIZATION, sensitive(signature.authorization));
+        } else {
+            match provider.kind {
+                router_core::config::ProviderKind::Anthropic => {
+                    builder = builder
+                        .header("x-api-key", sensitive(key.secret.expose().to_owned()))
+                        .header("anthropic-version", router_providers::ANTHROPIC_VERSION);
+                }
+                router_core::config::ProviderKind::Gemini => {
+                    builder =
+                        builder.header("x-goog-api-key", sensitive(key.secret.expose().to_owned()));
+                }
+                _ => {
+                    builder = builder.header(
+                        header::AUTHORIZATION,
+                        sensitive(format!("Bearer {}", key.secret.expose())),
+                    );
+                }
+            }
+        }
+    }
+
+    let request = builder.body(Full::new(body)).map_err(|e| {
+        GatewayError::new(
+            ErrorClass::InvalidRequest,
+            format!("bad passthrough request: {e}"),
+        )
+    })?;
+
+    let response = state
+        .upstream
+        .send(provider_name, request, provider.timeout)
+        .await?;
+    metrics::counter!(
+        "caret_passthrough_total",
+        "provider" => provider_name.to_owned(),
+        "status_class" => if response.status().is_success() { "2xx" } else { "4xx5xx" },
+    )
+    .increment(1);
+    let mut response = forward_response(response, permit);
+    if let Ok(v) = HeaderValue::from_str(provider_name) {
+        response.headers_mut().insert("x-caret-provider", v);
+    }
+    Ok(response)
 }

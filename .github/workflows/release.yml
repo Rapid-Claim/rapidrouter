@@ -1,0 +1,74 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+  id-token: write  # sigstore keyless signing
+
+jobs:
+  binaries:
+    strategy:
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-musl
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - name: musl tools
+        if: contains(matrix.target, 'musl')
+        run: sudo apt-get update && sudo apt-get install -y musl-tools
+      - run: cargo build --release --target ${{ matrix.target }} -p router-bin
+      - name: Package
+        run: |
+          NAME=caret-router-${GITHUB_REF_NAME}-${{ matrix.target }}
+          mkdir "$NAME"
+          cp target/${{ matrix.target }}/release/caret-router "$NAME/"
+          tar czf "$NAME.tar.gz" "$NAME"
+          shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: caret-router-*.tar.gz*
+
+  release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: SBOM
+        uses: anchore/sbom-action@v0
+        with:
+          format: spdx-json
+          output-file: caret-router-${{ github.ref_name }}.sbom.spdx.json
+      - name: Sign artifacts (sigstore keyless)
+        uses: sigstore/cosign-installer@v3
+      - run: |
+          for f in caret-router-*.tar.gz; do
+            cosign sign-blob --yes "$f" \
+              --output-signature "$f.sig" \
+              --output-certificate "$f.pem"
+          done
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            caret-router-*.tar.gz
+            caret-router-*.tar.gz.sha256
+            caret-router-*.tar.gz.sig
+            caret-router-*.tar.gz.pem
+            caret-router-*.sbom.spdx.json
+          generate_release_notes: true

@@ -86,6 +86,10 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .route("/anthropic/v1/messages", post(anthropic_messages))
         .route("/genai/v1beta/models/{model_action}", post(genai_generate))
         .route("/genai/v1/models/{model_action}", post(genai_generate))
+        .route(
+            "/passthrough/{provider}/{*rest}",
+            axum::routing::any(passthrough),
+        )
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             gateway_auth,
@@ -161,6 +165,18 @@ async fn responses(
     body: bytes::Bytes,
 ) -> Response {
     proxy::handle_responses(state, headers, body).await
+}
+
+async fn passthrough(
+    State(state): State<Arc<AppState>>,
+    axum::extract::Path((provider, rest)): axum::extract::Path<(String, String)>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: axum::http::HeaderMap,
+    body: bytes::Bytes,
+) -> Response {
+    let query = uri.query().map(str::to_owned);
+    proxy::handle_passthrough(state, provider, rest, method, query, headers, body).await
 }
 
 async fn completions(

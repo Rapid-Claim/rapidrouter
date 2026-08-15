@@ -45,6 +45,21 @@ pub fn preset(name: &str) -> Option<Preset> {
             discovery_env: None,
             keyless_ok: false,
         },
+        "vertex" => Preset {
+            kind: ProviderKind::Vertex,
+            base_url: None,
+            discovery_env: None,
+            keyless_ok: false,
+        },
+        // Databricks Foundation Model APIs are OpenAI-compatible under
+        // {workspace}/serving-endpoints; the workspace URL comes from
+        // config (or DATABRICKS_HOST discovery), so no preset base_url.
+        "databricks" => Preset {
+            kind: ProviderKind::OpenAiCompat,
+            base_url: None,
+            discovery_env: None,
+            keyless_ok: false,
+        },
         "groq" => openai_compat("https://api.groq.com/openai/v1", Some("GROQ_API_KEY")),
         "mistral" => openai_compat("https://api.mistral.ai/v1", Some("MISTRAL_API_KEY")),
         "cerebras" => openai_compat("https://api.cerebras.ai/v1", Some("CEREBRAS_API_KEY")),

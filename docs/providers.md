@@ -8,7 +8,9 @@
 | Azure OpenAI | `azure` | `api-key` header | Deployment mapping + `api-version` from config; Responses relay |
 | Anthropic | `anthropic` | `x-api-key` | Messages API; prompt-caching passthrough; thinking blocks |
 | Google Gemini | `gemini` | query/header key | generateContent; video input capable |
-| AWS Bedrock | `bedrock` | SigV4 | Converse APIs; event-stream decoding; static/env/profile credentials |
+| AWS Bedrock | `bedrock` | SigV4 | Converse APIs; event-stream decoding; `region` + `access_key_id` in config, secret key as the key value |
+| Vertex AI | `vertex` | Bearer (OAuth access token or express key) | Gemini dialect over `projects/{project}/locations/{location}` paths; `project` + `location` in config |
+| Databricks | `databricks` (`openai_compat`) | Bearer (PAT) | Foundation Model APIs under `{workspace}/serving-endpoints`; model = serving endpoint name; `DATABRICKS_HOST`/`DATABRICKS_TOKEN` zero-config discovery |
 | Groq | `openai_compat` preset | Bearer | |
 | Mistral | `openai_compat` preset | Bearer | |
 | Cerebras | `openai_compat` preset | Bearer | |

@@ -52,6 +52,19 @@ jobs:
       - name: Run SDK scenario suites against gateway + mock
         run: scripts/sdk-suite/run.sh /tmp/sdkvenv/bin/python
 
+  perf-smoke:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Micro benches compile and run
+        run: cargo bench --workspace -- --test
+      - name: Overhead gate (generous bounds for shared CI runners)
+        run: cargo run --release -p rig -- overhead --rps 200 --secs 5 --assert-p50-us 400 --assert-p99-us 4000
+      - name: Short soak, flat memory gate
+        run: cargo run --release -p rig -- soak --secs 20 --rps 100 --assert-rss-growth-pct 40
+
   musl-build:
     runs-on: ubuntu-latest
     steps:

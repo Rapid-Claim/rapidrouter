@@ -139,16 +139,24 @@ impl Scanner<'_> {
     }
 
     /// Consume a string token; returns its span including both quotes.
+    ///
+    /// String content dominates request bodies, so this is the scanner's
+    /// hot loop: memchr jumps to the next quote or escape instead of
+    /// stepping byte-by-byte.
     fn string_token(&mut self) -> Option<(usize, usize)> {
         let start = self.i;
         self.eat(b'"')?;
         loop {
-            match self.next()? {
-                b'"' => return Some((start, self.i)),
-                b'\\' => {
-                    self.next()?;
-                }
-                _ => {}
+            let offset = memchr::memchr2(b'"', b'\\', &self.b[self.i..])?;
+            self.i += offset;
+            if self.b[self.i] == b'"' {
+                self.i += 1;
+                return Some((start, self.i));
+            }
+            // Escape: skip the backslash and the escaped byte.
+            self.i += 2;
+            if self.i > self.b.len() {
+                return None;
             }
         }
     }

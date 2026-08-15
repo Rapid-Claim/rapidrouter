@@ -388,3 +388,48 @@ fn secrets_never_appear_in_debug_output() {
     }
     assert!(debug.contains("[REDACTED]"));
 }
+
+#[test]
+fn bedrock_requires_region_and_credentials() {
+    assert_invalid(
+        "[providers.bedrock]\nkeys = [{ name = \"k\", value = \"secret\" }]\n",
+        &[],
+        "providers.bedrock.region",
+        "required",
+    );
+    assert_invalid(
+        "[providers.bedrock]\nkeys = [{ name = \"k\", value = \"secret\" }]\n",
+        &[],
+        "providers.bedrock.access_key_id",
+        "required",
+    );
+}
+
+#[test]
+fn vertex_requires_project_and_derives_base_url() {
+    assert_invalid(
+        "[providers.vertex]\nkeys = [{ name = \"k\", value = \"tok\" }]\n",
+        &[],
+        "providers.vertex.project",
+        "required",
+    );
+    let config = load(
+        "[providers.vertex]\nproject = \"p1\"\nkeys = [{ name = \"k\", value = \"tok\" }]\n",
+        &[],
+    )
+    .unwrap();
+    assert_eq!(
+        config.providers["vertex"].base_url.as_deref(),
+        Some("https://us-central1-aiplatform.googleapis.com")
+    );
+}
+
+#[test]
+fn region_rejected_outside_bedrock() {
+    assert_invalid(
+        "[providers.openai]\nregion = \"us-east-1\"\nkeys = [{ name = \"k\", value = \"sk\" }]\n",
+        &[],
+        "providers.openai.region",
+        "only valid for the bedrock provider",
+    );
+}

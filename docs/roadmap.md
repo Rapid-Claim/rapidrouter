@@ -9,8 +9,8 @@ The surface documented throughout these docs:
   `/v1/models`, passthrough, `/health`, `/metrics`.
 - Inbound dialects: `/v1`, `/anthropic`, `/genai`; named-client CI (Claude
   Code, Codex, major SDKs).
-- Providers: OpenAI, Anthropic, Gemini, Azure, Bedrock + `openai_compat`
-  presets.
+- Providers: OpenAI, Anthropic, Gemini, Azure, Bedrock, Vertex AI,
+  Databricks + `openai_compat` presets.
 - Router: weighted keys, breakers, fallbacks, semaphore backpressure —
   loom/proptest-verified.
 - Config in `file` mode + hot reload; Prometheus; structured logs;

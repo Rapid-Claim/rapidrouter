@@ -45,7 +45,7 @@ routes, translates, load-balances, meters, and protects.
 | Cross-dialect routing | Any inbound dialect → any provider (Anthropic SDK code driving an OpenAI model, and vice versa) |
 | Multimodal | Image / audio / file content parts translated across dialects; large binary payloads handled zero-copy |
 | Streaming | First-class SSE path; per-chunk overhead in nanoseconds on passthrough, ~0.5 µs translated |
-| Providers | OpenAI, Anthropic, Google Gemini, Azure OpenAI, AWS Bedrock, plus any OpenAI-compatible endpoint by config (Groq, Mistral, Ollama, vLLM, and other presets) |
+| Providers | OpenAI, Anthropic, Google Gemini, Azure OpenAI, AWS Bedrock, Vertex AI, Databricks, plus any OpenAI-compatible endpoint by config (Groq, Mistral, Ollama, vLLM, and other presets) |
 | Reliability | Weighted multi-key load balancing, circuit breakers, fallback chains, per-provider backpressure |
 | Passthrough | `ANY /passthrough/{provider}/…` — verbatim forward with gateway auth and metering; new provider features work the day they ship |
 | Config | Single TOML/JSON file or console-managed; `env.*`/`store.*` secret references; atomic hot reload |

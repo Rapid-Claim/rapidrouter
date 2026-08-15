@@ -301,23 +301,6 @@ keys = [{{ name = "k", value = "sk" }}]
 }
 
 #[tokio::test]
-async fn unshipped_adapters_rejected_clearly() {
-    let gw = gateway_with(|_| {
-        r#"
-[providers.bedrock]
-keys = [{ name = "k", value = "aws-key" }]
-"#
-        .to_owned()
-    })
-    .await;
-    let res = chat(&gw, json!({"model": "bedrock/claude-x", "messages": []})).await;
-    assert_eq!(res.status(), 400);
-    let body: Value = res.json().await.unwrap();
-    let message = body["error"]["message"].as_str().unwrap();
-    assert!(message.contains("adapter"), "unhelpful message: {message}");
-}
-
-#[tokio::test]
 async fn gateway_auth_enforced_when_configured() {
     let gw = gateway_with(|mock| {
         format!(

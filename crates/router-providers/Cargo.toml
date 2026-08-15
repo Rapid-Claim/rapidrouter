@@ -7,4 +7,13 @@ license.workspace = true
 [dependencies]
 router-core = { workspace = true }
 bytes = { workspace = true }
+hmac = { workspace = true }
 serde_json = { workspace = true }
+sha2 = { workspace = true }
+
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "translate"
+harness = false

@@ -51,6 +51,14 @@ impl MockProvider {
             .route("/completions", post(completions))
             .route("/embeddings", post(embeddings))
             .route("/responses", post(openai_responses))
+            .route("/openai/deployments/{deployment}/chat/completions", post(azure_chat))
+            .route("/model/{model_action}/converse", post(bedrock_converse))
+            .route("/model/{model_action}/converse-stream", post(bedrock_converse_stream))
+            .route(
+                "/v1/projects/{project}/locations/{location}/publishers/google/models/{model_action}",
+                post(vertex_generate),
+            )
+            .route("/anything/{*rest}", axum::routing::any(record_anything))
             .route("/v1/messages", post(anthropic_messages))
             .route("/v1beta/models/{model_action}", post(gemini_generate))
             .with_state(shared.clone());
@@ -86,8 +94,18 @@ impl MockProvider {
     }
 }
 
+/// Recording is capped so long-running rigs (soak) measure the gateway,
+/// not the mock's memory of every request it ever saw.
+const MAX_RECORDED: usize = 1000;
+
 async fn record(shared: &Shared, path: &str, headers: &HeaderMap, body: &[u8]) -> Value {
     let parsed: Value = serde_json::from_slice(body).unwrap_or(Value::Null);
+    {
+        let mut requests = shared.requests.lock().unwrap();
+        if requests.len() >= MAX_RECORDED {
+            requests.remove(0);
+        }
+    }
     shared.requests.lock().unwrap().push(RecordedRequest {
         path: path.to_owned(),
         authorization: headers
@@ -97,6 +115,7 @@ async fn record(shared: &Shared, path: &str, headers: &HeaderMap, body: &[u8]) -
         api_key: headers
             .get("x-api-key")
             .or_else(|| headers.get("x-goog-api-key"))
+            .or_else(|| headers.get("api-key"))
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
         body: parsed.clone(),
@@ -445,17 +464,22 @@ async fn gemini_generate(
     headers: HeaderMap,
     body: axum::body::Bytes,
 ) -> Response {
+    let record_path = format!("/v1beta/models/{model_action}");
+    gemini_generate_inner(shared, model_action, record_path, headers, body).await
+}
+
+async fn gemini_generate_inner(
+    shared: Shared,
+    model_action: String,
+    record_path: String,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
     let (model, action) = model_action
         .split_once(':')
         .unwrap_or((model_action.as_str(), ""));
     let model = model.to_owned();
-    let parsed = record(
-        &shared,
-        &format!("/v1beta/models/{model_action}"),
-        &headers,
-        &body,
-    )
-    .await;
+    let parsed = record(&shared, &record_path, &headers, &body).await;
     if let Some(failure) = scripted_failure(&shared, &model).await {
         return failure;
     }
@@ -679,4 +703,172 @@ async fn openai_responses(
         "error": null,
     }))
     .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Azure-dialect upstream (deployment-addressed OpenAI)
+// ---------------------------------------------------------------------------
+
+async fn azure_chat(
+    State(shared): State<Shared>,
+    axum::extract::Path(deployment): axum::extract::Path<String>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let path = format!(
+        "/openai/deployments/{deployment}/chat/completions?{}",
+        query.unwrap_or_default()
+    );
+    let parsed = record(&shared, &path, &headers, &body).await;
+    let model = parsed["model"].as_str().unwrap_or("unknown").to_owned();
+    if let Some(failure) = scripted_failure(&shared, &model).await {
+        return failure;
+    }
+    if parsed["stream"] == json!(true) {
+        return sse_stream(model, parsed.get("tools").is_some());
+    }
+    axum::Json(json!({
+        "id": "chatcmpl-azure-mock",
+        "object": "chat.completion",
+        "model": model,
+        "choices": [{"index": 0,
+            "message": {"role": "assistant", "content": "mock response"},
+            "finish_reason": "stop"}],
+        "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+    }))
+    .into_response()
+}
+
+// ---------------------------------------------------------------------------
+// Bedrock-dialect upstream (Converse + event-stream ConverseStream)
+// ---------------------------------------------------------------------------
+
+async fn bedrock_converse(
+    State(shared): State<Shared>,
+    axum::extract::Path(model): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed = record(
+        &shared,
+        &format!("/model/{model}/converse"),
+        &headers,
+        &body,
+    )
+    .await;
+    let with_tools = parsed.get("toolConfig").is_some();
+
+    let content = if with_tools {
+        json!([
+            {"text": "let me check"},
+            {"toolUse": {"toolUseId": "bdrk_1", "name": "get_weather", "input": {"city": "Paris"}}}
+        ])
+    } else {
+        json!([{"text": "mock response"}])
+    };
+    axum::Json(json!({
+        "output": {"message": {"role": "assistant", "content": content}},
+        "stopReason": if with_tools { "tool_use" } else { "end_turn" },
+        "usage": {"inputTokens": 11, "outputTokens": 5, "totalTokens": 16},
+    }))
+    .into_response()
+}
+
+async fn bedrock_converse_stream(
+    State(shared): State<Shared>,
+    axum::extract::Path(model): axum::extract::Path<String>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let parsed = record(
+        &shared,
+        &format!("/model/{model}/converse-stream"),
+        &headers,
+        &body,
+    )
+    .await;
+    let with_tools = parsed.get("toolConfig").is_some();
+
+    let ev =
+        |t: &str, v: Value| router_core::eventstream::encode_event(t, v.to_string().as_bytes());
+    let mut frames: Vec<Vec<u8>> = vec![ev("messageStart", json!({"role": "assistant"}))];
+    if with_tools {
+        frames.push(ev(
+            "contentBlockStart",
+            json!({"contentBlockIndex": 0,
+            "start": {"toolUse": {"toolUseId": "bdrk_1", "name": "get_weather"}}}),
+        ));
+        for fragment in ["{\"city\":", " \"Paris\"}"] {
+            frames.push(ev(
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 0,
+                "delta": {"toolUse": {"input": fragment}}}),
+            ));
+        }
+        frames.push(ev("contentBlockStop", json!({"contentBlockIndex": 0})));
+        frames.push(ev("messageStop", json!({"stopReason": "tool_use"})));
+    } else {
+        for text in ["mock ", "stream"] {
+            frames.push(ev(
+                "contentBlockDelta",
+                json!({"contentBlockIndex": 0,
+                "delta": {"text": text}}),
+            ));
+        }
+        frames.push(ev("messageStop", json!({"stopReason": "end_turn"})));
+    }
+    frames.push(ev(
+        "metadata",
+        json!({"usage": {"inputTokens": 11, "outputTokens": 5, "totalTokens": 16}}),
+    ));
+
+    let stream = futures_util::stream::unfold(0usize, move |i| {
+        let frames = frames.clone();
+        async move {
+            if i < frames.len() {
+                tokio::time::sleep(Duration::from_millis(30)).await;
+                Some((
+                    Ok::<_, std::convert::Infallible>(bytes::Bytes::from(frames[i].clone())),
+                    i + 1,
+                ))
+            } else {
+                None
+            }
+        }
+    });
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/vnd.amazon.eventstream")
+        .body(Body::from_stream(stream))
+        .unwrap()
+}
+
+/// Passthrough test target: records and echoes method + path + query.
+async fn record_anything(
+    State(shared): State<Shared>,
+    method: axum::http::Method,
+    uri: axum::http::Uri,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let path = format!("{} {}", method, uri);
+    let _ = record(&shared, &path, &headers, &body).await;
+    axum::Json(json!({"echo": {"method": method.as_str(), "uri": uri.to_string()}})).into_response()
+}
+
+/// Vertex serves Gemini's dialect from project/location paths; the mock
+/// reuses the Gemini responder with the full path recorded.
+async fn vertex_generate(
+    State(shared): State<Shared>,
+    axum::extract::Path((project, location, model_action)): axum::extract::Path<(
+        String,
+        String,
+        String,
+    )>,
+    headers: HeaderMap,
+    body: axum::body::Bytes,
+) -> Response {
+    let full = format!("vertex/{project}/{location}/{model_action}");
+    gemini_generate_inner(shared, model_action, full, headers, body).await
 }

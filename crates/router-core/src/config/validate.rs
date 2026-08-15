@@ -7,8 +7,8 @@ use std::time::Duration;
 use super::presets::preset;
 use super::raw::{RawConfig, RawProvider};
 use super::{
-    ApiKey, AuthMode, AzureSettings, Breaker, Config, ConfigError, Provider, ProviderKind,
-    Reliability, Retries, RetryOn, ServerConfig, TargetModel,
+    ApiKey, AuthMode, AzureSettings, BedrockSettings, Breaker, Config, ConfigError, Provider,
+    ProviderKind, Reliability, Retries, RetryOn, ServerConfig, TargetModel, VertexSettings,
 };
 use crate::secret::SecretString;
 
@@ -238,6 +238,53 @@ fn validate_provider(
         ));
     }
 
+    let bedrock = validate_bedrock(kind, rp, path, env, errors);
+    let vertex = validate_vertex(kind, rp, path, errors);
+    for field in ["project", "location"] {
+        let set = match field {
+            "project" => rp.project.is_some(),
+            _ => rp.location.is_some(),
+        };
+        if set && kind != ProviderKind::Vertex {
+            errors.push(ConfigError::new(
+                format!("{path}.{field}"),
+                "only valid for the vertex provider",
+            ));
+        }
+    }
+    for field in ["region", "access_key_id"] {
+        let set = match field {
+            "region" => rp.region.is_some(),
+            _ => rp.access_key_id.is_some(),
+        };
+        if set && kind != ProviderKind::Bedrock {
+            errors.push(ConfigError::new(
+                format!("{path}.{field}"),
+                "only valid for the bedrock provider",
+            ));
+        }
+    }
+
+    // Azure's endpoint doubles as its base URL; Bedrock defaults to its
+    // regional runtime endpoint unless overridden.
+    let base_url = match (kind, &azure, &bedrock, &vertex) {
+        (ProviderKind::Azure, Some(a), _, _) => Some(a.endpoint.clone()),
+        (ProviderKind::Bedrock, _, Some(b), _) => base_url.or_else(|| {
+            Some(format!(
+                "https://bedrock-runtime.{}.amazonaws.com",
+                b.region
+            ))
+        }),
+        (ProviderKind::Vertex, _, _, Some(v)) => base_url.or_else(|| {
+            Some(if v.location == "global" {
+                "https://aiplatform.googleapis.com".to_owned()
+            } else {
+                format!("https://{}-aiplatform.googleapis.com", v.location)
+            })
+        }),
+        _ => base_url,
+    };
+
     if errors.len() > before {
         return None;
     }
@@ -249,6 +296,8 @@ fn validate_provider(
         max_concurrency: rp.max_concurrency,
         timeout: Duration::from_secs(rp.timeout_secs),
         azure,
+        bedrock,
+        vertex,
     })
 }
 
@@ -262,11 +311,11 @@ fn validate_azure(
         return None;
     }
     let endpoint = match &rp.endpoint {
-        Some(e) if e.starts_with("https://") => Some(e.clone()),
+        Some(e) if e.starts_with("https://") || e.starts_with("http://") => Some(e.clone()),
         Some(_) => {
             errors.push(ConfigError::new(
                 format!("{path}.endpoint"),
-                "must start with https://",
+                "must start with http:// or https://",
             ));
             None
         }
@@ -292,6 +341,76 @@ fn validate_azure(
         endpoint: endpoint?,
         api_version: api_version?,
         deployments: rp.deployments.clone(),
+    })
+}
+
+fn validate_bedrock(
+    kind: ProviderKind,
+    rp: &RawProvider,
+    path: &str,
+    env: &dyn EnvSource,
+    errors: &mut Vec<ConfigError>,
+) -> Option<BedrockSettings> {
+    if kind != ProviderKind::Bedrock {
+        return None;
+    }
+    let region = match &rp.region {
+        Some(r) if !r.is_empty() => Some(r.clone()),
+        _ => {
+            errors.push(ConfigError::new(
+                format!("{path}.region"),
+                "required for bedrock",
+            ));
+            None
+        }
+    };
+    let access_key_id = match &rp.access_key_id {
+        Some(reference) => match resolve_secret(reference, env) {
+            Ok(secret) => Some(secret.expose().to_owned()),
+            Err(msg) => {
+                errors.push(ConfigError::new(format!("{path}.access_key_id"), msg));
+                None
+            }
+        },
+        None => {
+            errors.push(ConfigError::new(
+                format!("{path}.access_key_id"),
+                "required for bedrock (the key's `value` is the secret access key)",
+            ));
+            None
+        }
+    };
+    Some(BedrockSettings {
+        region: region?,
+        access_key_id: access_key_id?,
+    })
+}
+
+fn validate_vertex(
+    kind: ProviderKind,
+    rp: &RawProvider,
+    path: &str,
+    errors: &mut Vec<ConfigError>,
+) -> Option<VertexSettings> {
+    if kind != ProviderKind::Vertex {
+        return None;
+    }
+    let project = match &rp.project {
+        Some(p) if !p.is_empty() => Some(p.clone()),
+        _ => {
+            errors.push(ConfigError::new(
+                format!("{path}.project"),
+                "required for vertex",
+            ));
+            None
+        }
+    };
+    Some(VertexSettings {
+        project: project?,
+        location: rp
+            .location
+            .clone()
+            .unwrap_or_else(|| "us-central1".to_owned()),
     })
 }
 

@@ -8,7 +8,10 @@ use std::time::Duration;
 use tokio::sync::Semaphore;
 
 use crate::breaker::{Admission, Breaker, BreakerConfig};
-use crate::config::{AuthMode, Config, ProviderKind, Retries, RetryOn, TargetModel};
+use crate::config::{
+    AuthMode, AzureSettings, BedrockSettings, Config, ProviderKind, Retries, RetryOn, TargetModel,
+    VertexSettings,
+};
 use crate::error::{ErrorClass, GatewayError};
 use crate::secret::SecretString;
 
@@ -33,6 +36,9 @@ pub struct ProviderRuntime {
     /// Health for keyless providers (local servers), where there is no
     /// key to hang a breaker on.
     pub provider_breaker: Breaker,
+    pub azure: Option<AzureSettings>,
+    pub bedrock: Option<BedrockSettings>,
+    pub vertex: Option<VertexSettings>,
 }
 
 #[derive(Debug)]
@@ -106,6 +112,9 @@ impl RoutingTable {
                     timeout: p.timeout,
                     semaphore: Arc::new(Semaphore::new(p.max_concurrency)),
                     provider_breaker: Breaker::new(breaker_config),
+                    azure: p.azure.clone(),
+                    bedrock: p.bedrock.clone(),
+                    vertex: p.vertex.clone(),
                 }),
             );
         }

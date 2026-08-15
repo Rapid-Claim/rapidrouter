@@ -3,6 +3,7 @@ pub mod chat;
 pub mod clock;
 pub mod config;
 pub mod error;
+pub mod eventstream;
 pub mod json;
 pub mod router;
 pub mod secret;

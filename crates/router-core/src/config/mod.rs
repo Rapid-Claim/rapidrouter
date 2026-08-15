@@ -27,6 +27,8 @@ pub enum ProviderKind {
     Gemini,
     Azure,
     Bedrock,
+    /// Gemini dialect over Vertex AI's project/location endpoints.
+    Vertex,
     OpenAiCompat,
 }
 
@@ -67,6 +69,8 @@ pub struct Provider {
     pub max_concurrency: usize,
     pub timeout: Duration,
     pub azure: Option<AzureSettings>,
+    pub bedrock: Option<BedrockSettings>,
+    pub vertex: Option<VertexSettings>,
 }
 
 #[derive(Debug)]
@@ -77,12 +81,24 @@ pub struct ApiKey {
     pub models: Option<Vec<String>>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct AzureSettings {
     pub endpoint: String,
     pub api_version: String,
     /// Model name -> deployment name.
     pub deployments: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct BedrockSettings {
+    pub region: String,
+    pub access_key_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct VertexSettings {
+    pub project: String,
+    pub location: String,
 }
 
 #[derive(Debug)]
@@ -229,6 +245,13 @@ impl Config {
                     "[providers.{name}]\nkeys = [{{ name = \"default\", value = \"env.{var}\" }}]\n\n"
                 ));
             }
+        }
+        // Databricks needs both a workspace host and a token.
+        if let (Some(host), Some(_)) = (env.get("DATABRICKS_HOST"), env.get("DATABRICKS_TOKEN")) {
+            let host = host.trim_end_matches('/');
+            doc.push_str(&format!(
+                "[providers.databricks]\nbase_url = \"{host}/serving-endpoints\"\nkeys = [{{ name = \"default\", value = \"env.DATABRICKS_TOKEN\" }}]\n\n"
+            ));
         }
         if doc.is_empty() {
             return None;

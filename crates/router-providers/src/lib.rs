@@ -6,8 +6,10 @@
 //! entirely (raw passthrough in the server).
 
 pub mod anthropic;
+pub mod bedrock;
 pub mod gemini;
 pub mod responses;
+pub mod sigv4;
 
 use bytes::Bytes;
 use router_core::chat::ChatRequest;
@@ -23,16 +25,24 @@ pub enum Dialect {
     OpenAi,
     Anthropic,
     Gemini,
+    /// Outbound-only: Bedrock's Converse dialect. Never an inbound wire.
+    Bedrock,
 }
 
 /// The wire dialect a provider speaks, or `None` for kinds whose
 /// adapters have not shipped yet (Azure, Bedrock).
 pub fn wire_dialect(kind: ProviderKind) -> Option<Dialect> {
     match kind {
-        ProviderKind::OpenAi | ProviderKind::OpenAiCompat => Some(Dialect::OpenAi),
+        // Azure speaks the OpenAI dialect over its own URL/auth scheme,
+        // which the transport layer handles.
+        ProviderKind::OpenAi | ProviderKind::OpenAiCompat | ProviderKind::Azure => {
+            Some(Dialect::OpenAi)
+        }
         ProviderKind::Anthropic => Some(Dialect::Anthropic),
-        ProviderKind::Gemini => Some(Dialect::Gemini),
-        ProviderKind::Azure | ProviderKind::Bedrock => None,
+        // Vertex serves Gemini's wire dialect from its own URL scheme,
+        // which the transport layer handles.
+        ProviderKind::Gemini | ProviderKind::Vertex => Some(Dialect::Gemini),
+        ProviderKind::Bedrock => Some(Dialect::Bedrock),
     }
 }
 
@@ -94,6 +104,22 @@ pub fn build_outbound(
                 json_schema_emulated: false,
             })
         }
+        Dialect::Bedrock => {
+            let built = bedrock::build_request(req)?;
+            let action = if stream {
+                "converse-stream"
+            } else {
+                "converse"
+            };
+            Ok(OutboundRequest {
+                path: format!("/model/{}/{action}", sigv4::encode_path_segment(model)),
+                body: serde_json::to_vec(&built.body)
+                    .expect("value serializes")
+                    .into(),
+                dropped_params: built.dropped_params,
+                json_schema_emulated: false,
+            })
+        }
     }
 }
 
@@ -109,6 +135,14 @@ pub fn passthrough_path(dialect: Dialect, model: &str, stream: bool) -> String {
                 "generateContent"
             };
             format!("/v1beta/models/{model}:{action}")
+        }
+        Dialect::Bedrock => {
+            let action = if stream {
+                "converse-stream"
+            } else {
+                "converse"
+            };
+            format!("/model/{}/{action}", sigv4::encode_path_segment(model))
         }
     }
 }
@@ -130,13 +164,14 @@ pub fn response_to_openai(
         Dialect::OpenAi => value,
         Dialect::Anthropic => anthropic::response_to_openai(&value, json_schema_emulated),
         Dialect::Gemini => gemini::response_to_openai(&value, model),
+        Dialect::Bedrock => bedrock::response_to_openai(&value, model),
     })
 }
 
 /// Render an internal (OpenAI-shaped) response in the inbound dialect.
 pub fn render_response(inbound: Dialect, openai: &Value) -> Value {
     match inbound {
-        Dialect::OpenAi => openai.clone(),
+        Dialect::OpenAi | Dialect::Bedrock => openai.clone(),
         Dialect::Anthropic => anthropic::openai_response_to_anthropic(openai),
         Dialect::Gemini => gemini::openai_response_to_gemini(openai),
     }
@@ -148,6 +183,7 @@ pub enum UpstreamStream {
     OpenAi,
     Anthropic(anthropic::StreamToOpenAi),
     Gemini(gemini::StreamToOpenAi),
+    Bedrock(bedrock::StreamToOpenAi),
 }
 
 impl UpstreamStream {
@@ -158,6 +194,7 @@ impl UpstreamStream {
                 Self::Anthropic(anthropic::StreamToOpenAi::new(json_schema_emulated))
             }
             Dialect::Gemini => Self::Gemini(gemini::StreamToOpenAi::new(model)),
+            Dialect::Bedrock => Self::Bedrock(bedrock::StreamToOpenAi::new(model)),
         }
     }
 
@@ -175,6 +212,7 @@ impl UpstreamStream {
             Self::Gemini(state) => serde_json::from_str::<Value>(&event.data)
                 .map(|v| state.on_chunk(&v))
                 .unwrap_or_default(),
+            Self::Bedrock(state) => state.on_event(event),
         }
     }
 }
@@ -214,7 +252,7 @@ pub enum InboundStream {
 impl InboundStream {
     pub fn new(dialect: Dialect) -> Self {
         match dialect {
-            Dialect::OpenAi => Self::OpenAi,
+            Dialect::OpenAi | Dialect::Bedrock => Self::OpenAi,
             Dialect::Anthropic => Self::Anthropic(anthropic::OpenAiToAnthropicStream::new()),
             Dialect::Gemini => Self::Gemini(gemini::OpenAiToGeminiStream::new()),
         }
@@ -263,7 +301,7 @@ impl InboundStream {
 /// Render an error in the inbound dialect's error shape.
 pub fn render_error(inbound: Dialect, err: &GatewayError) -> Value {
     match inbound {
-        Dialect::OpenAi => err.to_openai_body(),
+        Dialect::OpenAi | Dialect::Bedrock => err.to_openai_body(),
         Dialect::Anthropic => serde_json::json!({
             "type": "error",
             "error": {

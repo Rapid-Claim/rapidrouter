@@ -56,6 +56,14 @@ pub struct RawProvider {
     pub api_version: Option<String>,
     /// Azure only: model name -> deployment name.
     pub deployments: BTreeMap<String, String>,
+    /// Bedrock only.
+    pub region: Option<String>,
+    /// Bedrock only: `env.*` reference or literal AWS access key id.
+    pub access_key_id: Option<String>,
+    /// Vertex only.
+    pub project: Option<String>,
+    /// Vertex only; defaults to `us-central1`.
+    pub location: Option<String>,
 }
 
 impl Default for RawProvider {
@@ -70,6 +78,10 @@ impl Default for RawProvider {
             endpoint: None,
             api_version: None,
             deployments: BTreeMap::new(),
+            region: None,
+            access_key_id: None,
+            project: None,
+            location: None,
         }
     }
 }

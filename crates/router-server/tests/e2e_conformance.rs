@@ -461,6 +461,19 @@ keys = [{{ name = "k", value = "sk-ant" }}]
 [providers.gemini]
 base_url = "{base}"
 keys = [{{ name = "k", value = "sk-gem" }}]
+[providers.azure]
+endpoint = "{base}"
+api_version = "2024-10-21"
+keys = [{{ name = "k", value = "az-key" }}]
+[providers.vertex]
+project = "conf-project"
+base_url = "{base}"
+keys = [{{ name = "k", value = "vx-token" }}]
+[providers.bedrock]
+region = "us-east-1"
+access_key_id = "AKIACONF"
+base_url = "{base}"
+keys = [{{ name = "k", value = "aws-secret" }}]
 "#,
             base = mock.base_url()
         ),
@@ -589,6 +602,29 @@ async fn conformance_anthropic_target() {
 #[tokio::test]
 async fn conformance_gemini_target() {
     run_target("gemini", "gemini/gemini-pro", |s| s.gemini).await;
+}
+
+/// Azure keeps the OpenAI dialect, so it inherits its expectations.
+#[tokio::test]
+async fn conformance_azure_target() {
+    run_target("azure", "azure/gpt-4o", |s| s.openai).await;
+}
+
+/// Vertex serves the Gemini dialect, so it inherits its expectations.
+#[tokio::test]
+async fn conformance_vertex_target() {
+    run_target("vertex", "vertex/gemini-pro", |s| s.gemini).await;
+}
+
+/// Bedrock tracks Anthropic's capability profile except remote image
+/// URLs, which Converse cannot fetch.
+#[tokio::test]
+async fn conformance_bedrock_target() {
+    run_target("bedrock", "bedrock/claude-x", |s| match s.name {
+        "image_https_url" => Expect::Reject("messages"),
+        _ => s.anthropic,
+    })
+    .await;
 }
 
 /// The same tool/text corpus through the Responses surface, translated.
