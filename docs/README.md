@@ -58,6 +58,7 @@ curl http://localhost:8080/v1/chat/completions \
 | [components/observability.md](components/observability.md) | Metrics, tracing, logging, response headers |
 | [components/console.md](components/console.md) | The web console: product pages, bundling into the binary, design system |
 | [components/virtual-keys.md](components/virtual-keys.md) | Virtual keys: scoped credentials, budgets, rate limits, lifecycle |
+| [components/agent-subscriptions.md](components/agent-subscriptions.md) | Serving traffic from Claude Code / Codex subscription seats, and what is not yet verified |
 
 ### Providers & operations
 | Doc | Contents |

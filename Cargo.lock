@@ -2663,6 +2663,8 @@ dependencies = [
 name = "router-core"
 version = "0.1.0"
 dependencies = [
+ "arc-swap",
+ "base64",
  "blake3",
  "bytes",
  "crc32fast",
@@ -2698,6 +2700,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "axum",
+ "base64",
  "bytes",
  "fastrand",
  "futures-util",

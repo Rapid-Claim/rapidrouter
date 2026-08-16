@@ -30,6 +30,21 @@ pub enum ProviderKind {
     /// Gemini dialect over Vertex AI's project/location endpoints.
     Vertex,
     OpenAiCompat,
+    /// Anthropic's Messages API reached with a Claude Code subscription
+    /// OAuth token instead of a metered API key.
+    ClaudeSubscription,
+    /// The private Responses endpoint the Codex CLI talks to, reached
+    /// with a ChatGPT subscription credential.
+    CodexSubscription,
+}
+
+impl ProviderKind {
+    /// Whether this provider is backed by a subscription seat rather than
+    /// a metered API key. Seats rotate their credentials, are benched on
+    /// the provider's own schedule, and carry vendor-specific headers.
+    pub fn is_subscription(self) -> bool {
+        matches!(self, Self::ClaudeSubscription | Self::CodexSubscription)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -181,6 +196,30 @@ pub struct Provider {
     pub azure: Option<AzureSettings>,
     pub bedrock: Option<BedrockSettings>,
     pub vertex: Option<VertexSettings>,
+    pub codex: Option<CodexSettings>,
+}
+
+/// Per-provider knobs for the Codex subscription transport.
+#[derive(Debug, Clone)]
+pub struct CodexSettings {
+    /// The Codex CLI version presented to the backend. Configurable
+    /// because the backend gates model families on it and an operator
+    /// must be able to follow a new family without a gateway release.
+    pub version: String,
+    /// Reasoning-depth floor; `None` restores the backend's own default.
+    pub reasoning_effort: Option<String>,
+    /// Output-verbosity floor; `None` restores the backend's own default.
+    pub verbosity: Option<String>,
+}
+
+impl Default for CodexSettings {
+    fn default() -> Self {
+        Self {
+            version: "0.146.0".into(),
+            reasoning_effort: Some("low".into()),
+            verbosity: Some("low".into()),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -189,6 +228,13 @@ pub struct ApiKey {
     pub secret: SecretString,
     pub weight: f64,
     pub models: Option<Vec<String>>,
+    /// Where this credential was read from, when it came from a file.
+    ///
+    /// Retained only for `file:` references — a subscription seat whose
+    /// token rotates needs somewhere to write the new one. An inline or
+    /// `env.` value has no path, and for an inline value the reference
+    /// *is* the secret, so nothing is kept.
+    pub source_path: Option<String>,
 }
 
 #[derive(Debug, Clone)]

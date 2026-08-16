@@ -10,6 +10,7 @@ pub mod bedrock;
 pub mod gemini;
 pub mod responses;
 pub mod sigv4;
+pub mod subscription;
 
 use bytes::Bytes;
 use router_core::chat::ChatRequest;
@@ -27,6 +28,10 @@ pub enum Dialect {
     Gemini,
     /// Outbound-only: Bedrock's Converse dialect. Never an inbound wire.
     Bedrock,
+    /// Outbound-only: the Responses dialect as the ChatGPT Codex backend
+    /// serves it. Inbound Responses traffic is a different path
+    /// ([`crate::responses`]); this is the wire we *speak* to Codex.
+    CodexResponses,
 }
 
 /// The wire dialect a provider speaks, or `None` for kinds whose
@@ -43,6 +48,11 @@ pub fn wire_dialect(kind: ProviderKind) -> Option<Dialect> {
         // which the transport layer handles.
         ProviderKind::Gemini | ProviderKind::Vertex => Some(Dialect::Gemini),
         ProviderKind::Bedrock => Some(Dialect::Bedrock),
+        // A subscription seat changes the credential and the headers, not
+        // the wire: Claude subscription traffic is ordinary Messages API
+        // traffic, and every Anthropic translation applies unchanged.
+        ProviderKind::ClaudeSubscription => Some(Dialect::Anthropic),
+        ProviderKind::CodexSubscription => Some(Dialect::CodexResponses),
     }
 }
 
@@ -63,6 +73,8 @@ pub fn build_outbound(
     req: &ChatRequest,
     model: &str,
     stream: bool,
+    codex: Option<&router_core::config::CodexSettings>,
+    pin_claude_identity: bool,
 ) -> Result<OutboundRequest, GatewayError> {
     match dialect {
         Dialect::OpenAi => {
@@ -78,7 +90,12 @@ pub fn build_outbound(
             })
         }
         Dialect::Anthropic => {
-            let built = anthropic::build_request(req, model)?;
+            let mut built = anthropic::build_request(req, model)?;
+            // A subscription token is authorized for the Claude Code
+            // identity, so the request must present it.
+            if pin_claude_identity {
+                subscription::pin_claude_identity(&mut built.body);
+            }
             Ok(OutboundRequest {
                 path: "/v1/messages".into(),
                 body: serde_json::to_vec(&built.body)
@@ -120,6 +137,24 @@ pub fn build_outbound(
                 json_schema_emulated: false,
             })
         }
+        Dialect::CodexResponses => {
+            // The Codex backend only speaks SSE — `stream: false` is not
+            // an option it offers. A non-streaming caller is served by
+            // aggregating the stream at our end
+            // ([`subscription::aggregate_chunks`]), not by asking for a
+            // whole body upstream.
+            let _ = stream;
+            let settings = codex.cloned().unwrap_or_default();
+            let built = subscription::codex_request(req, model, &settings);
+            Ok(OutboundRequest {
+                path: "/backend-api/codex/responses".into(),
+                body: serde_json::to_vec(&built.body)
+                    .expect("value serializes")
+                    .into(),
+                dropped_params: built.dropped_params,
+                json_schema_emulated: false,
+            })
+        }
     }
 }
 
@@ -144,6 +179,9 @@ pub fn passthrough_path(dialect: Dialect, model: &str, stream: bool) -> String {
             };
             format!("/model/{}/{action}", sigv4::encode_path_segment(model))
         }
+        // Never reachable: passthrough is same-dialect forwarding, and no
+        // inbound wire is Codex's private Responses dialect.
+        Dialect::CodexResponses => "/backend-api/codex/responses".into(),
     }
 }
 
@@ -154,6 +192,11 @@ pub fn response_to_openai(
     model: &str,
     json_schema_emulated: bool,
 ) -> Result<Value, GatewayError> {
+    // Codex answers only in SSE, even for a caller who wanted a whole
+    // body, so it never has a JSON document to parse here.
+    if dialect == Dialect::CodexResponses {
+        return Ok(subscription::aggregate_sse(body, model));
+    }
     let value: Value = serde_json::from_slice(body).map_err(|e| {
         GatewayError::new(
             ErrorClass::UpstreamError,
@@ -165,13 +208,16 @@ pub fn response_to_openai(
         Dialect::Anthropic => anthropic::response_to_openai(&value, json_schema_emulated),
         Dialect::Gemini => gemini::response_to_openai(&value, model),
         Dialect::Bedrock => bedrock::response_to_openai(&value, model),
+        // A Codex response is never a whole body; it arrives as SSE even
+        // for a non-streaming caller, and is aggregated from chunks.
+        Dialect::CodexResponses => value,
     })
 }
 
 /// Render an internal (OpenAI-shaped) response in the inbound dialect.
 pub fn render_response(inbound: Dialect, openai: &Value) -> Value {
     match inbound {
-        Dialect::OpenAi | Dialect::Bedrock => openai.clone(),
+        Dialect::OpenAi | Dialect::Bedrock | Dialect::CodexResponses => openai.clone(),
         Dialect::Anthropic => anthropic::openai_response_to_anthropic(openai),
         Dialect::Gemini => gemini::openai_response_to_gemini(openai),
     }
@@ -184,6 +230,7 @@ pub enum UpstreamStream {
     Anthropic(anthropic::StreamToOpenAi),
     Gemini(gemini::StreamToOpenAi),
     Bedrock(bedrock::StreamToOpenAi),
+    Codex(subscription::CodexStreamToOpenAi),
 }
 
 impl UpstreamStream {
@@ -195,6 +242,7 @@ impl UpstreamStream {
             }
             Dialect::Gemini => Self::Gemini(gemini::StreamToOpenAi::new(model)),
             Dialect::Bedrock => Self::Bedrock(bedrock::StreamToOpenAi::new(model)),
+            Dialect::CodexResponses => Self::Codex(subscription::CodexStreamToOpenAi::new(model)),
         }
     }
 
@@ -213,6 +261,7 @@ impl UpstreamStream {
                 .map(|v| state.on_chunk(&v))
                 .unwrap_or_default(),
             Self::Bedrock(state) => state.on_event(event),
+            Self::Codex(state) => state.on_event(event),
         }
     }
 }
@@ -252,7 +301,7 @@ pub enum InboundStream {
 impl InboundStream {
     pub fn new(dialect: Dialect) -> Self {
         match dialect {
-            Dialect::OpenAi | Dialect::Bedrock => Self::OpenAi,
+            Dialect::OpenAi | Dialect::Bedrock | Dialect::CodexResponses => Self::OpenAi,
             Dialect::Anthropic => Self::Anthropic(anthropic::OpenAiToAnthropicStream::new()),
             Dialect::Gemini => Self::Gemini(gemini::OpenAiToGeminiStream::new()),
         }
@@ -301,7 +350,7 @@ impl InboundStream {
 /// Render an error in the inbound dialect's error shape.
 pub fn render_error(inbound: Dialect, err: &GatewayError) -> Value {
     match inbound {
-        Dialect::OpenAi | Dialect::Bedrock => err.to_openai_body(),
+        Dialect::OpenAi | Dialect::Bedrock | Dialect::CodexResponses => err.to_openai_body(),
         Dialect::Anthropic => serde_json::json!({
             "type": "error",
             "error": {

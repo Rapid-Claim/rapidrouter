@@ -155,3 +155,72 @@ fn vkey_spend_rollover_race_is_sound() {
         assert_eq!(spend.current(3), 0);
     });
 }
+
+/// A seat benched on a provider-reported window is never admitted before
+/// that window rolls, no matter how the bench races with concurrent
+/// admissions.
+///
+/// This is the invariant that keeps an exhausted subscription pool from
+/// burning its callers' retry budgets: every early probe costs one attempt
+/// and earns another 429.
+#[test]
+fn a_benched_seat_is_never_admitted_early() {
+    loom::model(|| {
+        let breaker = Arc::new(Breaker::new(BreakerConfig {
+            failure_threshold: 1,
+            window_ms: 100,
+            cooldown_ms: 10,
+        }));
+        // One thread benches (as a 429 handler does) while another tries
+        // to admit at a time the breaker's own cooldown would have
+        // allowed.
+        let bencher = {
+            let b = breaker.clone();
+            thread::spawn(move || b.bench_until(1_000))
+        };
+        let admitter = {
+            let b = breaker.clone();
+            thread::spawn(move || b.admit(500))
+        };
+        bencher.join().unwrap();
+        admitter.join().unwrap();
+
+        // Whatever order those landed in, the bench is now visible and
+        // must hold until its deadline.
+        assert_eq!(
+            breaker.admit(999),
+            Admission::No,
+            "a benched seat must not be admitted before its window rolls"
+        );
+        assert_eq!(
+            breaker.admit(1_000),
+            Admission::Yes,
+            "and must return after"
+        );
+    });
+}
+
+/// Concurrent benches from different windows resolve to the longest one:
+/// a seat out of weekly quota must not be released early because a
+/// shorter window landed second.
+#[test]
+fn concurrent_benches_keep_the_longest_window() {
+    loom::model(|| {
+        let breaker = Arc::new(Breaker::new(BreakerConfig {
+            failure_threshold: 1,
+            window_ms: 100,
+            cooldown_ms: 10,
+        }));
+        let long = {
+            let b = breaker.clone();
+            thread::spawn(move || b.bench_until(5_000))
+        };
+        let short = {
+            let b = breaker.clone();
+            thread::spawn(move || b.bench_until(100))
+        };
+        long.join().unwrap();
+        short.join().unwrap();
+        assert_eq!(breaker.admit(4_999), Admission::No);
+    });
+}

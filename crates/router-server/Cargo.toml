@@ -40,3 +40,4 @@ tower = { workspace = true }
 mock-provider = { workspace = true }
 reqwest = { workspace = true }
 tempfile = "3"
+base64 = { workspace = true }

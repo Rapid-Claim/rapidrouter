@@ -199,6 +199,20 @@ pub struct RawProvider {
     pub project: Option<String>,
     /// Vertex only; defaults to `us-central1`.
     pub location: Option<String>,
+    /// Codex subscription only.
+    pub codex: Option<RawCodex>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RawCodex {
+    /// Codex CLI version string sent as `Version`/`User-Agent`.
+    pub version: Option<String>,
+    /// `none`|`minimal`|`low`|`medium`|`high`|`xhigh`|`max`, or `""` to
+    /// send no floor and take the backend's per-model default.
+    pub reasoning_effort: Option<String>,
+    /// `low`|`medium`|`high`, or `""` for the backend default.
+    pub verbosity: Option<String>,
 }
 
 impl Default for RawProvider {
@@ -217,6 +231,7 @@ impl Default for RawProvider {
             access_key_id: None,
             project: None,
             location: None,
+            codex: None,
         }
     }
 }

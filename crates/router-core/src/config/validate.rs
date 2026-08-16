@@ -7,8 +7,9 @@ use std::time::Duration;
 use super::presets::preset;
 use super::raw::{RawConfig, RawProvider};
 use super::{
-    ApiKey, AuthMode, AzureSettings, BedrockSettings, Breaker, Config, ConfigError, Provider,
-    ProviderKind, Reliability, Retries, RetryOn, ServerConfig, TargetModel, VertexSettings,
+    ApiKey, AuthMode, AzureSettings, BedrockSettings, Breaker, CodexSettings, Config, ConfigError,
+    Provider, ProviderKind, Reliability, Retries, RetryOn, ServerConfig, TargetModel,
+    VertexSettings,
 };
 use crate::secret::SecretString;
 
@@ -377,10 +378,15 @@ fn validate_provider(
     let kind = match (&known, rp.r#type.as_deref()) {
         (Some(p), None) => p.kind,
         (None, Some("openai_compat")) => ProviderKind::OpenAiCompat,
+        (_, Some("claude_subscription")) => ProviderKind::ClaudeSubscription,
+        (_, Some("codex_subscription")) => ProviderKind::CodexSubscription,
         (None, Some(other)) => {
             errors.push(ConfigError::new(
                 format!("{path}.type"),
-                format!("unknown provider type `{other}` (expected `openai_compat`)"),
+                format!(
+                    "unknown provider type `{other}` (expected `openai_compat`, \
+                     `claude_subscription`, or `codex_subscription`)"
+                ),
             ));
             return None;
         }
@@ -474,6 +480,11 @@ fn validate_provider(
                 secret,
                 weight: rk.weight,
                 models: rk.models.clone(),
+                source_path: rk
+                    .value
+                    .strip_prefix("file:")
+                    .filter(|p| !p.is_empty())
+                    .map(str::to_owned),
             }),
             Err(msg) => errors.push(ConfigError::new(format!("{kpath}.value"), msg)),
         }
@@ -539,8 +550,12 @@ fn validate_provider(
         }
     }
 
+    let codex = validate_codex(kind, rp, path, errors);
+
     // Azure's endpoint doubles as its base URL; Bedrock defaults to its
-    // regional runtime endpoint unless overridden.
+    // regional runtime endpoint unless overridden. The subscription
+    // transports have one endpoint each and no reason to be pointed
+    // elsewhere in normal use, but stay overridable for testing.
     let base_url = match (kind, &azure, &bedrock, &vertex) {
         (ProviderKind::Azure, Some(a), _, _) => Some(a.endpoint.clone()),
         (ProviderKind::Bedrock, _, Some(b), _) => base_url.or_else(|| {
@@ -556,6 +571,12 @@ fn validate_provider(
                 format!("https://{}-aiplatform.googleapis.com", v.location)
             })
         }),
+        (ProviderKind::ClaudeSubscription, ..) => {
+            base_url.or_else(|| Some("https://api.anthropic.com".to_owned()))
+        }
+        (ProviderKind::CodexSubscription, ..) => {
+            base_url.or_else(|| Some("https://chatgpt.com".to_owned()))
+        }
         _ => base_url,
     };
 
@@ -572,7 +593,79 @@ fn validate_provider(
         azure,
         bedrock,
         vertex,
+        codex,
     })
+}
+
+/// Validate the `[providers.x.codex]` block.
+///
+/// Both enum knobs accept `""` — "send no floor, take the backend's own
+/// default" — which is why they are `Option<String>` rather than a
+/// defaulted string. An out-of-vocabulary value is rejected here rather
+/// than forwarded, because the backend answers one with a 400 on *every*
+/// request: a typo in a config file would take the whole provider down,
+/// and a config that cannot serve traffic must not validate.
+fn validate_codex(
+    kind: ProviderKind,
+    rp: &RawProvider,
+    path: &str,
+    errors: &mut Vec<ConfigError>,
+) -> Option<CodexSettings> {
+    const EFFORTS: [&str; 7] = ["none", "minimal", "low", "medium", "high", "xhigh", "max"];
+    const VERBOSITIES: [&str; 3] = ["low", "medium", "high"];
+
+    if kind != ProviderKind::CodexSubscription {
+        if rp.codex.is_some() {
+            errors.push(ConfigError::new(
+                format!("{path}.codex"),
+                "only valid for `type = \"codex_subscription\"` providers",
+            ));
+        }
+        return None;
+    }
+
+    let raw = rp.codex.as_ref();
+    let mut settings = CodexSettings::default();
+    if let Some(version) = raw.and_then(|c| c.version.as_deref()) {
+        if version.is_empty() {
+            errors.push(ConfigError::new(
+                format!("{path}.codex.version"),
+                "must not be empty — the backend gates models on this value",
+            ));
+        } else {
+            settings.version = version.to_owned();
+        }
+    }
+    let mut choice =
+        |value: Option<&str>, allowed: &[&str], field: &str| -> Option<Option<String>> {
+            let value = value?;
+            if value.is_empty() {
+                return Some(None);
+            }
+            if !allowed.contains(&value) {
+                errors.push(ConfigError::new(
+                    format!("{path}.codex.{field}"),
+                    format!("must be one of {allowed:?}, or \"\" for the provider default"),
+                ));
+                return None;
+            }
+            Some(Some(value.to_owned()))
+        };
+    if let Some(effort) = choice(
+        raw.and_then(|c| c.reasoning_effort.as_deref()),
+        &EFFORTS,
+        "reasoning_effort",
+    ) {
+        settings.reasoning_effort = effort;
+    }
+    if let Some(verbosity) = choice(
+        raw.and_then(|c| c.verbosity.as_deref()),
+        &VERBOSITIES,
+        "verbosity",
+    ) {
+        settings.verbosity = verbosity;
+    }
+    Some(settings)
 }
 
 fn validate_azure(
@@ -852,6 +945,23 @@ fn validate_reliability(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> Relia
 /// `env.VAR` reads the environment; `store.name` is reserved for the
 /// managed store; anything else is taken as a literal value.
 fn resolve_secret(value: &str, env: &dyn EnvSource) -> Result<SecretString, String> {
+    if let Some(path) = value.strip_prefix("file:") {
+        // A whole credential document read from disk: a Codex `auth.json`
+        // or a Claude Code credential file, which are what a subscription
+        // seat is configured with. Trailing whitespace is stripped so a
+        // file ending in a newline — every file an editor writes — still
+        // yields a usable token.
+        if path.is_empty() {
+            return Err("empty path after `file:`".into());
+        }
+        return match std::fs::read_to_string(path) {
+            Ok(contents) if !contents.trim().is_empty() => {
+                Ok(SecretString::new(contents.trim().to_owned()))
+            }
+            Ok(_) => Err(format!("credential file `{path}` is empty")),
+            Err(e) => Err(format!("cannot read credential file `{path}`: {e}")),
+        };
+    }
     if let Some(var) = value.strip_prefix("env.") {
         if var.is_empty() {
             return Err("empty environment variable name after `env.`".into());

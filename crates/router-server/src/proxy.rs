@@ -15,7 +15,10 @@ use futures_util::StreamExt;
 use http_body_util::BodyExt;
 use router_core::breaker::Breaker;
 use router_core::chat::ChatRequest;
-use router_core::config::{AuthMode, RetryOn};
+use router_core::config::{AuthMode, ProviderKind, RetryOn};
+use router_core::quota;
+
+use crate::refresh;
 use router_core::eventstream::EventStreamParser;
 use router_core::router::{KeyRuntime, ResolvedRoute, RoutePlan};
 use router_core::sse::SseParser;
@@ -419,8 +422,14 @@ async fn run_chat(
                 Some(r) => r,
                 None => internal.insert(inbound.to_internal()?),
             };
-            let built =
-                router_providers::build_outbound(out_dialect, req, &route.upstream_model, stream)?;
+            let built = router_providers::build_outbound(
+                out_dialect,
+                req,
+                &route.upstream_model,
+                stream,
+                route.provider.codex.as_ref(),
+                route.provider.kind == ProviderKind::ClaudeSubscription,
+            )?;
             (
                 built.body,
                 built.path,
@@ -438,7 +447,20 @@ async fn run_chat(
                 t_idx + 1 == n_targets && a_idx + 1 == plan.max_attempts_per_target;
             let now = clock::now_ms();
             let Some(choice) = route.provider.admit_key(&route.upstream_model, now) else {
-                last_error = Some(
+                // A subscription pool with every seat out of quota is rate
+                // limited, not out of capacity. The distinction is what
+                // the caller does next: a 503 invites an immediate retry,
+                // a 429 tells them there is a window to wait for.
+                last_error = Some(if route.provider.all_keys_benched(&route.upstream_model) {
+                    GatewayError::new(
+                        ErrorClass::RateLimited,
+                        format!(
+                            "every seat of provider `{}` is out of quota for model `{}`",
+                            route.provider.name, route.upstream_model
+                        ),
+                    )
+                    .with_provider(&route.provider.name)
+                } else {
                     GatewayError::new(
                         ErrorClass::NoCapacity,
                         format!(
@@ -446,8 +468,8 @@ async fn run_chat(
                             route.provider.name, route.upstream_model
                         ),
                     )
-                    .with_provider(&route.provider.name),
-                );
+                    .with_provider(&route.provider.name)
+                });
                 break;
             };
             let Ok(permit) = route.provider.semaphore.clone().try_acquire_owned() else {
@@ -463,6 +485,27 @@ async fn run_chat(
 
             attempts += 1;
             let breaker = route.provider.breaker_for(choice.key);
+            // Renew a subscription seat that is about to expire, before
+            // its token is put on a request. Doing it here rather than on
+            // the 401 that would follow keeps the failure off the caller's
+            // path; a seat that cannot renew simply carries on and is
+            // handled reactively.
+            if route.provider.kind.is_subscription()
+                && let Some(key) = choice.key
+            {
+                refresh::refresh_if_stale(
+                    &state.upstream,
+                    &state.refreshes,
+                    route.provider.kind,
+                    key,
+                    &key.source_path
+                        .as_deref()
+                        .map(|p| refresh::Persist::File(p.to_owned()))
+                        .unwrap_or(refresh::Persist::None),
+                    now_epoch_ms(),
+                )
+                .await;
+            }
             let request = build_upstream_request(
                 route,
                 out_dialect,
@@ -477,6 +520,7 @@ async fn run_chat(
                 route,
                 request,
                 breaker,
+                choice.key,
                 permit,
                 &plan,
                 is_last_candidate,
@@ -529,6 +573,7 @@ async fn attempt(
     route: &ResolvedRoute,
     request: http::Request<Body>,
     breaker: &Breaker,
+    key: Option<&router_core::router::KeyRuntime>,
     permit: tokio::sync::OwnedSemaphorePermit,
     plan: &RoutePlan,
     is_last_candidate: bool,
@@ -561,6 +606,53 @@ async fn attempt(
                 breaker.record_success(clock::now_ms());
             }
 
+            // A subscription seat that is out of quota is out until the
+            // provider's window rolls — minutes to days, not the breaker's
+            // configured cooldown. Probing before then costs the caller a
+            // retry attempt and earns another 429, so the seat is benched
+            // for the window the provider itself reported.
+            if route.provider.kind.is_subscription() {
+                bench_exhausted_seat(route, breaker, response.headers(), status);
+
+                // A seat whose credential was revoked or expired
+                // out-of-band answers 401. Renewing it in place and
+                // retrying is the difference between a transient blip and
+                // a seat that stays broken until someone notices: the
+                // proactive path only fires near a *known* expiry, and an
+                // out-of-band revocation has no expiry to be near.
+                if status.as_u16() == 401
+                    && !is_last_candidate
+                    && let Some(key) = key
+                    && let Some(seat) = key.seat()
+                    && let Some(path) = key.source_path.as_deref()
+                    && refresh::refresh_now(
+                        &state.upstream,
+                        &state.refreshes,
+                        route.provider.kind,
+                        seat,
+                        &refresh::Persist::File(path.to_owned()),
+                        now_epoch_ms(),
+                    )
+                    .await
+                {
+                    metrics::counter!(
+                        "caret_seat_refresh_total",
+                        "provider" => route.provider.name.clone(),
+                    )
+                    .increment(1);
+                    return AttemptOutcome::Retry(
+                        GatewayError::new(
+                            ErrorClass::UpstreamError,
+                            format!(
+                                "seat credential of provider `{}` was renewed; retrying",
+                                route.provider.name
+                            ),
+                        )
+                        .with_provider(&route.provider.name),
+                    );
+                }
+            }
+
             if retryable && !is_last_candidate {
                 metrics::counter!("caret_retries_total", "provider" => route.provider.name.clone())
                     .increment(1);
@@ -587,6 +679,91 @@ async fn attempt(
             served
         }
     }
+}
+
+/// Bench a subscription key for as long as the provider says, and record
+/// what it told us about its remaining quota.
+///
+/// Only a `429` benches. The quota gauges are published on every response,
+/// which is the point of doing this here: both providers report their
+/// windows on *success* too, so an operator watches a pool approach the
+/// edge instead of discovering it when traffic starts failing.
+///
+/// Header-only, deliberately. Both backends carry the reset window in a
+/// header on the response that refuses the request — Anthropic in
+/// `retry-after` (3311s on an exhausted 5h window) and Codex in
+/// `x-codex-primary-reset-after-seconds` (380613s on an exhausted weekly
+/// one), both verified live. Buffering an upstream body on the hot path to
+/// learn the same number would cost every request to save a parse on the
+/// rare one. [`quota::retry_after_body`] covers the nested-in-`error`
+/// spelling for the paths that have the body in hand already.
+fn bench_exhausted_seat(
+    route: &ResolvedRoute,
+    breaker: &Breaker,
+    headers: &HeaderMap,
+    status: http::StatusCode,
+) {
+    let header = |name: &str| {
+        headers
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_owned)
+    };
+    let now_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+
+    let quota = match route.provider.kind {
+        ProviderKind::ClaudeSubscription => quota::anthropic_quota(header, now_epoch),
+        _ => quota::codex_quota(header),
+    };
+    if let Some(peak) = quota.peak_utilization() {
+        metrics::gauge!(
+            "caret_seat_quota_utilization",
+            "provider" => route.provider.name.clone(),
+        )
+        .set(peak);
+    }
+
+    if status.as_u16() != 429 {
+        return;
+    }
+
+    // `retry-after` when the provider sends one; otherwise the window the
+    // rejecting quota view reported.
+    let window = header("retry-after")
+        .and_then(|v| quota::retry_after_header(&v))
+        .or_else(|| {
+            quota
+                .primary
+                .filter(|w| w.rejected)
+                .and_then(|w| w.resets_in)
+                .or_else(|| {
+                    quota
+                        .secondary
+                        .filter(|w| w.rejected)
+                        .and_then(|w| w.resets_in)
+                })
+        });
+
+    let Some(window) = window else {
+        // No window reported: leave the key to the breaker's own cooldown
+        // rather than inventing a bench length.
+        return;
+    };
+    let benched = quota::bench_for(window, fastrand::f64());
+    breaker.bench_until(clock::now_ms() + benched.as_millis() as u64);
+    metrics::gauge!(
+        "caret_seat_bench_seconds",
+        "provider" => route.provider.name.clone(),
+    )
+    .set(benched.as_secs_f64());
+    tracing::warn!(
+        provider = %route.provider.name,
+        seconds = benched.as_secs(),
+        "subscription seat out of quota; benched until the provider's window rolls",
+    );
 }
 
 /// Cross-dialect response handling: translate sync bodies whole, wrap
@@ -868,13 +1045,60 @@ fn build_upstream_request(
             Ok(v)
         };
 
-        if route.provider.azure.is_some() {
-            builder = builder.header("api-key", sensitive(key.secret.expose().to_owned())?);
+        // Read the credential ONCE per request. A subscription seat may be
+        // renewed underneath us, and a request that signed its first byte
+        // with one token must not finish with another.
+        let token = key.token();
+        if route.provider.kind == ProviderKind::ClaudeSubscription {
+            // The subscription token is a bearer, not an `x-api-key`, and
+            // is only admitted as an inference credential with the OAuth
+            // beta flag. The caller's own betas ride along.
+            let mut betas = vec![router_providers::subscription::CLAUDE_OAUTH_BETA.to_owned()];
+            if let Some(requested) = inbound.get("anthropic-beta").and_then(|v| v.to_str().ok()) {
+                betas.extend(
+                    requested
+                        .split(',')
+                        .map(str::trim)
+                        .filter(|b| {
+                            !b.is_empty() && *b != router_providers::subscription::CLAUDE_OAUTH_BETA
+                        })
+                        .map(str::to_owned),
+                );
+            }
+            builder = builder
+                .header(
+                    header::AUTHORIZATION,
+                    sensitive(format!("Bearer {}", token.expose()))?,
+                )
+                .header("anthropic-version", router_providers::ANTHROPIC_VERSION)
+                .header("anthropic-beta", betas.join(","));
+        } else if route.provider.kind == ProviderKind::CodexSubscription {
+            let seat = key.seat().map(|s| s.current());
+            let account_id = seat
+                .as_ref()
+                .and_then(|s| s.account_id.as_deref())
+                .unwrap_or_default();
+            let settings = route.provider.codex.clone().unwrap_or_default();
+            let session_id = uuid::Uuid::now_v7().simple().to_string();
+            for (name, value) in router_providers::subscription::codex_headers(
+                token.expose(),
+                account_id,
+                &settings.version,
+                &session_id,
+            ) {
+                // Content-type is already set above; the rest are the CLI's.
+                if name == "content-type" {
+                    continue;
+                }
+                builder = builder.header(name, sensitive(value)?);
+            }
+        } else if route.provider.azure.is_some() {
+            builder = builder.header("api-key", sensitive(token.expose().to_owned())?);
         } else if route.provider.vertex.is_some() {
             // OAuth access token (or express-mode key) as a bearer.
             builder = builder.header(
                 header::AUTHORIZATION,
-                sensitive(format!("Bearer {}", key.secret.expose()))?,
+                sensitive(format!("Bearer {}", token.expose()))?,
             );
         } else if let Some(bedrock) = &route.provider.bedrock {
             // SigV4: the signature covers host, date, and the payload hash.
@@ -889,7 +1113,7 @@ fn build_upstream_request(
             let signature =
                 router_providers::sigv4::sign(&router_providers::sigv4::SigningParams {
                     access_key_id: &bedrock.access_key_id,
-                    secret_access_key: key.secret.expose(),
+                    secret_access_key: token.expose(),
                     region: &bedrock.region,
                     service: "bedrock",
                     amz_date: &amz_date,
@@ -909,12 +1133,12 @@ fn build_upstream_request(
                 Dialect::OpenAi => {
                     builder = builder.header(
                         header::AUTHORIZATION,
-                        sensitive(format!("Bearer {}", key.secret.expose()))?,
+                        sensitive(format!("Bearer {}", token.expose()))?,
                     );
                 }
                 Dialect::Anthropic => {
                     builder = builder
-                        .header("x-api-key", sensitive(key.secret.expose().to_owned())?)
+                        .header("x-api-key", sensitive(token.expose().to_owned())?)
                         .header("anthropic-version", router_providers::ANTHROPIC_VERSION);
                     // Anthropic beta features requested by the client ride along.
                     if let Some(beta) = inbound.get("anthropic-beta") {
@@ -922,10 +1146,12 @@ fn build_upstream_request(
                     }
                 }
                 Dialect::Gemini => {
-                    builder = builder
-                        .header("x-goog-api-key", sensitive(key.secret.expose().to_owned())?);
+                    builder =
+                        builder.header("x-goog-api-key", sensitive(token.expose().to_owned())?);
                 }
-                Dialect::Bedrock => unreachable!("bedrock providers always carry settings"),
+                Dialect::Bedrock | Dialect::CodexResponses => {
+                    unreachable!("handled above by provider kind")
+                }
             }
         }
     }
@@ -1062,7 +1288,11 @@ async fn run_relay(
                 stream: false,
                 emulated: false,
             };
-            match attempt(state, route, request, breaker, permit, &plan, is_last, ctx).await {
+            match attempt(
+                state, route, request, breaker, choice.key, permit, &plan, is_last, ctx,
+            )
+            .await
+            {
                 AttemptOutcome::Serve(mut response) => {
                     finalize(&mut response, route, attempts, started);
                     return Ok(response);
@@ -1330,15 +1560,16 @@ async fn run_stream_relay(
     if provider.auth == AuthMode::Key
         && let Some(key) = choice.key
     {
+        let token = key.token();
         let mut auth = if provider.azure.is_some() {
-            HeaderValue::from_str(key.secret.expose()).map_err(|_| {
+            HeaderValue::from_str(token.expose()).map_err(|_| {
                 GatewayError::new(
                     ErrorClass::UpstreamError,
                     "provider key is not a valid header",
                 )
             })?
         } else {
-            HeaderValue::from_str(&format!("Bearer {}", key.secret.expose())).map_err(|_| {
+            HeaderValue::from_str(&format!("Bearer {}", token.expose())).map_err(|_| {
                 GatewayError::new(
                     ErrorClass::UpstreamError,
                     "provider key is not a valid header",
@@ -1641,8 +1872,14 @@ async fn run_responses(
                     internal.insert(parsed.internal)
                 }
             };
-            let built =
-                router_providers::build_outbound(out_dialect, req, &route.upstream_model, stream)?;
+            let built = router_providers::build_outbound(
+                out_dialect,
+                req,
+                &route.upstream_model,
+                stream,
+                route.provider.codex.as_ref(),
+                route.provider.kind == ProviderKind::ClaudeSubscription,
+            )?;
             (built.body, built.path, built.json_schema_emulated)
         };
 
@@ -1666,6 +1903,27 @@ async fn run_responses(
             };
             attempts += 1;
             let breaker = route.provider.breaker_for(choice.key);
+            // Renew a subscription seat that is about to expire, before
+            // its token is put on a request. Doing it here rather than on
+            // the 401 that would follow keeps the failure off the caller's
+            // path; a seat that cannot renew simply carries on and is
+            // handled reactively.
+            if route.provider.kind.is_subscription()
+                && let Some(key) = choice.key
+            {
+                refresh::refresh_if_stale(
+                    &state.upstream,
+                    &state.refreshes,
+                    route.provider.kind,
+                    key,
+                    &key.source_path
+                        .as_deref()
+                        .map(|p| refresh::Persist::File(p.to_owned()))
+                        .unwrap_or(refresh::Persist::None),
+                    now_epoch_ms(),
+                )
+                .await;
+            }
             let request = build_upstream_request(
                 route,
                 out_dialect,
@@ -1686,6 +1944,7 @@ async fn run_responses(
                 route,
                 request,
                 breaker,
+                choice.key,
                 permit,
                 &plan,
                 is_last_candidate,
@@ -1860,8 +2119,9 @@ async fn run_passthrough(
             v.set_sensitive(true);
             v
         };
+        let relay_token = key.token();
         if provider.azure.is_some() {
-            builder = builder.header("api-key", sensitive(key.secret.expose().to_owned()));
+            builder = builder.header("api-key", sensitive(relay_token.expose().to_owned()));
         } else if let Some(bedrock) = &provider.bedrock {
             let uri: http::Uri = url.parse().map_err(|_| {
                 GatewayError::new(ErrorClass::InvalidRequest, "invalid passthrough path")
@@ -1875,7 +2135,7 @@ async fn run_passthrough(
             let signature =
                 router_providers::sigv4::sign(&router_providers::sigv4::SigningParams {
                     access_key_id: &bedrock.access_key_id,
-                    secret_access_key: key.secret.expose(),
+                    secret_access_key: relay_token.expose(),
                     region: &bedrock.region,
                     service: "bedrock",
                     amz_date: &amz_date,
@@ -1894,17 +2154,17 @@ async fn run_passthrough(
             match provider.kind {
                 router_core::config::ProviderKind::Anthropic => {
                     builder = builder
-                        .header("x-api-key", sensitive(key.secret.expose().to_owned()))
+                        .header("x-api-key", sensitive(relay_token.expose().to_owned()))
                         .header("anthropic-version", router_providers::ANTHROPIC_VERSION);
                 }
                 router_core::config::ProviderKind::Gemini => {
-                    builder =
-                        builder.header("x-goog-api-key", sensitive(key.secret.expose().to_owned()));
+                    builder = builder
+                        .header("x-goog-api-key", sensitive(relay_token.expose().to_owned()));
                 }
                 _ => {
                     builder = builder.header(
                         header::AUTHORIZATION,
-                        sensitive(format!("Bearer {}", key.secret.expose())),
+                        sensitive(format!("Bearer {}", relay_token.expose())),
                     );
                 }
             }
@@ -1933,4 +2193,15 @@ async fn run_passthrough(
         response.headers_mut().insert("x-caret-provider", v);
     }
     Ok(response)
+}
+
+/// Wall-clock milliseconds, for comparing against a credential's expiry.
+///
+/// Distinct from `clock::now_ms`, which is a monotonic process epoch: a
+/// token's `exp` is a real date and cannot be compared against uptime.
+fn now_epoch_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
