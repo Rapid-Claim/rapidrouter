@@ -7,20 +7,29 @@ async function signIn(page: import("@playwright/test").Page) {
     await page.getByLabel("Admin key").fill("admin-e2e-key");
     await page.getByRole("button", { name: "Sign in" }).click();
   }
-  await expect(page.getByRole("heading", { name: "Overview" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Usage", exact: true, level: 1 })).toBeVisible();
 }
 
 test.beforeEach(async ({ page }) => {
   await signIn(page);
 });
 
-const PAGES = ["overview", "providers", "routing", "keys", "usage", "requests", "playground", "fleet", "settings"] as const;
+const PAGES = ["usage", "activity", "logs", "keys", "providers", "models", "routing", "playground", "cluster", "settings"] as const;
 
-test("all eight operator pages are reachable", async ({ page }) => {
-  for (const name of ["Providers", "Routing", "Keys", "Usage", "Requests", "Playground", "Fleet", "Overview"]) {
+test("every operator page is reachable from the rail", async ({ page }) => {
+  for (const name of [
+    "Model activity", "Logs", "Virtual keys", "Providers", "Models", "Routing", "Playground", "Cluster", "Usage",
+  ]) {
     await page.getByRole("link", { name, exact: true }).click();
-    await expect(page.getByRole("heading", { name, exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name, exact: true, level: 1 })).toBeVisible();
   }
+});
+
+test("there is no overview page any more", async ({ page }) => {
+  await expect(page.getByRole("link", { name: "Overview", exact: true })).toHaveCount(0);
+  // An old bookmark must land somewhere real rather than a blank frame.
+  await page.goto("/console#overview");
+  await expect(page.getByRole("heading", { name: "Usage", exact: true, level: 1 })).toBeVisible();
 });
 
 test("settings lives in the nav footer and exports the config", async ({ page }) => {
@@ -36,21 +45,21 @@ test("settings lives in the nav footer and exports the config", async ({ page })
 test("keyboard shortcuts jump between pages and focus the filter", async ({ page }) => {
   await page.locator("body").press("g");
   await page.locator("body").press("k");
-  await expect(page.getByRole("heading", { name: "Keys", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Virtual keys", exact: true, level: 1 })).toBeVisible();
   await page.locator("body").press("g");
-  await page.locator("body").press("q");
-  await expect(page.getByRole("heading", { name: "Requests", exact: true })).toBeVisible();
+  await page.locator("body").press("l");
+  await expect(page.getByRole("heading", { name: "Logs", exact: true, level: 1 })).toBeVisible();
   await page.locator("body").press("/");
   await expect(page.locator("[data-filter]")).toBeFocused();
   // A shortcut key typed into a field must reach the field, not navigate.
   await page.keyboard.type("g");
   await expect(page.locator("[data-filter]")).toHaveValue("g");
-  await expect(page.getByRole("heading", { name: "Requests", exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Logs", exact: true, level: 1 })).toBeVisible();
 });
 
 test("creates and reveals a virtual key", async ({ page }) => {
   const name = `browser-${Date.now()}`;
-  await page.getByRole("link", { name: "Keys" }).click();
+  await page.getByRole("link", { name: "Virtual keys" }).click();
   await page.getByRole("button", { name: "Create key" }).click();
   await page.getByLabel("Name").fill(name);
   await page.getByLabel("Allowed models Optional").fill("ollama/llama3");

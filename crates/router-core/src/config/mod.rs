@@ -228,6 +228,9 @@ pub struct ApiKey {
     pub secret: SecretString,
     pub weight: f64,
     pub models: Option<Vec<String>>,
+    /// This key's own request/token ceilings; see [`raw::RawKey`].
+    pub rpm: Option<u64>,
+    pub tpm: Option<u64>,
     /// Where this credential was read from, when it came from a file.
     ///
     /// Retained only for `file:` references — a subscription seat whose

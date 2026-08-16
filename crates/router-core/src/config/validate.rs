@@ -474,12 +474,22 @@ fn validate_provider(
         if !(rk.weight.is_finite() && rk.weight > 0.0) {
             errors.push(ConfigError::new(format!("{kpath}.weight"), "must be > 0"));
         }
+        for (field, limit) in [("rpm", rk.rpm), ("tpm", rk.tpm)] {
+            if limit == Some(0) {
+                errors.push(ConfigError::new(
+                    format!("{kpath}.{field}"),
+                    "must be > 0 — omit the field to leave this key unlimited",
+                ));
+            }
+        }
         match resolve_secret(&rk.value, env) {
             Ok(secret) => keys.push(ApiKey {
                 name: rk.name.clone(),
                 secret,
                 weight: rk.weight,
                 models: rk.models.clone(),
+                rpm: rk.rpm,
+                tpm: rk.tpm,
                 source_path: rk
                     .value
                     .strip_prefix("file:")

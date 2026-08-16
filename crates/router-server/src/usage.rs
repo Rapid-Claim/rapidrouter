@@ -404,6 +404,9 @@ impl Aggregator {
 const RECENT_CAP: usize = 1000;
 
 pub struct UsagePipeline {
+    /// Where the flusher writes, so history can be read back. `None` when
+    /// there is no data dir and aggregation is in-memory only.
+    data_dir: Option<PathBuf>,
     tx: Mutex<Option<mpsc::SyncSender<UsageRecord>>>,
     pub agg: Aggregator,
     recent: Mutex<VecDeque<UsageRecord>>,
@@ -417,6 +420,7 @@ impl UsagePipeline {
     /// batches to disk and prunes retention; without one (pure env/file
     /// setups), aggregation is in-memory only.
     pub fn start(data_dir: Option<PathBuf>, cfg: &UsageConfig, node_id: &str) -> Arc<Self> {
+        let history_dir = data_dir.clone();
         let tx = data_dir.map(|dir| {
             let (tx, rx) = mpsc::sync_channel::<UsageRecord>(8192);
             let flush_interval = cfg.flush_interval;
@@ -429,6 +433,7 @@ impl UsagePipeline {
             tx
         });
         Arc::new(Self {
+            data_dir: history_dir,
             tx: Mutex::new(tx),
             agg: Aggregator::new(),
             recent: Mutex::new(VecDeque::with_capacity(RECENT_CAP)),
@@ -532,6 +537,8 @@ pub struct UsageHook {
     pub started: std::time::Instant,
     pub overhead_us: u64,
     pub tag: Option<String>,
+    /// The credential that served this request, when one did.
+    pub seat: Option<crate::proxy::SeatUsed>,
 }
 
 impl UsageHook {
@@ -548,6 +555,13 @@ impl UsageHook {
                 router_core::clock::now_ms(),
                 ordinal,
             );
+        }
+        // Tokens are post-paid: the ceiling is only enforceable once the
+        // response says what it actually cost.
+        if let Some(seat) = &self.seat
+            && let Some(key) = seat.provider.keys.iter().find(|k| k.name == seat.key)
+        {
+            key.debit_tokens(usage.billable(), router_core::clock::now_ms());
         }
         let rec = UsageRecord {
             ts: now_unix,
@@ -753,6 +767,96 @@ fn flusher(
             last_prune = std::time::Instant::now();
             prune(&dir, retention_days);
         }
+    }
+}
+
+/// One day's totals, optionally split by a dimension.
+#[derive(Debug, Serialize, Default)]
+pub struct DayBucket {
+    pub day: String,
+    pub requests: u64,
+    pub failed: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micro_usd: u64,
+}
+
+impl UsagePipeline {
+    /// Daily totals over the last `days`, grouped by `by`
+    /// (`provider` | `model` | `key` | `""` for the total).
+    ///
+    /// Read from the flushed files rather than the in-memory aggregate,
+    /// which only spans 24 hours — a spend chart that cannot see past
+    /// yesterday is not a spend chart. Records still in the current batch
+    /// have not been flushed yet, so today's figures firm up within a
+    /// flush interval; the alternative is holding a second copy of every
+    /// record in memory to make the last few seconds exact.
+    pub fn history(&self, days: u32, by: &str) -> BTreeMap<String, Vec<DayBucket>> {
+        let mut out: BTreeMap<String, BTreeMap<String, DayBucket>> = BTreeMap::new();
+        let Some(dir) = self.data_dir.as_ref().map(|d| d.join("usage")) else {
+            return BTreeMap::new();
+        };
+        let cutoff =
+            day_partition(vkey::unix_now_ms().saturating_sub(days.max(1) as u64 * 86_400_000));
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            return BTreeMap::new();
+        };
+        let mut days_found: Vec<_> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().into_owned();
+                // Lexicographic compare works for `dt=YYYY-MM-DD`.
+                (name.starts_with("dt=") && name.as_str() >= cutoff.as_str())
+                    .then(|| (name, e.path()))
+            })
+            .collect();
+        days_found.sort();
+
+        for (partition, path) in days_found {
+            let day = partition.trim_start_matches("dt=").to_owned();
+            let Ok(files) = std::fs::read_dir(&path) else {
+                continue;
+            };
+            for file in files.flatten() {
+                let Ok(handle) = std::fs::File::open(file.path()) else {
+                    continue;
+                };
+                let Ok(decoder) = zstd::Decoder::new(handle) else {
+                    continue;
+                };
+                for line in
+                    std::io::BufRead::lines(std::io::BufReader::new(decoder)).map_while(Result::ok)
+                {
+                    let Ok(rec) = serde_json::from_str::<UsageRecord>(&line) else {
+                        continue;
+                    };
+                    let series = match by {
+                        "provider" => rec.provider.clone(),
+                        "model" => rec.model.clone(),
+                        "key" => rec.vkey.clone().unwrap_or_else(|| "(none)".into()),
+                        _ => "total".to_owned(),
+                    };
+                    let bucket = out
+                        .entry(series)
+                        .or_default()
+                        .entry(day.clone())
+                        .or_insert_with(|| DayBucket {
+                            day: day.clone(),
+                            ..Default::default()
+                        });
+                    bucket.requests += 1;
+                    if rec.status >= 400 {
+                        bucket.failed += 1;
+                    }
+                    bucket.input_tokens += rec.input_tokens;
+                    bucket.output_tokens += rec.output_tokens;
+                    bucket.cost_micro_usd += rec.cost_micro_usd;
+                }
+            }
+        }
+        out.into_iter()
+            .map(|(series, days)| (series, days.into_values().collect()))
+            .collect()
     }
 }
 

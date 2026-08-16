@@ -1,76 +1,103 @@
-/* The design system: one small set of custom properties drives every
-   surface. Light and dark are token swaps — `prefers-color-scheme` by
-   default, overridable per-operator via `data-theme` on the root. */
+/* The design system, ported from the Caret desktop app
+   (`caret/web/src/styles/theme.css`, which itself mirrors
+   `CaretDesktop/Caret/Theme.swift`). The two products sit next to each
+   other on the same machine and should read as one, so the values here
+   are copied rather than re-derived — any drift is visible.
+
+   shadcn's **stone** neutral with an **orange** primary: Tailwind's stone
+   ramp end to end, no blue anywhere. The warmth is the point. A neutral
+   grey UI with a cool accent reads as generic tooling, and every surface
+   this gateway shows — provider names, token counts, spend — is warm.
+
+   Dark only, as Caret is. `color-scheme: dark` is declared rather than
+   implied: undeclared, CSS `light-dark()` and native form controls,
+   scrollbars and caret colour all take the light branch. */
 :root {
-  color-scheme: light dark;
-  --bg: #f6f7f6;
-  --surface: #ffffff;
-  --surface-2: #eef1ef;
-  --border: #dfe4e1;
-  --border-strong: #b9c2bd;
-  --text: #17201c;
-  --muted: #5b6560;
-  --accent: #1c6a52;
-  --accent-hover: #14523f;
-  --accent-ink: #ffffff;
-  --accent-soft: #e4f2ed;
-  --danger: #a32c37;
-  --danger-soft: #fae8e9;
-  --warning: #7a5010;
-  --focus: #15599f;
-  --radius-control: 5px;
-  --radius-panel: 7px;
-  --sidebar: #18231e;
-  --sidebar-text: #d9e2dd;
-  --sidebar-muted: #b6c3bc;
-}
-
-/* Dark tokens live once and are applied by either signal. */
-@media (prefers-color-scheme: dark) {
-  :root:not([data-theme="light"]) {
-    --bg: #111714;
-    --surface: #17201c;
-    --surface-2: #202b26;
-    --border: #2d3933;
-    --border-strong: #4b5a52;
-    --text: #edf2ef;
-    --muted: #a8b3ad;
-    --accent: #6cc9a6;
-    --accent-hover: #8ad9bc;
-    --accent-ink: #0d1a15;
-    --accent-soft: #1d3a30;
-    --danger: #f4949b;
-    --danger-soft: #3d2226;
-    --warning: #e0b872;
-    --focus: #7fb6ef;
-    --sidebar: #0b100e;
-    --sidebar-text: #cbd5d0;
-    --sidebar-muted: #9fada6;
-  }
-}
-
-:root[data-theme="dark"] {
   color-scheme: dark;
-  --bg: #111714;
-  --surface: #17201c;
-  --surface-2: #202b26;
-  --border: #2d3933;
-  --border-strong: #4b5a52;
-  --text: #edf2ef;
-  --muted: #a8b3ad;
-  --accent: #6cc9a6;
-  --accent-hover: #8ad9bc;
-  --accent-ink: #0d1a15;
-  --accent-soft: #1d3a30;
-  --danger: #f4949b;
-  --danger-soft: #3d2226;
-  --warning: #e0b872;
-  --focus: #7fb6ef;
-  --sidebar: #0b100e;
-  --sidebar-text: #cbd5d0;
-  --sidebar-muted: #9fada6;
+
+  /* One surface, not three. Layered near-blacks turn a single quiet
+     field into competing ones and the seams become the loudest thing on
+     screen; the borders are what say where you are. */
+  --bg: #0c0a09;              /* stone-950 */
+  --surface: #1c1917;         /* stone-900 — cards, panels, the rail */
+  --surface-2: #292524;       /* stone-800 — hover fills, inset wells */
+  --panel: #131110;
+
+  /* Neutral alpha rules, so a border sits on any surface without tinting
+     it. Two weights, not three: a brighter structural seam draws the eye
+     to the one place nothing is happening. */
+  --border: #ffffff24;        /* 14% — controls, inputs, seams */
+  --border-soft: #ffffff14;   /*  8% — row separators, card interiors */
+  --border-strong: #ffffff26; /* 15% — input outlines */
+
+  --text: #fafaf9;            /* stone-50 */
+  --title: #d6d3d1;           /* stone-300 — headings and active rows */
+  --muted: #a6a09b;           /* stone-400 */
+  --faint: #79716b;           /* stone-500 */
+
+  /* Orange, not indigo. `accent` is the interactive hue — text, icons,
+     the active-row mark. 6.8:1 on the background. */
+  --accent: #ff6900;          /* orange-500 */
+  --accent-hover: #ff8534;
+  --accent-fill: #ff6900;
+  --accent-fill-hover: #ff8534;
+  --accent-ink: #0c0a09;
+
+  /* `primary` is the deeper rest state for *filled* controls, and this is
+     the distinction that matters: white on `accent` is 2.89:1, which the
+     desktop app spends on exactly one hero button. A console full of
+     filled buttons cannot, so filled controls take `primary` with
+     `primary-foreground` — 6.9:1, and Caret's own token for the job. */
+  --btn-bg: #9f2d00;          /* orange-800 */
+  --btn-bg-hover: #b83403;
+  --btn-ink: #fff7ed;
+
+  --accent-soft: #2a1206;
+  --accent-line: #7a3a10;
+
+  --danger: #ff6467;
+  --danger-soft: #2e1616;
+  --warning: #ffb86a;
+  --warning-soft: #2a2011;
+  --success: #3fb950;
+  --success-soft: #10261a;
+  --focus: #79716b;           /* --color-ring */
+
+  /* Charts. Orange leads; the rest are Caret's git/review hues, which
+     users already read as distinct. */
+  --series-1: #ff6900;
+  --series-2: #3fb950;
+  --series-3: #58a6ff;
+  --series-4: #ffb86a;
+  --series-5: #a371f7;
+  --series-6: #ff6467;
+  --grid: #ffffff14;
+
+  /* 0.45rem, matching the desktop app — tighter than the 8px this
+     console used before. */
+  --radius-control: 0.45rem;
+  --radius-small: 5px;
+  --radius-panel: 0.45rem;
+  --shadow-panel: none;
+  --shadow-pop: 0 12px 32px rgb(0 0 0 / 55%);
+
+  /* The rail is the same stone-900 card fill as every other panel: it is
+     one surface, distinguished by its border, not by a second colour. */
+  --sidebar: #1c1917;
+  --sidebar-2: #ffffff10;
+  --sidebar-text: #fafaf9;
+  --sidebar-muted: #a6a09b;
+  --sidebar-border: #ffffff1a;
+
+  --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
 }
 
+/* Both theme hooks resolve to the same palette: the desktop app has no
+   light mode, and a console that flipped to white beside it would break
+   the pairing this file exists to keep. Kept as selectors so a light
+   variant is one block away if it is ever wanted. */
+:root[data-theme="dark"],
 :root[data-theme="light"] {
-  color-scheme: light;
+  color-scheme: dark;
 }

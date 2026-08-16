@@ -66,7 +66,7 @@ impl S3Store {
     }
 }
 
-/// `""` and `"caret"` and `"caret/"` should all mean the same place.
+/// `""` and `"rapid"` and `"caret/"` should all mean the same place.
 fn normalize_prefix(raw: &str) -> String {
     let trimmed = raw.trim_matches('/');
     if trimmed.is_empty() {

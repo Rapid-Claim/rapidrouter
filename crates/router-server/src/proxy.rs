@@ -64,6 +64,19 @@ fn vk_gate(vk: &VkRuntime, requested: &str, plan: &RoutePlan) -> Result<(), Gate
     }
 }
 
+/// Which credential served a request, carried from the attempt to the
+/// meter as a response *extension* rather than a header.
+///
+/// It has to travel with the response because the token cost is only
+/// known once the body is done — but it must not travel to the client: a
+/// key name is operator-facing, and naming the credential that served you
+/// in a response header hands every caller a map of the pool.
+#[derive(Clone)]
+pub struct SeatUsed {
+    pub provider: Arc<router_core::router::ProviderRuntime>,
+    pub key: String,
+}
+
 fn meter(response: Response, mut hook: UsageHook, dialect: Dialect, stream: bool) -> Response {
     hook.provider = response
         .headers()
@@ -90,6 +103,7 @@ fn meter(response: Response, mut hook: UsageHook, dialect: Dialect, stream: bool
         .and_then(|v| v.parse().ok())
         .unwrap_or_default();
     hook.stream = stream;
+    hook.seat = response.extensions().get::<SeatUsed>().cloned();
     usage::meter_response(response, hook, dialect)
 }
 
@@ -142,6 +156,7 @@ fn build_hook(
             .get("x-caret-tag")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
+        seat: None,
     }
 }
 
@@ -535,7 +550,7 @@ async fn run_chat(
             .await
             {
                 AttemptOutcome::Serve(mut response) => {
-                    finalize(&mut response, route, attempts, started);
+                    finalize(&mut response, route, choice.key, attempts, started);
                     if emulated {
                         response
                             .headers_mut()
@@ -612,7 +627,7 @@ async fn attempt(
             // retry attempt and earns another 429, so the seat is benched
             // for the window the provider itself reported.
             if route.provider.kind.is_subscription() {
-                bench_exhausted_seat(route, breaker, response.headers(), status);
+                bench_exhausted_seat(route, breaker, key, response.headers(), status);
 
                 // A seat whose credential was revoked or expired
                 // out-of-band answers 401. Renewing it in place and
@@ -700,6 +715,7 @@ async fn attempt(
 fn bench_exhausted_seat(
     route: &ResolvedRoute,
     breaker: &Breaker,
+    key: Option<&router_core::router::KeyRuntime>,
     headers: &HeaderMap,
     status: http::StatusCode,
 ) {
@@ -718,6 +734,12 @@ fn bench_exhausted_seat(
         ProviderKind::ClaudeSubscription => quota::anthropic_quota(header, now_epoch),
         _ => quota::codex_quota(header),
     };
+    // Recorded on every subscription response, not only refusals: the
+    // number an operator needs is how close a seat is to its ceiling, and
+    // that is only visible while it is still serving.
+    if let Some(key) = key {
+        key.observe_quota(quota, clock::now_ms());
+    }
     if let Some(peak) = quota.peak_utilization() {
         metrics::gauge!(
             "caret_seat_quota_utilization",
@@ -946,7 +968,21 @@ fn extract_upstream_error(body: &[u8]) -> Option<String> {
     None
 }
 
-fn finalize(response: &mut Response, route: &ResolvedRoute, attempts: u32, started: Instant) {
+fn finalize(
+    response: &mut Response,
+    route: &ResolvedRoute,
+    key: Option<&router_core::router::KeyRuntime>,
+    attempts: u32,
+    started: Instant,
+) {
+    // Which credential served, for the token-limit debit once the body is
+    // done. An extension, not a header — see [`SeatUsed`].
+    if let Some(key) = key {
+        response.extensions_mut().insert(SeatUsed {
+            provider: route.provider.clone(),
+            key: key.name.clone(),
+        });
+    }
     // Gateway-added time: total elapsed minus the upstream wait of the
     // serving attempt. (Earlier failed attempts' upstream waits count
     // against us — retries are our choice.)
@@ -1294,7 +1330,7 @@ async fn run_relay(
             .await
             {
                 AttemptOutcome::Serve(mut response) => {
-                    finalize(&mut response, route, attempts, started);
+                    finalize(&mut response, route, choice.key, attempts, started);
                     return Ok(response);
                 }
                 AttemptOutcome::Retry(err) => last_error = Some(err),
@@ -1953,7 +1989,7 @@ async fn run_responses(
             .await
             {
                 AttemptOutcome::Serve(mut response) => {
-                    finalize(&mut response, route, attempts, started);
+                    finalize(&mut response, route, choice.key, attempts, started);
                     if emulated {
                         response
                             .headers_mut()

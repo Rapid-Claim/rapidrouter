@@ -149,7 +149,7 @@ impl AppState {
     /// and pricing, and swap them atomically. In-flight requests keep the
     /// snapshots they resolved against.
     pub fn apply_config(&self, config: Config) {
-        let table = RoutingTable::from_config(&config);
+        let table = RoutingTable::from_config_with(&config, Some(&self.table.load()));
         let defs = self.collect_defs(&config);
         let prev = self.vkeys.load();
         self.vkeys.store(Arc::new(VkTable::build_with_shares(
