@@ -11,7 +11,7 @@ selection, breaker check, error mapping. CI fails on a >10 % regression
 against stored baselines.
 
 ### 2 · End-to-end overhead rig (`benches/e2e/`)
-caret-router in front of a **local mock provider** (canned responses in
+rapid-router in front of a **local mock provider** (canned responses in
 ~zero time), loaded by a fixed-RPS generator. Reported: added p50/p99/p999
 versus hitting the mock directly — that delta *is* the gateway overhead.
 Runs at 500 / 1 000 / 5 000 RPS on a pinned runner class; results published

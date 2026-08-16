@@ -247,6 +247,15 @@ pub struct RawKey {
     /// Restrict this key to specific models; omitted = all models.
     #[serde(default)]
     pub models: Option<Vec<String>>,
+    /// This key's own ceiling, independent of any virtual key's.
+    ///
+    /// Provider accounts are rate limited per credential, so the limit
+    /// belongs on the credential: one key hitting its ceiling should move
+    /// traffic to the next key, not fail the request.
+    #[serde(default)]
+    pub rpm: Option<u64>,
+    #[serde(default)]
+    pub tpm: Option<u64>,
 }
 
 fn default_weight() -> f64 {

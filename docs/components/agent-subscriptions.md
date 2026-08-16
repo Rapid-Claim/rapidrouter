@@ -13,7 +13,7 @@ cheaper, and a pool of seats behaves like one large rate-limited provider.
 
 This design is drawn from two places: **AGI Gateway**
 (`rapid-mono/services/agi-gateway`), a Python gateway that has run exactly
-this in production against ~70 seats; and caret-router's own router, which
+this in production against ~70 seats; and rapid-router's own router, which
 already owns most of the machinery AGI Gateway had to invent.
 
 ---
@@ -280,8 +280,8 @@ keys = [
 type = "codex_subscription"
 codex = { version = "0.146.0", reasoning_effort = "low", verbosity = "low" }
 keys = [
-  { name = "seat-1", value = "file:/etc/caret/codex/seat-1/auth.json" },
-  { name = "seat-2", value = "file:/etc/caret/codex/seat-2/auth.json" },
+  { name = "seat-1", value = "file:/etc/rapid/codex/seat-1/auth.json" },
+  { name = "seat-2", value = "file:/etc/rapid/codex/seat-2/auth.json" },
 ]
 
 [fallbacks]
@@ -318,7 +318,7 @@ build.
    Clamp to `[1 s, 24 h]` and apply 0–10% one-sided jitter. Both the nesting
    and the jitter are non-obvious and both were production incidents.
 4. **Fleet-safe secrets.** Seat credentials live in the store sealed under
-   `CARET_MASTER_KEY` like any other `store.*` secret, so any node can read
+   `RAPID_MASTER_KEY` like any other `store.*` secret, so any node can read
    what any node wrote. A refreshed token must be written through the store
    (CAS) rather than to node-local disk, or two nodes will fight over one
    `auth.json` and invalidate each other's refresh token.
@@ -343,7 +343,7 @@ build.
   `account_id` or an `id_token` carrying `chatgpt_account_id`).
 - **Headers**: the exact Codex CLI set from §1, with `version` configurable
   per provider — it is a compatibility gate that moves when OpenAI ships a
-  model family, and it must not require a caret-router release to bump.
+  model family, and it must not require a rapid-router release to bump.
 - **Body**: our existing Responses translation, plus `store: false`,
   `stream: true`, `instructions` from the system prompt, the flattened
   Responses tool shape (`{"type":"function","name",…}`, not the Chat
@@ -435,8 +435,8 @@ Stated up front because the failure mode is a surprised operator:
    amortized share of the subscription. The token counts are right; the
    dollars are not.
 5. **Console.** No seat view yet: quota utilization and bench state are
-   exported as metrics (`caret_seat_quota_utilization`,
-   `caret_seat_bench_seconds`) but not rendered anywhere.
+   exported as metrics (`rapid_seat_quota_utilization`,
+   `rapid_seat_bench_seconds`) but not rendered anywhere.
 
 ## 6 · Where the code is
 

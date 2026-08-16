@@ -2,7 +2,7 @@
 //! over an immutable routing snapshot.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use tokio::sync::Semaphore;
@@ -14,7 +14,9 @@ use crate::config::{
 };
 use crate::credential::{self, Credential, Seat};
 use crate::error::{ErrorClass, GatewayError};
+use crate::quota::Quota;
 use crate::secret::SecretString;
+use crate::token_bucket::TokenBucket;
 
 pub struct RoutingTable {
     providers: BTreeMap<String, Arc<ProviderRuntime>>,
@@ -58,6 +60,30 @@ pub struct KeyRuntime {
     /// Where a rotated credential is persisted; see
     /// [`crate::config::ApiKey::source_path`].
     pub source_path: Option<String>,
+    /// Per-key rate limits, enforced before the request leaves.
+    ///
+    /// A metered key's ceiling is the provider's published rate limit for
+    /// that account; a subscription seat's is its plan quota, which the
+    /// provider reports rather than us configuring. Both are per *key*,
+    /// not per provider: one exhausted key must not stop the pool.
+    pub rpm: Option<TokenBucket>,
+    pub tpm: Option<TokenBucket>,
+    /// The last quota view this key's provider reported, for the console.
+    ///
+    /// Observability only — benching is decided at the moment a response
+    /// arrives (see the proxy) and lives in `breaker`. This is the
+    /// snapshot an operator looks at to answer "how close to the edge is
+    /// this seat", which is otherwise invisible until traffic starts
+    /// failing.
+    quota: Mutex<Option<QuotaSnapshot>>,
+}
+
+/// A quota reading with the wall-clock time it was taken, so the console
+/// can say "as of 40 seconds ago" rather than implying it is live.
+#[derive(Debug, Clone, Copy)]
+pub struct QuotaSnapshot {
+    pub quota: Quota,
+    pub observed_ms: u64,
 }
 
 impl KeyRuntime {
@@ -66,6 +92,62 @@ impl KeyRuntime {
     /// Owned rather than borrowed: a seat may be renewed while the caller
     /// is still assembling the request, and a request must use one
     /// consistent token from first byte to last.
+    /// Record the provider's latest quota view for this key.
+    pub fn observe_quota(&self, quota: Quota, now_ms: u64) {
+        if quota.is_empty() {
+            return;
+        }
+        if let Ok(mut slot) = self.quota.lock() {
+            *slot = Some(QuotaSnapshot {
+                quota,
+                observed_ms: now_ms,
+            });
+        }
+    }
+
+    /// The latest quota view, if this key has ever served a request.
+    pub fn quota(&self) -> Option<QuotaSnapshot> {
+        self.quota.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Spend one request against this key's own ceiling. `false` means
+    /// the key is over its limit and selection should try the next one.
+    ///
+    /// Requests are pre-paid (one per request, known up front); tokens
+    /// are post-paid, because the true cost is not known until the
+    /// response. So the token limiter is only *checked* here — an
+    /// exhausted balance holds the key out until it refills — and
+    /// [`Self::debit_tokens`] settles it afterwards.
+    pub fn try_admit_request(&self, now_ms: u64) -> bool {
+        if let Some(tpm) = &self.tpm {
+            // A zero-token take is how the bucket is made to credit
+            // elapsed time without spending any of it.
+            tpm.try_consume(0, now_ms);
+            if tpm.available_tokens() == 0 {
+                return false;
+            }
+        }
+        match &self.rpm {
+            Some(rpm) => rpm.try_consume(1, now_ms),
+            None => true,
+        }
+    }
+
+    /// Settle the token limiter against what the request actually used.
+    pub fn debit_tokens(&self, tokens: u64, now_ms: u64) {
+        if let Some(tpm) = &self.tpm {
+            tpm.debit_saturating(tokens, now_ms);
+        }
+    }
+
+    /// Remaining allowance, for the console. `None` = unlimited.
+    pub fn rate_headroom(&self) -> (Option<u64>, Option<u64>) {
+        (
+            self.rpm.as_ref().map(TokenBucket::available_tokens),
+            self.tpm.as_ref().map(TokenBucket::available_tokens),
+        )
+    }
+
     pub fn token(&self) -> SecretString {
         self.credential.token()
     }
@@ -102,6 +184,18 @@ pub struct KeyChoice<'a> {
 
 impl RoutingTable {
     pub fn from_config(config: &Config) -> Self {
+        Self::from_config_with(config, None)
+    }
+
+    /// Rebuild, carrying per-key runtime state across the swap.
+    ///
+    /// A config reload must not hand every key a fresh rate-limit
+    /// allowance — that would make "edit the config" a way to bypass the
+    /// ceiling, and a config that reloads often would never enforce one.
+    /// The observed quota is carried for the same reason in reverse:
+    /// blanking it would make the console claim it knows nothing about a
+    /// seat that is, in fact, still exhausted.
+    pub fn from_config_with(config: &Config, prev: Option<&Self>) -> Self {
         let breaker_config = BreakerConfig {
             failure_threshold: config.reliability.breaker.failure_threshold,
             window_ms: config.reliability.breaker.window.as_millis() as u64,
@@ -121,6 +215,20 @@ impl RoutingTable {
                     weight: k.weight,
                     models: k.models.as_ref().map(|m| m.iter().cloned().collect()),
                     breaker: Breaker::new(breaker_config),
+                    // A minute's worth of capacity, refilled per second,
+                    // so a burst is allowed but a sustained overrun is
+                    // not — the same shape the virtual-key limiter uses.
+                    rpm: carry_bucket(
+                        previous_key(prev, name, &k.name).and_then(|p| p.rpm.as_ref()),
+                        k.rpm,
+                    ),
+                    tpm: carry_bucket(
+                        previous_key(prev, name, &k.name).and_then(|p| p.tpm.as_ref()),
+                        k.tpm,
+                    ),
+                    quota: Mutex::new(
+                        previous_key(prev, name, &k.name).and_then(KeyRuntime::quota),
+                    ),
                 })
                 .collect();
             for key in &keys {
@@ -242,6 +350,31 @@ impl RoutingTable {
     }
 }
 
+/// The same key in the outgoing snapshot, matched on provider and key
+/// name — the only identity a config edit preserves.
+fn previous_key<'a>(
+    prev: Option<&'a RoutingTable>,
+    provider: &str,
+    key: &str,
+) -> Option<&'a KeyRuntime> {
+    prev?
+        .providers
+        .get(provider)?
+        .keys
+        .iter()
+        .find(|k| k.name == key)
+}
+
+/// Keep the running balance when a limit is unchanged in kind; start
+/// fresh when one is newly added or its shape changed.
+fn carry_bucket(prev: Option<&TokenBucket>, limit: Option<u64>) -> Option<TokenBucket> {
+    match (prev, limit) {
+        (Some(bucket), Some(_)) => Some(bucket.clone_state()),
+        (_, Some(limit)) => Some(TokenBucket::new(limit, limit.div_ceil(60))),
+        (_, None) => None,
+    }
+}
+
 impl ProviderRuntime {
     /// Admit one attempt for `model`: weighted-random among healthy
     /// eligible keys; if none is healthy, offer the probe slot of an
@@ -274,12 +407,20 @@ impl ProviderRuntime {
             .copied()
             .filter(|k| k.breaker.looks_healthy())
             .collect();
-        if !healthy.is_empty() {
-            let picked = weighted_pick(&healthy);
-            return Some(KeyChoice {
-                key: Some(picked),
-                admission: Admission::Yes,
-            });
+        // Weighted pick among the healthy, skipping any key that is over
+        // its own rate ceiling. A rate-limited key is not *unhealthy* —
+        // its breaker is closed and it will serve again shortly — so it is
+        // stepped over rather than recorded as a failure.
+        let mut candidates = healthy;
+        while !candidates.is_empty() {
+            let picked = weighted_pick(&candidates);
+            if picked.try_admit_request(now_ms) {
+                return Some(KeyChoice {
+                    key: Some(picked),
+                    admission: Admission::Yes,
+                });
+            }
+            candidates.retain(|k| !std::ptr::eq(*k, picked));
         }
 
         for key in eligible {
@@ -402,6 +543,157 @@ fast = "groq/llama-3.3-70b"
 [fallbacks]
 "openai/gpt-4o" = ["groq/llama-3.3-70b"]
 "#;
+
+    fn config(toml: &str) -> Config {
+        Config::from_str_with_env(toml, Format::Toml, &|_: &str| None).unwrap()
+    }
+
+    const LIMITED: &str = r#"
+[providers.openai]
+keys = [
+  { name = "slow", value = "sk-a", rpm = 60 },
+  { name = "spare", value = "sk-b" },
+]
+"#;
+
+    #[test]
+    fn a_key_over_its_own_rpm_steps_aside_for_the_next() {
+        let t = table(LIMITED);
+        let p = t.providers.get("openai").unwrap();
+        // 60 rpm = a 60-token bucket refilling one per second. Drain it
+        // within the same millisecond so refill cannot mask the limit.
+        let slow = p.keys.iter().find(|k| k.name == "slow").unwrap();
+        for _ in 0..60 {
+            assert!(slow.try_admit_request(1_000));
+        }
+        assert!(
+            !slow.try_admit_request(1_000),
+            "the ceiling must actually bind"
+        );
+
+        // Selection still serves, because the other key is unlimited.
+        for _ in 0..20 {
+            let choice = p.admit_key("gpt-4o", 1_000).expect("a key is admitted");
+            assert_eq!(choice.key.unwrap().name, "spare");
+        }
+    }
+
+    #[test]
+    fn a_rate_limited_key_is_not_treated_as_unhealthy() {
+        let t = table(LIMITED);
+        let p = t.providers.get("openai").unwrap();
+        let slow = p.keys.iter().find(|k| k.name == "slow").unwrap();
+        for _ in 0..60 {
+            slow.try_admit_request(1_000);
+        }
+        // Being out of allowance is not a fault: nothing failed upstream,
+        // and the key must come back on its own without a probe.
+        assert!(slow.breaker.looks_healthy());
+        assert!(
+            slow.try_admit_request(61_000),
+            "a minute later the allowance has refilled"
+        );
+    }
+
+    #[test]
+    fn reloading_the_config_does_not_refill_a_spent_allowance() {
+        // Otherwise "edit the config" is a way around the ceiling, and a
+        // config that reloads often never enforces one at all.
+        let first = table(LIMITED);
+        let spent = first.providers.get("openai").unwrap();
+        let slow = spent.keys.iter().find(|k| k.name == "slow").unwrap();
+        for _ in 0..60 {
+            slow.try_admit_request(1_000);
+        }
+        assert!(!slow.try_admit_request(1_000));
+
+        let rebuilt = RoutingTable::from_config_with(&config(LIMITED), Some(&first));
+        let carried = rebuilt
+            .providers
+            .get("openai")
+            .unwrap()
+            .keys
+            .iter()
+            .find(|k| k.name == "slow")
+            .unwrap();
+        assert!(
+            !carried.try_admit_request(1_000),
+            "the spent allowance must survive the swap"
+        );
+    }
+
+    #[test]
+    fn a_newly_added_limit_starts_full_and_a_removed_one_disappears() {
+        let first = table(LIMITED);
+        let added = RoutingTable::from_config_with(
+            &config(
+                r#"
+[providers.openai]
+keys = [
+  { name = "slow", value = "sk-a", rpm = 60 },
+  { name = "spare", value = "sk-b", rpm = 10 },
+]
+"#,
+            ),
+            Some(&first),
+        );
+        let spare = added
+            .providers
+            .get("openai")
+            .unwrap()
+            .keys
+            .iter()
+            .find(|k| k.name == "spare")
+            .unwrap();
+        assert_eq!(spare.rate_headroom().0, Some(10));
+
+        let removed = RoutingTable::from_config_with(&config(BASE), Some(&first));
+        let a = removed
+            .providers
+            .get("openai")
+            .unwrap()
+            .keys
+            .iter()
+            .find(|k| k.name == "a")
+            .unwrap();
+        assert_eq!(a.rate_headroom(), (None, None));
+    }
+
+    #[test]
+    fn an_observed_quota_survives_a_reload() {
+        // A reload must not make the console claim it knows nothing about
+        // a seat that is, in fact, still exhausted.
+        let first = table(LIMITED);
+        let key = &first.providers.get("openai").unwrap().keys[0];
+        key.observe_quota(
+            crate::quota::Quota {
+                primary: Some(crate::quota::Window {
+                    utilization: 0.91,
+                    resets_in: Some(std::time::Duration::from_secs(600)),
+                    length: None,
+                    rejected: false,
+                }),
+                secondary: None,
+            },
+            42,
+        );
+        let rebuilt = RoutingTable::from_config_with(&config(LIMITED), Some(&first));
+        let carried = rebuilt.providers.get("openai").unwrap().keys[0]
+            .quota()
+            .expect("the reading is carried across the swap");
+        assert_eq!(carried.observed_ms, 42);
+        assert_eq!(carried.quota.peak_utilization(), Some(0.91));
+    }
+
+    #[test]
+    fn an_empty_quota_reading_is_not_recorded() {
+        // A payload we no longer recognise must read as "no information",
+        // not as a seat with 0% utilization.
+        let t = table(LIMITED);
+        let key = &t.providers.get("openai").unwrap().keys[0];
+        key.observe_quota(crate::quota::Quota::default(), 42);
+        assert!(key.quota().is_none());
+    }
 
     #[test]
     fn resolves_prefix_alias_and_catalog() {

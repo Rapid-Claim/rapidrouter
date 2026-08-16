@@ -24,7 +24,7 @@ suite. Swapping between them is a config change and a data copy.
 ### File, including on a shared volume
 
 ```bash
-caret-router --store-path /mnt/shared/caret/store.json --data-dir /var/lib/caret-router
+rapid-router --store-path /mnt/shared/rapid/store.json --data-dir /var/lib/rapid-router
 ```
 
 `--store-path` separates *where the fleet's document lives* from *where
@@ -42,7 +42,7 @@ automatically and secrets work without any further setup.
 ```toml
 [store]
 backend = "s3"
-bucket  = "acme-caret-router"
+bucket  = "acme-rapid-router"
 prefix  = "prod/"          # optional
 ```
 
@@ -59,7 +59,7 @@ IAM needs `s3:GetObject`, `s3:PutObject`, `s3:DeleteObject`, and
 ```toml
 [store]
 backend = "dynamodb"
-table   = "caret-router"
+table   = "rapid-router"
 ```
 
 Create the table with a composite key — partition `pk` (string), sort
@@ -68,11 +68,11 @@ right: the traffic is a handful of small reads per node per interval.
 
 ```bash
 aws dynamodb create-table \
-  --table-name caret-router \
+  --table-name rapid-router \
   --attribute-definitions AttributeName=pk,AttributeType=S AttributeName=sk,AttributeType=S \
   --key-schema AttributeName=pk,KeyType=HASH AttributeName=sk,KeyType=RANGE \
   --billing-mode PAY_PER_REQUEST
-aws dynamodb update-time-to-live --table-name caret-router \
+aws dynamodb update-time-to-live --table-name rapid-router \
   --time-to-live-specification "Enabled=true,AttributeName=expires_at"
 ```
 
@@ -87,10 +87,10 @@ Stored secrets are encrypted before they reach the store, so the bucket
 or table holds ciphertext. Every node must therefore hold the same key:
 
 ```bash
-caret-router master-key            # prints a fresh key
+rapid-router master-key            # prints a fresh key
 ```
 
-Set it as `CARET_MASTER_KEY` on every node, from Secrets Manager, SSM, or
+Set it as `RAPID_MASTER_KEY` on every node, from Secrets Manager, SSM, or
 whatever your platform provides. A node pointed at a shared store without
 it **refuses to start**, rather than sealing secrets the rest of the
 fleet cannot read — that failure is silent and looks like a bad API key.
@@ -131,7 +131,7 @@ document they configure access to. That means:
 
 Everything else — providers, keys, limits, budgets — comes from the
 shared document, so a node needs no config file at all once the fleet
-has one. That is what `caret-router --store-path ...` with no `--config`
+has one. That is what `rapid-router --store-path ...` with no `--config`
 does: it reads the fleet's configuration and starts serving it.
 
 ## Rate limits and the fleet size
@@ -177,12 +177,12 @@ immediately.
 
 Because the configuration is shared, every node also gets the same
 `[server] port`. On separate hosts that is what you want. To run two
-nodes on one host, override it per node with `--port` (or `CARET_PORT`);
+nodes on one host, override it per node with `--port` (or `RAPID_PORT`);
 nothing else needs to differ.
 
 Two things do need care:
 
-* **Roll out `CARET_MASTER_KEY` before the config that uses new secrets.**
+* **Roll out `RAPID_MASTER_KEY` before the config that uses new secrets.**
   A node that cannot decrypt a secret refuses to adopt the config naming
   it, and logs why. It keeps serving the previous one, so this degrades
   rather than breaks — but the fleet will be split across two configs
@@ -193,7 +193,7 @@ Two things do need care:
 ## Inspecting a fleet
 
 ```bash
-caret-router fleet --store-backend dynamodb --store-table caret-router
+rapid-router fleet --store-backend dynamodb --store-table rapid-router
 ```
 
 prints the store, the document version, and every node heartbeating

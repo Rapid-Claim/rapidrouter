@@ -1,6 +1,6 @@
 # Overview
 
-caret-router is a network gateway that sits between your applications and
+rapid-router is a network gateway that sits between your applications and
 LLM providers. It presents one stable, OpenAI-compatible API; behind it, it
 routes, translates, load-balances, meters, and protects.
 
@@ -52,11 +52,11 @@ routes, translates, load-balances, meters, and protects.
 | Virtual keys | Scoped gateway credentials with budgets and rate limits — provider keys never leave the gateway ([components/virtual-keys.md](components/virtual-keys.md)) |
 | Web console | Embedded single-page app at `/console` — dashboards, config editing, keys, playground; no separate deployment ([components/console.md](components/console.md)) |
 | Fleet mode | N stateless nodes, same binary, sharing one external store — S3 or DynamoDB ([operations/fleet.md](operations/fleet.md)) |
-| Observability | Prometheus metrics, structured JSON logs, optional OTLP traces, `x-caret-overhead-us` receipt header |
+| Observability | Prometheus metrics, structured JSON logs, optional OTLP traces, `x-rapid-overhead-us` receipt header |
 
 ## Non-goals
 
-- Not a Python/JS library or SDK wrapper — caret-router is a network service.
+- Not a Python/JS library or SDK wrapper — rapid-router is a network service.
 - Not a prompt-management, evals, or observability platform — the embedded
   console covers gateway operations, nothing more.
 - No training or fine-tuning proxying.

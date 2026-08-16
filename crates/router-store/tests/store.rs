@@ -14,7 +14,7 @@ use support::s3_mock::S3Mock;
 
 const WINDOW: Duration = Duration::from_secs(15);
 
-/// `CARET_MASTER_KEY` is process-global, so the tests that care about it
+/// `RAPID_MASTER_KEY` is process-global, so the tests that care about it
 /// take turns. An async mutex, because the guard is held across awaits.
 static ENV: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
@@ -227,8 +227,8 @@ async fn a_secret_sealed_on_one_node_is_readable_on_every_other() {
     let _key = MasterKey::set(&Sealer::generate_master_key());
 
     let spec = BackendSpec::S3 {
-        bucket: "caret-test".into(),
-        prefix: "caret/".into(),
+        bucket: "rapid-test".into(),
+        prefix: "rapid/".into(),
         region: Some("us-east-1".into()),
         endpoint: Some(endpoint),
     };
@@ -270,8 +270,8 @@ async fn a_shared_backend_refuses_to_start_without_a_master_key() {
     let dir = tempfile::tempdir().unwrap();
     let err = Store::open(
         &BackendSpec::S3 {
-            bucket: "caret-test".into(),
-            prefix: "caret/".into(),
+            bucket: "rapid-test".into(),
+            prefix: "rapid/".into(),
             region: Some("us-east-1".into()),
             endpoint: Some(endpoint),
         },
@@ -351,8 +351,8 @@ async fn the_fleet_count_follows_heartbeats() {
     let _key = MasterKey::set(&Sealer::generate_master_key());
 
     let spec = BackendSpec::S3 {
-        bucket: "caret-test".into(),
-        prefix: "caret/".into(),
+        bucket: "rapid-test".into(),
+        prefix: "rapid/".into(),
         region: Some("us-east-1".into()),
         endpoint: Some(endpoint),
     };

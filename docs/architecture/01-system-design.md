@@ -4,7 +4,7 @@
 
 ```
                         ┌──────────────────────────────────────────────────┐
-                        │                caret-router                      │
+                        │                rapid-router                      │
                         │                                                  │
   OpenAI SDK ──────►    │  ┌─────────┐  ┌──────────┐  ┌─────────────────┐  │
   Anthropic SDK ───►    │  │  HTTP   │─►│Middleware│─►│     Router      │  │
@@ -39,7 +39,7 @@ the routing table but sits entirely off the request path
 ## Crate layout (Cargo workspace)
 
 ```
-caret-router/
+rapid-router/
 ├── Cargo.toml                 # workspace
 ├── crates/
 │   ├── router-core/           # no HTTP server; the embeddable heart
@@ -96,7 +96,7 @@ benchmarks, fuzzers, and embedders target. `router-server` is thin by design.
    straightforward path.
 6. **Measured, not asserted.** Overhead budgets are enforced by CI
    benchmarks; the per-request overhead is returned to callers in
-   `x-caret-overhead-us`.
+   `x-rapid-overhead-us`.
 7. **The data plane never depends on the control plane.** Serving traffic
    requires only the local applied snapshot — consensus, disk, and the
    console can all be degraded while requests keep flowing.

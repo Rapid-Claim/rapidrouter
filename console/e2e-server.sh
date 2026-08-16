@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-DATA="$(mktemp -d "${TMPDIR:-/tmp}/caret-console-e2e.XXXXXX")"
+DATA="$(mktemp -d "${TMPDIR:-/tmp}/rapid-console-e2e.XXXXXX")"
 CONFIG="$DATA/config.toml"
 cleanup() { rm -rf "$DATA"; }
 trap cleanup EXIT

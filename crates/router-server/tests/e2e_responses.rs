@@ -86,7 +86,7 @@ async fn relay_sync_with_state_allowed() {
     )
     .await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "openai");
+    assert_eq!(res.headers()["x-rapid-provider"], "openai");
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["object"], "response");
     assert_eq!(body["output"][0]["content"][0]["text"], "mock response");
@@ -173,7 +173,7 @@ async fn translate_sync_text_to_anthropic() {
     )
     .await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "anthropic");
+    assert_eq!(res.headers()["x-rapid-provider"], "anthropic");
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["object"], "response");
     assert_eq!(body["status"], "completed");

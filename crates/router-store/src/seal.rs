@@ -8,7 +8,7 @@
 //! the first one sealed — it holds different bytes, so the unseal returns
 //! `None` and a provider looks unconfigured.
 //!
-//! So a shared backend requires `CARET_MASTER_KEY`: 32 bytes of base64
+//! So a shared backend requires `RAPID_MASTER_KEY`: 32 bytes of base64
 //! that the operator supplies to every task, from Secrets Manager, SSM,
 //! or whatever their platform uses. Only the single-node file backend
 //! falls back to minting a key on disk, where "every node" is one node
@@ -36,18 +36,18 @@ pub struct Sealer {
 }
 
 /// The environment variable holding the cluster-wide key.
-pub const MASTER_KEY_ENV: &str = "CARET_MASTER_KEY";
+pub const MASTER_KEY_ENV: &str = "RAPID_MASTER_KEY";
 
 #[derive(Debug, thiserror::Error)]
 pub enum KeyError {
     #[error(
         "{MASTER_KEY_ENV} is not set. A shared control-plane store needs one key across every \
          node, or secrets sealed by one node cannot be read by the others. Generate one with \
-         `caret-router master-key` and supply it to every node."
+         `rapid-router master-key` and supply it to every node."
     )]
     Missing,
     #[error(
-        "{MASTER_KEY_ENV} is not 32 bytes of base64. Generate one with `caret-router master-key`."
+        "{MASTER_KEY_ENV} is not 32 bytes of base64. Generate one with `rapid-router master-key`."
     )]
     Malformed,
     #[error("reading the node key: {0}")]

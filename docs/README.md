@@ -1,11 +1,11 @@
-# caret-router Documentation
+# rapid-router Documentation
 
-**caret-router** is an open-source LLM gateway written in Rust: one
+**rapid-router** is an open-source LLM gateway written in Rust: one
 OpenAI-compatible API in front of every major LLM provider, with
 **microseconds — not milliseconds — of added latency**.
 
 Point any OpenAI SDK at `http://localhost:8080/v1`, set
-`"model": "anthropic/claude-sonnet-4-5"`, and caret-router translates the
+`"model": "anthropic/claude-sonnet-4-5"`, and rapid-router translates the
 request to Anthropic's wire format, streams the response back in OpenAI chunk
 format, load-balances across your API keys, and fails over to backup
 providers when one degrades — all from a single static binary that carries
@@ -14,7 +14,7 @@ else installed, and three boxes form a fleet with nothing else installed.
 
 ```bash
 export OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-...
-caret-router                       # zero-config start on :8080
+rapid-router                       # zero-config start on :8080
 
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -26,7 +26,7 @@ curl http://localhost:8080/v1/chat/completions \
 ### Start here
 | Doc | Contents |
 |---|---|
-| [01-overview.md](01-overview.md) | What caret-router is, design goals, feature summary, non-goals |
+| [01-overview.md](01-overview.md) | What rapid-router is, design goals, feature summary, non-goals |
 | [guides/quickstart.md](guides/quickstart.md) | Install, run, connect your SDK in five minutes |
 | [guides/coding-agents.md](guides/coding-agents.md) | Claude Code, Codex, and other agents through the gateway |
 

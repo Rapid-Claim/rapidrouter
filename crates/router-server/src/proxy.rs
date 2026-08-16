@@ -64,32 +64,46 @@ fn vk_gate(vk: &VkRuntime, requested: &str, plan: &RoutePlan) -> Result<(), Gate
     }
 }
 
+/// Which credential served a request, carried from the attempt to the
+/// meter as a response *extension* rather than a header.
+///
+/// It has to travel with the response because the token cost is only
+/// known once the body is done — but it must not travel to the client: a
+/// key name is operator-facing, and naming the credential that served you
+/// in a response header hands every caller a map of the pool.
+#[derive(Clone)]
+pub struct SeatUsed {
+    pub provider: Arc<router_core::router::ProviderRuntime>,
+    pub key: String,
+}
+
 fn meter(response: Response, mut hook: UsageHook, dialect: Dialect, stream: bool) -> Response {
     hook.provider = response
         .headers()
-        .get("x-caret-provider")
+        .get("x-rapid-provider")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_owned();
     hook.model = response
         .headers()
-        .get("x-caret-model")
+        .get("x-rapid-model")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_owned();
     hook.attempts = response
         .headers()
-        .get("x-caret-attempts")
+        .get("x-rapid-attempts")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or(1);
     hook.overhead_us = response
         .headers()
-        .get("x-caret-overhead-us")
+        .get("x-rapid-overhead-us")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.parse().ok())
         .unwrap_or_default();
     hook.stream = stream;
+    hook.seat = response.extensions().get::<SeatUsed>().cloned();
     usage::meter_response(response, hook, dialect)
 }
 
@@ -139,9 +153,10 @@ fn build_hook(
         started,
         overhead_us: 0,
         tag: headers
-            .get("x-caret-tag")
+            .get("x-rapid-tag")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
+        seat: None,
     }
 }
 
@@ -438,7 +453,7 @@ async fn run_chat(
             )
         };
         for param in &dropped {
-            metrics::counter!("caret_dropped_params_total", "param" => param.clone(), "provider" => route.provider.name.clone()).increment(1);
+            metrics::counter!("rapid_dropped_params_total", "param" => param.clone(), "provider" => route.provider.name.clone()).increment(1);
             tracing::debug!(provider = %route.provider.name, param, "dropped unsupported parameter");
         }
 
@@ -535,11 +550,11 @@ async fn run_chat(
             .await
             {
                 AttemptOutcome::Serve(mut response) => {
-                    finalize(&mut response, route, attempts, started);
+                    finalize(&mut response, route, choice.key, attempts, started);
                     if emulated {
                         response
                             .headers_mut()
-                            .insert("x-caret-emulated", HeaderValue::from_static("json_schema"));
+                            .insert("x-rapid-emulated", HeaderValue::from_static("json_schema"));
                     }
                     return Ok(response);
                 }
@@ -585,13 +600,13 @@ async fn attempt(
         .send(&route.provider.name, request, route.provider.timeout)
         .await;
     let upstream_elapsed = upstream_started.elapsed();
-    metrics::histogram!("caret_upstream_duration_seconds", "provider" => route.provider.name.clone())
+    metrics::histogram!("rapid_upstream_duration_seconds", "provider" => route.provider.name.clone())
         .record(upstream_elapsed.as_secs_f64());
 
     match result {
         Err(err) => {
             breaker.record_failure(clock::now_ms());
-            metrics::counter!("caret_retries_total", "provider" => route.provider.name.clone())
+            metrics::counter!("rapid_retries_total", "provider" => route.provider.name.clone())
                 .increment(1);
             AttemptOutcome::Retry(err)
         }
@@ -612,7 +627,7 @@ async fn attempt(
             // retry attempt and earns another 429, so the seat is benched
             // for the window the provider itself reported.
             if route.provider.kind.is_subscription() {
-                bench_exhausted_seat(route, breaker, response.headers(), status);
+                bench_exhausted_seat(route, breaker, key, response.headers(), status);
 
                 // A seat whose credential was revoked or expired
                 // out-of-band answers 401. Renewing it in place and
@@ -636,7 +651,7 @@ async fn attempt(
                     .await
                 {
                     metrics::counter!(
-                        "caret_seat_refresh_total",
+                        "rapid_seat_refresh_total",
                         "provider" => route.provider.name.clone(),
                     )
                     .increment(1);
@@ -654,7 +669,7 @@ async fn attempt(
             }
 
             if retryable && !is_last_candidate {
-                metrics::counter!("caret_retries_total", "provider" => route.provider.name.clone())
+                metrics::counter!("rapid_retries_total", "provider" => route.provider.name.clone())
                     .increment(1);
                 return AttemptOutcome::Retry(
                     GatewayError::new(
@@ -700,6 +715,7 @@ async fn attempt(
 fn bench_exhausted_seat(
     route: &ResolvedRoute,
     breaker: &Breaker,
+    key: Option<&router_core::router::KeyRuntime>,
     headers: &HeaderMap,
     status: http::StatusCode,
 ) {
@@ -718,9 +734,15 @@ fn bench_exhausted_seat(
         ProviderKind::ClaudeSubscription => quota::anthropic_quota(header, now_epoch),
         _ => quota::codex_quota(header),
     };
+    // Recorded on every subscription response, not only refusals: the
+    // number an operator needs is how close a seat is to its ceiling, and
+    // that is only visible while it is still serving.
+    if let Some(key) = key {
+        key.observe_quota(quota, clock::now_ms());
+    }
     if let Some(peak) = quota.peak_utilization() {
         metrics::gauge!(
-            "caret_seat_quota_utilization",
+            "rapid_seat_quota_utilization",
             "provider" => route.provider.name.clone(),
         )
         .set(peak);
@@ -755,7 +777,7 @@ fn bench_exhausted_seat(
     let benched = quota::bench_for(window, fastrand::f64());
     breaker.bench_until(clock::now_ms() + benched.as_millis() as u64);
     metrics::gauge!(
-        "caret_seat_bench_seconds",
+        "rapid_seat_bench_seconds",
         "provider" => route.provider.name.clone(),
     )
     .set(benched.as_secs_f64());
@@ -946,7 +968,21 @@ fn extract_upstream_error(body: &[u8]) -> Option<String> {
     None
 }
 
-fn finalize(response: &mut Response, route: &ResolvedRoute, attempts: u32, started: Instant) {
+fn finalize(
+    response: &mut Response,
+    route: &ResolvedRoute,
+    key: Option<&router_core::router::KeyRuntime>,
+    attempts: u32,
+    started: Instant,
+) {
+    // Which credential served, for the token-limit debit once the body is
+    // done. An extension, not a header — see [`SeatUsed`].
+    if let Some(key) = key {
+        response.extensions_mut().insert(SeatUsed {
+            provider: route.provider.clone(),
+            key: key.name.clone(),
+        });
+    }
     // Gateway-added time: total elapsed minus the upstream wait of the
     // serving attempt. (Earlier failed attempts' upstream waits count
     // against us — retries are our choice.)
@@ -959,18 +995,18 @@ fn finalize(response: &mut Response, route: &ResolvedRoute, attempts: u32, start
 
     let headers = response.headers_mut();
     if let Ok(v) = HeaderValue::from_str(&route.provider.name) {
-        headers.insert("x-caret-provider", v);
+        headers.insert("x-rapid-provider", v);
     }
     if let Ok(v) = HeaderValue::from_str(&route.upstream_model) {
-        headers.insert("x-caret-model", v);
+        headers.insert("x-rapid-model", v);
     }
     if let Ok(v) = HeaderValue::from_str(&attempts.to_string()) {
-        headers.insert("x-caret-attempts", v);
+        headers.insert("x-rapid-attempts", v);
     }
     if let Ok(v) = HeaderValue::from_str(&overhead.as_micros().to_string()) {
-        headers.insert("x-caret-overhead-us", v);
+        headers.insert("x-rapid-overhead-us", v);
     }
-    metrics::histogram!("caret_gateway_overhead_seconds").record(overhead.as_secs_f64());
+    metrics::histogram!("rapid_gateway_overhead_seconds").record(overhead.as_secs_f64());
     record_request_metrics(&route.provider.name, response.status());
 }
 
@@ -1294,7 +1330,7 @@ async fn run_relay(
             .await
             {
                 AttemptOutcome::Serve(mut response) => {
-                    finalize(&mut response, route, attempts, started);
+                    finalize(&mut response, route, choice.key, attempts, started);
                     return Ok(response);
                 }
                 AttemptOutcome::Retry(err) => last_error = Some(err),
@@ -1314,7 +1350,7 @@ const MULTIPART_ROUTE_PREFIX_CAP: usize = 1024 * 1024;
 
 /// Relay a multipart request without collecting the upload. For official
 /// SDKs, the small `model` form field is discovered in the multipart
-/// prefix. Callers can always provide `x-caret-model` explicitly.
+/// prefix. Callers can always provide `x-rapid-model` explicitly.
 pub async fn handle_stream_relay(
     state: Arc<AppState>,
     path: &'static str,
@@ -1326,7 +1362,7 @@ pub async fn handle_stream_relay(
 ) -> Response {
     let started = Instant::now();
     let model_header = headers
-        .get("x-caret-model")
+        .get("x-rapid-model")
         .and_then(|v| v.to_str().ok())
         .map(str::to_owned);
     let (model, body) = if needs_model && model_header.is_none() {
@@ -1342,7 +1378,7 @@ pub async fn handle_stream_relay(
     };
     let requested = if model.is_empty() {
         headers
-            .get("x-caret-provider")
+            .get("x-rapid-provider")
             .and_then(|v| v.to_str().ok())
             .map(|p| format!("{p}/*"))
             .unwrap_or_else(|| "default/*".to_owned())
@@ -1383,7 +1419,7 @@ pub async fn handle_provider_relay(
 ) -> Response {
     let started = Instant::now();
     let provider = headers
-        .get("x-caret-provider")
+        .get("x-rapid-provider")
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default();
     let requested = if provider.is_empty() {
@@ -1435,7 +1471,7 @@ async fn read_multipart_model_prefix(mut body: Body) -> Result<(String, Body), G
                 if prefix.len() > MULTIPART_ROUTE_PREFIX_CAP {
                     return Err(GatewayError::new(
                         ErrorClass::InvalidRequest,
-                        "multipart model was not found in the first 1 MiB; send x-caret-model",
+                        "multipart model was not found in the first 1 MiB; send x-rapid-model",
                     )
                     .with_param("model"));
                 }
@@ -1496,7 +1532,7 @@ async fn run_stream_relay(
         (route.provider.clone(), route.upstream_model.clone())
     } else {
         let selected = headers
-            .get("x-caret-provider")
+            .get("x-rapid-provider")
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned);
         let mut candidates = table
@@ -1512,7 +1548,7 @@ async fn run_stream_relay(
         if selected.is_none() && candidates.next().is_some() {
             return Err(GatewayError::new(
                 ErrorClass::InvalidRequest,
-                "multiple providers are available; send x-caret-provider",
+                "multiple providers are available; send x-rapid-provider",
             ));
         }
         let scope = format!("{}/*", provider.name);
@@ -1595,17 +1631,17 @@ async fn run_stream_relay(
         .await?;
     let mut response = forward_response(response, permit);
     response.headers_mut().insert(
-        "x-caret-provider",
+        "x-rapid-provider",
         HeaderValue::from_str(&provider.name).expect("validated provider name"),
     );
     if !upstream_model.is_empty()
         && let Ok(value) = HeaderValue::from_str(&upstream_model)
     {
-        response.headers_mut().insert("x-caret-model", value);
+        response.headers_mut().insert("x-rapid-model", value);
     }
     response
         .headers_mut()
-        .insert("x-caret-attempts", HeaderValue::from_static("1"));
+        .insert("x-rapid-attempts", HeaderValue::from_static("1"));
     Ok(response)
 }
 
@@ -1675,7 +1711,7 @@ fn record_request_metrics(provider: &str, status: StatusCode) {
         _ => "5xx",
     };
     metrics::counter!(
-        "caret_requests_total",
+        "rapid_requests_total",
         "provider" => provider.to_owned(),
         "status_class" => class,
     )
@@ -1703,10 +1739,10 @@ pub fn error_response_for(render: RenderTarget, err: &GatewayError) -> Response 
     if let Some(provider) = &err.provider
         && let Ok(v) = HeaderValue::from_str(provider)
     {
-        response.headers_mut().insert("x-caret-provider", v);
+        response.headers_mut().insert("x-rapid-provider", v);
     }
     metrics::counter!(
-        "caret_requests_total",
+        "rapid_requests_total",
         "provider" => err.provider.clone().unwrap_or_else(|| "none".into()),
         "status_class" => if status.is_client_error() { "4xx" } else { "5xx" },
     )
@@ -1864,7 +1900,7 @@ async fn run_responses(
                 None => {
                     let parsed = router_providers::responses::request_to_internal(&value)?;
                     for param in &parsed.dropped_params {
-                        metrics::counter!("caret_dropped_params_total",
+                        metrics::counter!("rapid_dropped_params_total",
                             "param" => param.clone(),
                             "provider" => route.provider.name.clone())
                         .increment(1);
@@ -1953,11 +1989,11 @@ async fn run_responses(
             .await
             {
                 AttemptOutcome::Serve(mut response) => {
-                    finalize(&mut response, route, attempts, started);
+                    finalize(&mut response, route, choice.key, attempts, started);
                     if emulated {
                         response
                             .headers_mut()
-                            .insert("x-caret-emulated", HeaderValue::from_static("json_schema"));
+                            .insert("x-rapid-emulated", HeaderValue::from_static("json_schema"));
                     }
                     return Ok(response);
                 }
@@ -2183,14 +2219,14 @@ async fn run_passthrough(
         .send(provider_name, request, provider.timeout)
         .await?;
     metrics::counter!(
-        "caret_passthrough_total",
+        "rapid_passthrough_total",
         "provider" => provider_name.to_owned(),
         "status_class" => if response.status().is_success() { "2xx" } else { "4xx5xx" },
     )
     .increment(1);
     let mut response = forward_response(response, permit);
     if let Ok(v) = HeaderValue::from_str(provider_name) {
-        response.headers_mut().insert("x-caret-provider", v);
+        response.headers_mut().insert("x-rapid-provider", v);
     }
     Ok(response)
 }

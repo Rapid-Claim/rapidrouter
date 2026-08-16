@@ -18,7 +18,7 @@ fn main() {
         println!("cargo:warning=could not create console placeholder: {err}");
         return;
     }
-    let placeholder = "<!doctype html>\n<meta charset=\"utf-8\">\n<title>caret-router console</title>\n\
+    let placeholder = "<!doctype html>\n<meta charset=\"utf-8\">\n<title>rapid-router console</title>\n\
         <p>The console bundle was not built into this binary. Run <code>npm ci && npm run build</code> \
         in <code>console/</code> and rebuild, or use <code>--no-default-features</code> to drop the \
         console entirely.</p>\n";

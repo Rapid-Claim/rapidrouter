@@ -239,7 +239,7 @@ fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
     let target = std::path::Path::new(path);
     let directory = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let temporary = directory.join(format!(
-        ".{}.caret-tmp",
+        ".{}.rapid-tmp",
         target
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
@@ -271,8 +271,8 @@ mod tests {
     #[test]
     fn persist_targets_come_from_file_refs_only() {
         assert!(matches!(
-            Persist::from_ref("file:/etc/caret/auth.json"),
-            Persist::File(path) if path == "/etc/caret/auth.json"
+            Persist::from_ref("file:/etc/rapid/auth.json"),
+            Persist::File(path) if path == "/etc/rapid/auth.json"
         ));
         // An env or inline credential has nowhere to write a rotated
         // token, so it must not be refreshed at all.
@@ -283,7 +283,7 @@ mod tests {
 
     #[test]
     fn atomic_write_replaces_and_restricts() {
-        let directory = std::env::temp_dir().join(format!("caret-refresh-{}", std::process::id()));
+        let directory = std::env::temp_dir().join(format!("rapid-refresh-{}", std::process::id()));
         std::fs::create_dir_all(&directory).unwrap();
         let path = directory.join("auth.json");
         std::fs::write(&path, "{\"old\": true}").unwrap();
@@ -291,7 +291,7 @@ mod tests {
         write_atomic(path.to_str().unwrap(), "{\"new\": true}").unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "{\"new\": true}");
         assert!(
-            !directory.join(".auth.json.caret-tmp").exists(),
+            !directory.join(".auth.json.rapid-tmp").exists(),
             "the temporary file is renamed away, not left behind"
         );
         #[cfg(unix)]

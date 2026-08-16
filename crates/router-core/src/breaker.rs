@@ -107,6 +107,24 @@ impl Breaker {
         }
     }
 
+    /// A one-word health summary for the console. Observability only —
+    /// [`Self::admit`] remains the authority on what actually serves.
+    ///
+    /// `benched` outranks `open` because it is the more specific and more
+    /// actionable answer: an operator seeing "open" reaches for the
+    /// breaker's cooldown, when the truth is a provider quota window they
+    /// cannot shorten.
+    pub fn health(&self, now_ms: u64) -> &'static str {
+        if self.benched_until_ms().is_some_and(|until| now_ms < until) {
+            return "benched";
+        }
+        match unpack(self.word.load(Ordering::Acquire)).1 {
+            CLOSED => "healthy",
+            HALF_OPEN => "probing",
+            _ => "open",
+        }
+    }
+
     pub fn admit(&self, now_ms: u64) -> Admission {
         // A provider-declared bench outranks the breaker's own state: no
         // probe, no half-open slot, nothing until the window rolls.

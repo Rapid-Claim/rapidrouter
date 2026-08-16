@@ -10,17 +10,17 @@ raw keys, never caller identifiers.
 
 | Metric | Type |
 |---|---|
-| `caret_requests_total{provider,model,status_class,dialect}` | counter |
-| `caret_gateway_overhead_seconds` | histogram — the headline number, µs-resolution buckets |
-| `caret_ttft_seconds{provider,model}` | histogram |
-| `caret_upstream_duration_seconds{provider}` | histogram |
-| `caret_stream_chunks_total`, `caret_stream_chunk_overhead_seconds` | counter, histogram |
-| `caret_tokens_total{provider,model,kind=prompt\|completion\|cached}` | counter |
-| `caret_cost_usd_total{provider,model}` | counter (price-table derived) |
-| `caret_key_state{provider,key_name,state}` | gauge — breaker closed/open/half-open |
-| `caret_fallbacks_total{from,to}`, `caret_retries_total`, `caret_dropped_params_total{param,provider}` | counters |
-| `caret_inflight{provider}` | gauge |
-| `caret_cluster_members`, `caret_cluster_is_leader`, `caret_cluster_applied_version` | gauges (cluster mode) |
+| `rapid_requests_total{provider,model,status_class,dialect}` | counter |
+| `rapid_gateway_overhead_seconds` | histogram — the headline number, µs-resolution buckets |
+| `rapid_ttft_seconds{provider,model}` | histogram |
+| `rapid_upstream_duration_seconds{provider}` | histogram |
+| `rapid_stream_chunks_total`, `rapid_stream_chunk_overhead_seconds` | counter, histogram |
+| `rapid_tokens_total{provider,model,kind=prompt\|completion\|cached}` | counter |
+| `rapid_cost_usd_total{provider,model}` | counter (price-table derived) |
+| `rapid_key_state{provider,key_name,state}` | gauge — breaker closed/open/half-open |
+| `rapid_fallbacks_total{from,to}`, `rapid_retries_total`, `rapid_dropped_params_total{param,provider}` | counters |
+| `rapid_inflight{provider}` | gauge |
+| `rapid_cluster_members`, `rapid_cluster_is_leader`, `rapid_cluster_applied_version` | gauges (cluster mode) |
 
 ## Tracing
 
@@ -47,6 +47,6 @@ Client-visible observability on every response:
 | Header | Meaning |
 |---|---|
 | `x-request-id` | correlation id |
-| `x-caret-provider`, `x-caret-model` | who actually served (fallbacks disclosed) |
-| `x-caret-attempts` | candidates tried |
-| `x-caret-overhead-us` | this request's measured gateway overhead — the promise, auditable per request |
+| `x-rapid-provider`, `x-rapid-model` | who actually served (fallbacks disclosed) |
+| `x-rapid-attempts` | candidates tried |
+| `x-rapid-overhead-us` | this request's measured gateway overhead — the promise, auditable per request |

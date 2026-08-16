@@ -26,6 +26,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/keys/{id}/rotate", post(rotate_key))
         .route("/usage", get(usage))
         .route("/requests", get(requests))
+        .route("/providers", get(providers))
+        .route("/history", get(history))
         .route("/fleet", get(fleet))
         .route("/events", get(events))
         .layer(axum::middleware::from_fn_with_state(
@@ -107,7 +109,7 @@ async fn create_session(
         .insert(token.clone(), expires_ms);
     let mut response = Json(json!({ "token": token, "expires_ms": expires_ms })).into_response();
     if let Ok(cookie) = format!(
-        "caret_session={}; Path=/admin/api; HttpOnly; SameSite=Strict; Max-Age={}",
+        "rapid_session={}; Path=/admin/api; HttpOnly; SameSite=Strict; Max-Age={}",
         token,
         config.console.session_ttl.as_secs(),
     )
@@ -136,7 +138,7 @@ async fn admin_auth(State(state): State<Arc<AppState>>, request: Request, next: 
             cookies
                 .split(';')
                 .map(str::trim)
-                .find_map(|value| value.strip_prefix("caret_session="))
+                .find_map(|value| value.strip_prefix("rapid_session="))
         });
     let valid_static = bearer.is_some_and(|token| {
         config
@@ -469,6 +471,121 @@ async fn requests(
         )
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct HistoryQuery {
+    #[serde(default = "default_days")]
+    days: u32,
+    #[serde(default)]
+    by: Option<String>,
+}
+
+fn default_days() -> u32 {
+    30
+}
+
+/// Daily spend and volume for the Usage page's time ramp.
+///
+/// The in-memory aggregate only spans 24 hours, so anything longer is
+/// read back from the flushed usage files. Capped at a year: the read
+/// walks every record in range, and an unbounded range on a busy gateway
+/// is a way to make the console the slowest thing in the process.
+async fn history(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<HistoryQuery>,
+) -> Response {
+    let by = query.by.as_deref().unwrap_or("");
+    let by = if matches!(by, "provider" | "model" | "key") {
+        by
+    } else {
+        ""
+    };
+    Json(json!({ "data": state.usage.history(query.days.clamp(1, 365), by) })).into_response()
+}
+
+/// Per-provider, per-credential state for the console's Providers page.
+///
+/// The interesting column is the ceiling each credential is working
+/// against, and the two kinds are genuinely different. A metered API key
+/// is limited by what we configured (`rpm`/`tpm`), and the remaining
+/// allowance is ours to compute. A subscription seat is limited by the
+/// plan, on windows only the provider knows — Claude's 5h and 7d,
+/// Codex's primary and secondary — so what is reported here is the last
+/// thing the provider actually told us, with the time it said it.
+///
+/// Both are per credential rather than per provider, because that is how
+/// they are enforced: one exhausted seat must not read as an exhausted
+/// pool.
+async fn providers(State(state): State<Arc<AppState>>) -> Response {
+    let now = router_core::clock::now_ms();
+    let now_unix = vkey::unix_now_ms();
+    let table = state.table.load();
+
+    let window = |w: Option<router_core::quota::Window>| {
+        w.map(|w| {
+            json!({
+                "utilization": w.utilization,
+                "resets_in_s": w.resets_in.map(|d| d.as_secs()),
+                "length_s": w.length.map(|d| d.as_secs()),
+                "rejected": w.rejected,
+            })
+        })
+    };
+
+    let data: Vec<Value> = table
+        .providers()
+        .map(|p| {
+            let keys: Vec<Value> = p
+                .keys
+                .iter()
+                .map(|k| {
+                    let (rpm_left, tpm_left) = k.rate_headroom();
+                    let seat = k.credential.seat().map(|s| s.current());
+                    json!({
+                        "name": k.name,
+                        "weight": k.weight,
+                        "models": k.models,
+                        "health": k.breaker.health(now),
+                        // Reported as a wall-clock instant, not a
+                        // duration: the console renders a countdown, and a
+                        // duration computed here would be stale by the
+                        // time it is drawn.
+                        "benched_until_ms": k.breaker.benched_until_ms().map(|until| {
+                            now_unix.saturating_add(until.saturating_sub(now))
+                        }),
+                        "limits": {
+                            "rpm": k.rpm.as_ref().map(|_| json!({ "remaining": rpm_left })),
+                            "tpm": k.tpm.as_ref().map(|_| json!({ "remaining": tpm_left })),
+                        },
+                        "quota": k.quota().map(|snapshot| json!({
+                            "observed_ms": now_unix.saturating_sub(now.saturating_sub(snapshot.observed_ms)),
+                            "peak_utilization": snapshot.quota.peak_utilization(),
+                            "primary": window(snapshot.quota.primary),
+                            "secondary": window(snapshot.quota.secondary),
+                        })),
+                        // A seat's credential expires; a metered key's
+                        // does not. `null` for "unknown" is meaningful —
+                        // an opaque token carries no readable expiry.
+                        "credential": seat.as_ref().map(|s| json!({
+                            "expires_at_ms": s.expires_at_ms,
+                            "can_refresh": s.refresh_token.is_some(),
+                            "expired": s.is_expired(now_unix),
+                        })),
+                        "source_path": k.source_path,
+                    })
+                })
+                .collect();
+            json!({
+                "name": p.name,
+                "kind": format!("{:?}", p.kind),
+                "subscription": p.kind.is_subscription(),
+                "base_url": p.base_url,
+                "keys": keys,
+            })
+        })
+        .collect();
+    Json(json!({ "data": data })).into_response()
 }
 
 /// What the console's Fleet page reads: which store is authoritative,

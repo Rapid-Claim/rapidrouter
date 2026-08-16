@@ -1,4 +1,4 @@
-"""OpenAI SDK scenario suite, run against a caret-router gateway.
+"""OpenAI SDK scenario suite, run against a rapid-router gateway.
 
 Usage: openai_suite.py <gateway_base_url>
 Exits non-zero on the first failed scenario. The gateway is expected to

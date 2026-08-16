@@ -17,6 +17,53 @@ export type VirtualKey = {
   created_ms: number;
 };
 
+/** One credential's live state, as the Providers page shows it. */
+export type ProviderKey = {
+  name: string;
+  weight: number;
+  models: string[] | null;
+  health: "healthy" | "probing" | "open" | "benched";
+  benched_until_ms: number | null;
+  limits: {
+    rpm: { remaining: number | null } | null;
+    tpm: { remaining: number | null } | null;
+  };
+  /** Present only once the provider has reported a window for this seat. */
+  quota: {
+    observed_ms: number;
+    peak_utilization: number | null;
+    primary: QuotaWindow | null;
+    secondary: QuotaWindow | null;
+  } | null;
+  /** Subscription seats only; metered keys have no expiry to report. */
+  credential: { expires_at_ms: number | null; can_refresh: boolean; expired: boolean } | null;
+  source_path: string | null;
+};
+
+export type QuotaWindow = {
+  utilization: number;
+  resets_in_s: number | null;
+  length_s: number | null;
+  rejected: boolean;
+};
+
+export type Provider = {
+  name: string;
+  kind: string;
+  subscription: boolean;
+  base_url: string | null;
+  keys: ProviderKey[];
+};
+
+export type DayBucket = {
+  day: string;
+  requests: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_micro_usd: number;
+};
+
 export type UsageRecord = {
   ts: number;
   request_id: string;
@@ -32,7 +79,7 @@ export type UsageRecord = {
   latency_ms: number;
 };
 
-const TOKEN_KEY = "caret-admin-session";
+const TOKEN_KEY = "rapid-admin-session";
 
 export function sessionToken(): string {
   return sessionStorage.getItem(TOKEN_KEY) ?? "";
@@ -88,4 +135,8 @@ export const api = {
   requests: (errors = false) =>
     request<{ data: UsageRecord[] }>(`/requests?limit=200&errors=${errors}`),
   fleet: () => request<any>("/fleet"),
+  providers: () => request<{ data: Provider[] }>("/providers"),
+  /** Daily totals from the flushed usage files; `by` splits into series. */
+  history: (days = 30, by = "") =>
+    request<{ data: Record<string, DayBucket[]> }>(`/history?days=${days}&by=${by}`),
 };

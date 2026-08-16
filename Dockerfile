@@ -8,6 +8,6 @@ RUN cargo build --release -p router-bin
 
 FROM scratch
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
-COPY --from=build /src/target/release/caret-router /caret-router
+COPY --from=build /src/target/release/rapid-router /rapid-router
 EXPOSE 8080
-ENTRYPOINT ["/caret-router"]
+ENTRYPOINT ["/rapid-router"]

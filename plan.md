@@ -1,4 +1,4 @@
-# caret-router — End-to-End Build Plan
+# rapid-router — End-to-End Build Plan
 
 Phased plan for building the gateway described in [docs/](docs/README.md).
 Each phase lists what gets built, what gets tested, and a hard exit
@@ -26,7 +26,7 @@ Guiding rules:
 **Build**
 - Cargo workspace: `router-core`, `router-providers`, `router-server`,
   `router-bin` (+ empty `router-store`, `console/` placeholders).
-- Config schema + total validation + `caret-router check`; `env.*` secret
+- Config schema + total validation + `rapid-router check`; `env.*` secret
   references; `SecretString`.
 - axum server: `/health`, `/metrics` stub, graceful drain.
 - CI: fmt, clippy (deny warnings), test, cargo-audit/deny; release build
@@ -76,7 +76,7 @@ multi-key failover works under load test.
   rewrite, auth injection, hyper upstream pool, SSE raw forwarding.
 - `openai_compat` presets (groq, mistral, ollama, vllm, openrouter).
 - `/v1/models`, `/v1/completions`, `/v1/embeddings` relay.
-- Receipt headers (`x-caret-*`), request IDs, metrics.
+- Receipt headers (`x-rapid-*`), request IDs, metrics.
 
 **Tests — this is where the borrowed suites start**
 - **Mock provider** crate (in-repo): OpenAI-shaped server with scripted
@@ -252,7 +252,7 @@ with compare-and-swap, and a node holds nothing worth keeping.
 **Build**
 - `ControlPlane` adapter trait; `file`, `s3`, `dynamodb`, `memory`
   backends. One document, one version, conditional writes.
-- Fleet-wide `CARET_MASTER_KEY` sealing secrets, so any node can read
+- Fleet-wide `RAPID_MASTER_KEY` sealing secrets, so any node can read
   what any other node wrote.
 - Poll-based propagation and heartbeat-based liveness replacing
   replication and membership; live-N limit shares kept.

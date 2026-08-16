@@ -57,7 +57,7 @@ are versioned and exact. Summary of the current tables:
 | Embeddings | ✓ | ✓ | — | ✓ | ✓ | preset-dependent |
 | Prompt caching | ✓ | ✓ | ✓ (passthrough control) | ✓ | ✓ | — |
 
-¹ Emulated via forced tool use; disclosed with `x-caret-emulated: json_schema`.
+¹ Emulated via forced tool use; disclosed with `x-rapid-emulated: json_schema`.
 ² Stateless core; `store`/`previous_response_id` rejected with a precise 400.
 
 Unsupported combinations fail at routing time with a `400` naming the

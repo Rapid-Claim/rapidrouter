@@ -113,7 +113,7 @@ pub const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 /// `400 "The '<model>' model requires a newer version of Codex."`
 /// Configurable per provider precisely because it moves when OpenAI ships
 /// a model family, and an operator must be able to follow that without
-/// waiting for a caret-router release.
+/// waiting for a rapid-router release.
 pub const DEFAULT_CODEX_VERSION: &str = "0.146.0";
 
 /// The header set the Codex CLI sends, reproduced exactly.

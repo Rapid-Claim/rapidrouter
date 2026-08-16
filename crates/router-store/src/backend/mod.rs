@@ -102,7 +102,7 @@ impl ControlPlaneError {
 /// of the system leans on.
 #[async_trait::async_trait]
 pub trait ControlPlane: Send + Sync + 'static {
-    /// Short operator-facing description, e.g. `dynamodb://caret-router`.
+    /// Short operator-facing description, e.g. `dynamodb://rapid-router`.
     fn describe(&self) -> String;
 
     /// Read the current document. A backend with nothing stored yet

@@ -31,15 +31,15 @@ jobs:
       - run: cargo build --release --target ${{ matrix.target }} -p router-bin
       - name: Package
         run: |
-          NAME=caret-router-${GITHUB_REF_NAME}-${{ matrix.target }}
+          NAME=rapid-router-${GITHUB_REF_NAME}-${{ matrix.target }}
           mkdir "$NAME"
-          cp target/${{ matrix.target }}/release/caret-router "$NAME/"
+          cp target/${{ matrix.target }}/release/rapid-router "$NAME/"
           tar czf "$NAME.tar.gz" "$NAME"
           shasum -a 256 "$NAME.tar.gz" > "$NAME.tar.gz.sha256"
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.target }}
-          path: caret-router-*.tar.gz*
+          path: rapid-router-*.tar.gz*
 
   release:
     needs: binaries
@@ -53,11 +53,11 @@ jobs:
         uses: anchore/sbom-action@v0
         with:
           format: spdx-json
-          output-file: caret-router-${{ github.ref_name }}.sbom.spdx.json
+          output-file: rapid-router-${{ github.ref_name }}.sbom.spdx.json
       - name: Sign artifacts (sigstore keyless)
         uses: sigstore/cosign-installer@v3
       - run: |
-          for f in caret-router-*.tar.gz; do
+          for f in rapid-router-*.tar.gz; do
             cosign sign-blob --yes "$f" \
               --output-signature "$f.sig" \
               --output-certificate "$f.pem"
@@ -66,9 +66,9 @@ jobs:
         uses: softprops/action-gh-release@v2
         with:
           files: |
-            caret-router-*.tar.gz
-            caret-router-*.tar.gz.sha256
-            caret-router-*.tar.gz.sig
-            caret-router-*.tar.gz.pem
-            caret-router-*.sbom.spdx.json
+            rapid-router-*.tar.gz
+            rapid-router-*.tar.gz.sha256
+            rapid-router-*.tar.gz.sig
+            rapid-router-*.tar.gz.pem
+            rapid-router-*.sbom.spdx.json
           generate_release_notes: true

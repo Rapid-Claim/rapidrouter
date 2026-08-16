@@ -1,4 +1,4 @@
-"""OpenAI SDK Responses-API scenarios against caret-router: native relay
+"""OpenAI SDK Responses-API scenarios against rapid-router: native relay
 (openai target) and stateless translation (anthropic target)."""
 
 import sys
