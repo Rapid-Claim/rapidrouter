@@ -82,10 +82,10 @@ async fn chat_completion_round_trip() {
     .await;
 
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "openai");
-    assert_eq!(res.headers()["x-caret-model"], "gpt-4o");
+    assert_eq!(res.headers()["x-rapid-provider"], "openai");
+    assert_eq!(res.headers()["x-rapid-model"], "gpt-4o");
     assert!(res.headers().contains_key("x-request-id"));
-    let overhead: u64 = res.headers()["x-caret-overhead-us"]
+    let overhead: u64 = res.headers()["x-rapid-overhead-us"]
         .to_str()
         .unwrap()
         .parse()
@@ -112,7 +112,7 @@ async fn bare_model_resolves_through_catalog() {
     let gw = gateway().await;
     let res = chat(&gw, json!({"model": "gpt-4o-mini", "messages": []})).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "openai");
+    assert_eq!(res.headers()["x-rapid-provider"], "openai");
     assert_eq!(gw.mock.last_request().body["model"], "gpt-4o-mini");
 }
 
@@ -121,7 +121,7 @@ async fn alias_resolves_and_strips() {
     let gw = gateway().await;
     let res = chat(&gw, json!({"model": "fast", "messages": []})).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "groq");
+    assert_eq!(res.headers()["x-rapid-provider"], "groq");
     let seen = gw.mock.last_request();
     assert_eq!(seen.body["model"], "llama-3.3-70b-versatile");
     assert_eq!(seen.authorization.as_deref(), Some("Bearer gsk-mock"));
@@ -493,6 +493,6 @@ fast = "openai/gpt-4o"
 
     let res = chat(&gw, json!({"model": "fast", "messages": []})).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "openai");
+    assert_eq!(res.headers()["x-rapid-provider"], "openai");
     assert_eq!(gw.mock.last_request().body["model"], "gpt-4o");
 }

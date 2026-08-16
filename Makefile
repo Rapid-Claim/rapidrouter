@@ -1,4 +1,4 @@
-# caret-router
+# rapid-router
 #
 # `make` on its own lists everything. The targets that talk to real
 # providers source `.env` first (the binary has no dotenv of its own), so
@@ -19,8 +19,8 @@ PORT    ?=
 # remembers the last config it was given, so a shared data dir means
 # `make run` silently inherits state from whatever you ran days ago.
 # Keeping it in-tree (and gitignored) makes a dev run reproducible and
-# leaves ~/.caret-router — a real deployment's state — untouched.
-DATA_DIR ?= .caret-data
+# leaves ~/.rapid-router — a real deployment's state — untouched.
+DATA_DIR ?= .rapid-data
 # The dev gateway's config, generated on first use with a random admin
 # key. It lives in DATA_DIR so it is gitignored and `make reset` clears
 # it — a checked-in admin key is a credential in the repo.
@@ -71,7 +71,7 @@ dev: dev-config console-deps ## Gateway + Vite together, with the admin key prin
 	   kill -0 $$gateway 2>/dev/null || { echo "gateway exited before it was ready"; exit 1; }; \
 	   sleep 1; \
 	 done; \
-	 CARET_GATEWAY=http://127.0.0.1:$(DEV_PORT) npm --prefix console run dev -- --host 127.0.0.1 --port $(VITE_PORT)
+	 RAPID_GATEWAY=http://127.0.0.1:$(DEV_PORT) npm --prefix console run dev -- --host 127.0.0.1 --port $(VITE_PORT)
 
 .PHONY: dev-config
 dev-config: ## Create the dev config with a fresh admin key, if absent
@@ -159,9 +159,9 @@ ci-loom: ## Model-check the breaker and token bucket under loom
 
 .PHONY: ci-sdk-suite
 ci-sdk-suite: ## Official OpenAI/Anthropic SDKs against gateway + mock
-	@python3 -m venv /tmp/caret-sdkvenv
-	@/tmp/caret-sdkvenv/bin/pip install --quiet --upgrade openai anthropic
-	scripts/sdk-suite/run.sh /tmp/caret-sdkvenv/bin/python
+	@python3 -m venv /tmp/rapid-sdkvenv
+	@/tmp/rapid-sdkvenv/bin/pip install --quiet --upgrade openai anthropic
+	scripts/sdk-suite/run.sh /tmp/rapid-sdkvenv/bin/python
 
 .PHONY: ci-perf
 ci-perf: ## Benches compile, overhead gate, short soak
@@ -176,7 +176,7 @@ audit: ## cargo-audit over the dependency tree
 ## Console (console/)
 .PHONY: console-dev
 console-dev: console-deps ## Vite alone, against a gateway you started yourself
-	CARET_GATEWAY=http://127.0.0.1:$(DEV_PORT) npm --prefix console run dev -- --host 127.0.0.1 --port $(VITE_PORT)
+	RAPID_GATEWAY=http://127.0.0.1:$(DEV_PORT) npm --prefix console run dev -- --host 127.0.0.1 --port $(VITE_PORT)
 
 .PHONY: console-build
 console-build: ## Typecheck and build the console bundle

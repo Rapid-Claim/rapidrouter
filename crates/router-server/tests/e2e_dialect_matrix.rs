@@ -107,7 +107,7 @@ async fn oai_to_ant_sync_text() {
     )
     .await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "anthropic");
+    assert_eq!(res.headers()["x-rapid-provider"], "anthropic");
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["object"], "chat.completion");
     assert_eq!(body["choices"][0]["message"]["content"], "mock response");
@@ -291,7 +291,7 @@ async fn oai_to_ant_json_schema_emulated() {
             "name": "out", "schema": {"type": "object", "properties": {"answer": {"type": "string"}, "n": {"type": "integer"}}}}},
     })).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-emulated"], "json_schema");
+    assert_eq!(res.headers()["x-rapid-emulated"], "json_schema");
     let body: Value = res.json().await.unwrap();
     // The forced tool's arguments came back as content JSON.
     let content: Value =
@@ -340,7 +340,7 @@ async fn oai_to_gem_sync_and_tools() {
     )
     .await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "gemini");
+    assert_eq!(res.headers()["x-rapid-provider"], "gemini");
     let body: Value = res.json().await.unwrap();
     let calls = body["choices"][0]["message"]["tool_calls"]
         .as_array()
@@ -443,7 +443,7 @@ async fn ant_to_oai_sync_text() {
     )
     .await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "openai");
+    assert_eq!(res.headers()["x-rapid-provider"], "openai");
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["type"], "message");
     assert_eq!(body["role"], "assistant");
@@ -552,7 +552,7 @@ async fn ant_to_gem_sync_tools() {
     )
     .await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "gemini");
+    assert_eq!(res.headers()["x-rapid-provider"], "gemini");
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["type"], "message");
     let tool_uses: Vec<&Value> = body["content"]

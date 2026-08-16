@@ -48,8 +48,8 @@ what happened:
 
 | Header | Meaning |
 |---|---|
-| `x-caret-provider`, `x-caret-model` | who actually served (or last failed) |
-| `x-caret-attempts` | total candidates tried |
+| `x-rapid-provider`, `x-rapid-model` | who actually served (or last failed) |
+| `x-rapid-attempts` | total candidates tried |
 | `retry-after` | propagated from upstream 429s, or computed from gateway limits |
 
 Client-side retries on 429/5xx therefore remain safe and meaningful — each

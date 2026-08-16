@@ -1,4 +1,4 @@
-"""Anthropic SDK scenario suite against caret-router's /anthropic dialect.
+"""Anthropic SDK scenario suite against rapid-router's /anthropic dialect.
 
 Covers same-dialect passthrough (anthropic model), cross-dialect routing
 (OpenAI model behind the Anthropic SDK — the coding-agent shape), tools,

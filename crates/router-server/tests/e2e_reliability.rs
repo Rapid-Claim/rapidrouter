@@ -68,9 +68,9 @@ max_attempts = 1
 
     let res = chat(&gw, json!({"model": "internal/m", "messages": []})).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "openai");
-    assert_eq!(res.headers()["x-caret-model"], "gpt-4o");
-    let attempts: u32 = res.headers()["x-caret-attempts"]
+    assert_eq!(res.headers()["x-rapid-provider"], "openai");
+    assert_eq!(res.headers()["x-rapid-model"], "gpt-4o");
+    let attempts: u32 = res.headers()["x-rapid-attempts"]
         .to_str()
         .unwrap()
         .parse()
@@ -105,7 +105,7 @@ max_attempts = 1
 
     let res = chat(&gw, json!({"model": "primary", "messages": []})).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-model"], "gpt-4o");
+    assert_eq!(res.headers()["x-rapid-model"], "gpt-4o");
     let bodies: Vec<String> = gw
         .mock
         .requests()
@@ -173,7 +173,7 @@ max_attempts = 1
         let res = chat(&gw, json!({"model": "primary", "messages": []})).await;
         assert_eq!(res.status(), 200);
         assert_eq!(
-            res.headers()["x-caret-attempts"],
+            res.headers()["x-rapid-attempts"],
             "1",
             "must skip the open target"
         );
@@ -227,20 +227,20 @@ max_attempts = 1
     }
     // Open: served by fallback without touching primary.
     let res = chat(&gw, json!({"model": "primary", "messages": []})).await;
-    assert_eq!(res.headers()["x-caret-attempts"], "1");
+    assert_eq!(res.headers()["x-rapid-attempts"], "1");
 
     // After cooldown the probe goes through; the target has healed
     // (recover-after-2 succeeds from the 3rd hit), so service returns.
     tokio::time::sleep(std::time::Duration::from_millis(1100)).await;
     let res = chat(&gw, json!({"model": "primary", "messages": []})).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-model"], "recover-after-2");
+    assert_eq!(res.headers()["x-rapid-model"], "recover-after-2");
 
     // Closed again: straight to primary.
     let res = chat(&gw, json!({"model": "primary", "messages": []})).await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-model"], "recover-after-2");
-    assert_eq!(res.headers()["x-caret-attempts"], "1");
+    assert_eq!(res.headers()["x-rapid-model"], "recover-after-2");
+    assert_eq!(res.headers()["x-rapid-attempts"], "1");
 }
 
 #[tokio::test]

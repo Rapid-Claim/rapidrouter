@@ -86,7 +86,7 @@ async fn azure_maps_deployment_and_api_key() {
     )
     .await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "azure");
+    assert_eq!(res.headers()["x-rapid-provider"], "azure");
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["choices"][0]["message"]["content"], "mock response");
 
@@ -285,7 +285,7 @@ async fn vertex_routes_gemini_dialect_through_project_paths() {
     )
     .await;
     assert_eq!(res.status(), 200, "{}", res.text().await.unwrap());
-    assert_eq!(res.headers()["x-caret-provider"], "vertex");
+    assert_eq!(res.headers()["x-rapid-provider"], "vertex");
     let body: Value = res.json().await.unwrap();
     let calls = body["choices"][0]["message"]["tool_calls"]
         .as_array()
@@ -354,7 +354,7 @@ async fn databricks_serves_as_openai_compatible_workspace() {
     )
     .await;
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "databricks");
+    assert_eq!(res.headers()["x-rapid-provider"], "databricks");
     let seen = gw.mock.last_request();
     assert_eq!(seen.path, "/chat/completions");
     assert_eq!(seen.body["model"], "databricks-meta-llama-3-3-70b-instruct");
@@ -397,7 +397,7 @@ async fn passthrough_forwards_verbatim_with_auth() {
         .await
         .unwrap();
     assert_eq!(res.status(), 200);
-    assert_eq!(res.headers()["x-caret-provider"], "openai");
+    assert_eq!(res.headers()["x-rapid-provider"], "openai");
     let seen = gw.mock.last_request();
     assert!(seen.path.contains("POST"));
     assert!(

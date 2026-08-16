@@ -122,7 +122,7 @@ fn validate_virtual_keys(
             errors.push(ConfigError::new(
                 format!("{path}.secret_hash"),
                 "must be `blake3:` followed by 64 hex characters \
-                 (create one with `caret-router key hash`)",
+                 (create one with `rapid-router key hash`)",
             ));
         }
         for (j, scope) in rk.models.iter().enumerate() {
@@ -991,7 +991,7 @@ fn resolve_secret(value: &str, env: &dyn EnvSource) -> Result<SecretString, Stri
         match env.get(value) {
             Some(v) if !v.is_empty() => Ok(SecretString::new(v)),
             _ => Err(format!(
-                "store secret `{name}` is not set (managed mode: `caret-router secret set {name}`)"
+                "store secret `{name}` is not set (managed mode: `rapid-router secret set {name}`)"
             )),
         }
     } else if value.is_empty() {

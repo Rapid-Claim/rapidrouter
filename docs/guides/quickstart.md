@@ -4,9 +4,9 @@
 
 ```bash
 # macOS / Linux
-curl -fsSL https://caret-router.dev/install.sh | sh     # or: brew install caret-router
+curl -fsSL https://rapid-router.dev/install.sh | sh     # or: brew install rapid-router
 # Docker
-docker pull ghcr.io/caret/caret-router
+docker pull ghcr.io/rapid/rapid-router
 ```
 
 (Verify signatures if you're the careful kind — releases are cosign-signed
@@ -19,8 +19,8 @@ export OPENAI_API_KEY=sk-...
 export ANTHROPIC_API_KEY=sk-ant-...
 export GROQ_API_KEY=gsk-...
 
-caret-router
-# caret-router listening on 0.0.0.0:8080
+rapid-router
+# rapid-router listening on 0.0.0.0:8080
 # providers configured from environment: openai, anthropic, groq
 ```
 
@@ -79,12 +79,12 @@ fast = "groq/llama-3.3-70b-versatile"
 ```
 
 ```bash
-caret-router --config caret-router.toml --watch
+rapid-router --config rapid-router.toml --watch
 ```
 
 Now `"model": "fast"` routes wherever you point it, and gpt-4o traffic
 survives an OpenAI incident without your application noticing — check the
-`x-caret-provider` response header to see who actually served.
+`x-rapid-provider` response header to see who actually served.
 
 ## Next
 

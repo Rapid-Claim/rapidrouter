@@ -1,6 +1,6 @@
 # Inbound Dialects & Cross-Dialect Routing
 
-caret-router speaks three wire formats *inbound*, selected by URL prefix.
+rapid-router speaks three wire formats *inbound*, selected by URL prefix.
 Routing, reliability, and metering are identical behind all three; the
 prefix only sets which dialect the client is speaking — and therefore which
 shapes it gets back.
@@ -51,7 +51,7 @@ silent behavior change.
 - **`/genai`**: `generateContent` / `streamGenerateContent` shapes,
   `systemInstruction`, function-calling parts.
 
-Where a provider's real API differs from its documentation, caret-router
+Where a provider's real API differs from its documentation, rapid-router
 matches the API. Compatibility beats purity.
 
 ## Named-client guarantee

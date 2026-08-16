@@ -6,14 +6,14 @@ through the embedded console/CLI, persisted and replicated by the built-in
 store (`managed` mode, the default). Same schema either way; no external
 database or config service in either mode.
 
-## Example `caret-router.toml`
+## Example `rapid-router.toml`
 
 ```toml
 [server]
 host = "0.0.0.0"
 port = 8080
 max_body_size_mb = 100
-auth_keys = ["env.CARET_GATEWAY_KEY"]     # omit for open localhost use
+auth_keys = ["env.RAPID_GATEWAY_KEY"]     # omit for open localhost use
 require_auth = false                      # true: refuse anonymous requests
 drain_timeout_secs = 30
 
@@ -61,7 +61,7 @@ max_attempts = 2
 on = ["connect_error", "429", "5xx"]
 
 [console]                       # the console and /admin/api exist only
-admin_keys = ["env.CARET_ADMIN_KEY"]      # once admin credentials do
+admin_keys = ["env.RAPID_ADMIN_KEY"]      # once admin credentials do
 session_ttl_secs = 43200
 
 [usage]
@@ -76,7 +76,7 @@ output_per_mtok = 0.60
 [[virtual_keys]]                # file-mode form; console/CLI is the usual path
 name        = "checkout-service"
 id          = "9f3a2c"
-secret_hash = "blake3:…"        # from `caret-router key hash`
+secret_hash = "blake3:…"        # from `rapid-router key hash`
 models      = ["openai/gpt-4o-mini", "fast"]
 budget      = { usd = 250, period = "monthly" }
 rate_limit  = { rpm = 600, tpm = 400_000 }
@@ -101,7 +101,7 @@ enabled     = true
   empty key lists, alias cycles, fallback targets that don't exist,
   deployment maps missing models — all rejected before the port binds, with
   pathed messages (`providers.groq.keys[0].weight: must be > 0`).
-  `caret-router check <file>` runs the same validation standalone for CI.
+  `rapid-router check <file>` runs the same validation standalone for CI.
 - **Virtual keys carry hashes, never secrets.** A `[[virtual_keys]]` entry
   is validated like everything else: the id must be six hex characters, the
   hash must be `blake3:` plus 64 hex characters, and every scope entry must
@@ -133,14 +133,14 @@ atomically:
 
 ## Precedence & zero-config
 
-CLI flags → environment (`CARET_ROUTER__SERVER__PORT=…`) → file → defaults.
+CLI flags → environment (`RAPID_ROUTER__SERVER__PORT=…`) → file → defaults.
 
 ## Config modes
 
 - **`managed`** (default): the file — if present — seeds the embedded
   replicated store on first boot; thereafter the store is the source of
   truth, editable from the console/CLI on any node and replicated across a
-  cluster. `caret-router config export` writes it back out as TOML at any
+  cluster. `rapid-router config export` writes it back out as TOML at any
   time.
 - **`file`**: the file is the sole source of truth, hot-reloaded; the
   console is read-only. For GitOps and immutable-infrastructure shops.
@@ -150,7 +150,7 @@ Secrets may be referenced as `env.*` (injected by your platform) or
 Details in
 [../architecture/06-state-and-storage.md](../architecture/06-state-and-storage.md).
 
-With no file at all, caret-router starts on `:8080` and auto-configures any
+With no file at all, rapid-router starts on `:8080` and auto-configures any
 provider whose conventional env var is present (`OPENAI_API_KEY`,
 `ANTHROPIC_API_KEY`, `GEMINI_API_KEY`, `GROQ_API_KEY`, …) — the five-minute
 quickstart path ([../guides/quickstart.md](../guides/quickstart.md)).

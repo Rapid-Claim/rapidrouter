@@ -45,8 +45,8 @@ async fn file(dir: &tempfile::TempDir) -> Arc<dyn ControlPlane> {
 async fn s3(mock_endpoint: &str) -> Arc<dyn ControlPlane> {
     support::fake_aws_env();
     BackendSpec::S3 {
-        bucket: "caret-test".into(),
-        prefix: "caret/".into(),
+        bucket: "rapid-test".into(),
+        prefix: "rapid/".into(),
         region: Some("us-east-1".into()),
         endpoint: Some(mock_endpoint.to_owned()),
     }
@@ -58,7 +58,7 @@ async fn s3(mock_endpoint: &str) -> Arc<dyn ControlPlane> {
 async fn dynamo(mock_endpoint: &str) -> Arc<dyn ControlPlane> {
     support::fake_aws_env();
     BackendSpec::DynamoDb {
-        table: "caret-test".into(),
+        table: "rapid-test".into(),
         region: Some("us-east-1".into()),
         endpoint: Some(mock_endpoint.to_owned()),
     }
@@ -260,7 +260,7 @@ async fn s3_uses_if_none_match_to_create_and_if_match_to_replace() {
 
     let empty = plane.load().await.unwrap();
     plane.commit(&empty, state_with("one")).await.unwrap();
-    assert_eq!(mock.object_count("caret/store.json"), 1);
+    assert_eq!(mock.object_count("rapid/store.json"), 1);
 
     // Another node writes. Our cached ETag is now stale, so the next
     // conditional PUT must be refused rather than clobbering their work.
@@ -268,7 +268,7 @@ async fn s3_uses_if_none_match_to_create_and_if_match_to_replace() {
         "format": 1, "version": 7, "state": {"config_text": "theirs"}
     }))
     .unwrap();
-    mock.force_put("caret/store.json", &stolen);
+    mock.force_put("rapid/store.json", &stolen);
 
     let stale = plane.load().await.unwrap();
     let older = router_store::Snapshot {
@@ -331,7 +331,7 @@ async fn s3_ignores_stale_and_foreign_objects_when_counting_the_fleet() {
     let key = mock
         .keys()
         .into_iter()
-        .find(|k| k.starts_with("caret/nodes/node-a."))
+        .find(|k| k.starts_with("rapid/nodes/node-a."))
         .expect("node-a has a heartbeat object");
     mock.age_object(&key, 60_000);
 

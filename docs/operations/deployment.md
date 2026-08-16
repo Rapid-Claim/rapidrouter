@@ -12,22 +12,22 @@
 ## Running
 
 ```bash
-caret-router                              # zero-config: :8080, env-var provider discovery,
-                                          #   data dir at /var/lib/caret-router (fallback ~/.caret-router)
-caret-router --config caret-router.toml   # seed (managed mode) or source of truth (file mode)
-caret-router check caret-router.toml      # validate only (CI)
-caret-router --watch                      # file mode: hot reload on change (else: SIGHUP)
-caret-router --join box1:9444 --cluster-token env.CARET_CLUSTER_TOKEN   # add this box to a cluster
-caret-router config export                # store → TOML on stdout
-caret-router secret set openai_key        # seal a store.* secret
+rapid-router                              # zero-config: :8080, env-var provider discovery,
+                                          #   data dir at /var/lib/rapid-router (fallback ~/.rapid-router)
+rapid-router --config rapid-router.toml   # seed (managed mode) or source of truth (file mode)
+rapid-router check rapid-router.toml      # validate only (CI)
+rapid-router --watch                      # file mode: hot reload on change (else: SIGHUP)
+rapid-router --join box1:9444 --cluster-token env.RAPID_CLUSTER_TOKEN   # add this box to a cluster
+rapid-router config export                # store → TOML on stdout
+rapid-router secret set openai_key        # seal a store.* secret
 ```
 
 ```bash
 docker run -p 8080:8080 \
-  -v caret-data:/var/lib/caret-router \
-  -v $PWD/caret-router.toml:/etc/caret-router.toml \
+  -v rapid-data:/var/lib/rapid-router \
+  -v $PWD/rapid-router.toml:/etc/rapid-router.toml \
   -e OPENAI_API_KEY -e ANTHROPIC_API_KEY \
-  ghcr.io/caret/caret-router --config /etc/caret-router.toml
+  ghcr.io/rapid/rapid-router --config /etc/rapid-router.toml
 ```
 
 The volume holds the embedded store and usage partitions; pure `file`-mode
@@ -49,7 +49,7 @@ replicas that ship usage to an external sink can run without it.
 - CPU-light by design: the gateway adds microseconds of compute per
   request; capacity is usually bounded by connection counts and provider
   latencies, not cores. Start with 2 vCPUs; scale on p99 overhead and
-  `caret_inflight`.
+  `rapid_inflight`.
 - Memory is flat and small: buffers scale with concurrent request bodies;
   per-key state is atomics. The soak rig
   ([benchmarking.md](benchmarking.md)) charts 24-hour RSS per release.

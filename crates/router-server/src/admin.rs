@@ -109,7 +109,7 @@ async fn create_session(
         .insert(token.clone(), expires_ms);
     let mut response = Json(json!({ "token": token, "expires_ms": expires_ms })).into_response();
     if let Ok(cookie) = format!(
-        "caret_session={}; Path=/admin/api; HttpOnly; SameSite=Strict; Max-Age={}",
+        "rapid_session={}; Path=/admin/api; HttpOnly; SameSite=Strict; Max-Age={}",
         token,
         config.console.session_ttl.as_secs(),
     )
@@ -138,7 +138,7 @@ async fn admin_auth(State(state): State<Arc<AppState>>, request: Request, next: 
             cookies
                 .split(';')
                 .map(str::trim)
-                .find_map(|value| value.strip_prefix("caret_session="))
+                .find_map(|value| value.strip_prefix("rapid_session="))
         });
     let valid_static = bearer.is_some_and(|token| {
         config

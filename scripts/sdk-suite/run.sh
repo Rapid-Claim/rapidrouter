@@ -42,7 +42,7 @@ keys = [{ name = "main", value = "sk-gem-suite" }]
 failure_threshold = 1000
 CFG
 
-./target/release/caret-router --config /tmp/sdk-gw.toml > /tmp/sdk-gw.log 2>&1 & GW=$!
+./target/release/rapid-router --config /tmp/sdk-gw.toml > /tmp/sdk-gw.log 2>&1 & GW=$!
 sleep 0.8
 
 "$PY" scripts/sdk-suite/openai_suite.py http://127.0.0.1:18091

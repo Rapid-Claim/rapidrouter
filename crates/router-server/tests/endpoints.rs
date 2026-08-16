@@ -57,7 +57,7 @@ async fn metrics_render_prometheus_text() {
         .unwrap();
     let text = String::from_utf8(body.to_vec()).unwrap();
     assert!(
-        text.contains("caret_build_info"),
+        text.contains("rapid_build_info"),
         "metrics output was: {text}"
     );
 }

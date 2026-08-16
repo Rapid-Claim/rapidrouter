@@ -223,7 +223,7 @@ async fn embedded_console_serves_spa_and_security_headers() {
             .unwrap();
         assert_eq!(response.status(), 200);
         assert!(response.headers().contains_key("content-security-policy"));
-        assert!(response.text().await.unwrap().contains("Caret Router"));
+        assert!(response.text().await.unwrap().contains("Rapid Router"));
     }
 }
 
@@ -295,7 +295,7 @@ async fn multipart_audio_upload_streams_through_without_gateway_collection() {
     )
     .unwrap();
     let app = build_router(AppState::new(config));
-    let boundary = "caret-phase7-boundary";
+    let boundary = "rapid-phase7-boundary";
     let prefix = Bytes::from(format!(
         "--{boundary}\r\nContent-Disposition: form-data; name=\"model\"\r\n\r\nopenai/whisper-1\r\n--{boundary}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"audio.wav\"\r\nContent-Type: audio/wav\r\n\r\n"
     ));

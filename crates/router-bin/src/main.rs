@@ -19,7 +19,7 @@ enum Mode {
 }
 
 #[derive(Parser)]
-#[command(name = "caret-router", version, about = "A fast LLM gateway")]
+#[command(name = "rapid-router", version, about = "A fast LLM gateway")]
 struct Cli {
     /// TOML or JSON config. In managed mode it seeds an empty store.
     #[arg(long, global = true)]
@@ -31,42 +31,42 @@ struct Cli {
 
     /// Where control-plane state lives: file, s3, or dynamodb. Every
     /// node pointed at the same one is a node of the same fleet.
-    #[arg(long, global = true, env = "CARET_STORE_BACKEND")]
+    #[arg(long, global = true, env = "RAPID_STORE_BACKEND")]
     store_backend: Option<String>,
 
     /// S3 bucket holding the control-plane document.
-    #[arg(long, global = true, env = "CARET_STORE_BUCKET")]
+    #[arg(long, global = true, env = "RAPID_STORE_BUCKET")]
     store_bucket: Option<String>,
 
     /// Key prefix within the bucket. Defaults to the bucket root.
-    #[arg(long, global = true, env = "CARET_STORE_PREFIX")]
+    #[arg(long, global = true, env = "RAPID_STORE_PREFIX")]
     store_prefix: Option<String>,
 
     /// DynamoDB table holding the control-plane document.
-    #[arg(long, global = true, env = "CARET_STORE_TABLE")]
+    #[arg(long, global = true, env = "RAPID_STORE_TABLE")]
     store_table: Option<String>,
 
     /// AWS region for the store. Defaults to the ambient AWS config.
-    #[arg(long, global = true, env = "CARET_STORE_REGION")]
+    #[arg(long, global = true, env = "RAPID_STORE_REGION")]
     store_region: Option<String>,
 
     /// Override the AWS endpoint, for local testing or a private gateway.
-    #[arg(long, global = true, env = "CARET_STORE_ENDPOINT")]
+    #[arg(long, global = true, env = "RAPID_STORE_ENDPOINT")]
     store_endpoint: Option<String>,
 
     /// Path to the control-plane document for the `file` backend.
     /// Defaults to `store.json` in the data dir; point several nodes at
     /// one path on a shared volume to run a fleet without AWS.
-    #[arg(long, global = true, env = "CARET_STORE_PATH")]
+    #[arg(long, global = true, env = "RAPID_STORE_PATH")]
     store_path: Option<PathBuf>,
 
     /// Override the port from the config. The control-plane document is
     /// shared, so this is how two nodes run on one host.
-    #[arg(long, global = true, env = "CARET_PORT")]
+    #[arg(long, global = true, env = "RAPID_PORT")]
     port: Option<u16>,
 
     /// Address this node advertises to the console's fleet list.
-    #[arg(long, global = true, env = "CARET_ADVERTISE_ADDR")]
+    #[arg(long, global = true, env = "RAPID_ADVERTISE_ADDR")]
     advertise: Option<String>,
 
     /// Managed mode permits console writes; file mode is read-only.
@@ -192,12 +192,12 @@ fn main() -> ExitCode {
 fn data_dir(cli: &Cli) -> PathBuf {
     cli.data_dir
         .clone()
-        .or_else(|| std::env::var_os("CARET_DATA_DIR").map(PathBuf::from))
+        .or_else(|| std::env::var_os("RAPID_DATA_DIR").map(PathBuf::from))
         .unwrap_or_else(|| {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join(".caret-router")
+                .join(".rapid-router")
         })
 }
 
@@ -477,7 +477,7 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
         KeyCommand::Ls => {
             let (state, _) = store.read();
             if state.virtual_keys.is_empty() {
-                println!("No virtual keys. Create one with `caret-router key create --name NAME`.");
+                println!("No virtual keys. Create one with `rapid-router key create --name NAME`.");
                 return ExitCode::SUCCESS;
             }
             println!(
@@ -688,7 +688,7 @@ fn advertise_addr(cli: &Cli, port: Option<u16>) -> String {
         return addr.clone();
     }
     let port = port.unwrap_or(8080);
-    let host = std::env::var("CARET_ADVERTISE_HOST")
+    let host = std::env::var("RAPID_ADVERTISE_HOST")
         .ok()
         .or_else(local_ipv4)
         .unwrap_or_else(|| "127.0.0.1".into());
@@ -788,7 +788,7 @@ fn run(cli: Cli) -> ExitCode {
             Ok(listener) => listener,
             Err(err) => return fail(format!("failed to bind {addr}: {err}")),
         };
-        tracing::info!(%addr, ?providers, mode = ?cli.mode, "caret-router listening");
+        tracing::info!(%addr, ?providers, mode = ?cli.mode, "rapid-router listening");
 
         if cli.mode == Mode::File {
             spawn_reload_tasks(state.clone(), cli.config.clone(), cli.watch, store.clone());

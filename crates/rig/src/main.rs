@@ -25,7 +25,7 @@ use serde_json::json;
 static ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
 #[derive(Parser)]
-#[command(name = "rig", about = "caret-router performance rig")]
+#[command(name = "rig", about = "rapid-router performance rig")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -113,7 +113,7 @@ fn body() -> serde_json::Value {
 }
 
 /// Open-loop run against one URL. Returns (round-trip µs, gateway
-/// self-reported x-caret-overhead-us) histograms; the second is empty
+/// self-reported x-rapid-overhead-us) histograms; the second is empty
 /// for direct runs.
 async fn run_fixed_rps(url: &str, rps: u64, secs: u64) -> (Histogram<u64>, Histogram<u64>) {
     let client = client();
@@ -140,7 +140,7 @@ async fn run_fixed_rps(url: &str, rps: u64, secs: u64) -> (Histogram<u64>, Histo
             let res = client.post(&url).json(&body()).send().await.unwrap();
             let internal = res
                 .headers()
-                .get("x-caret-overhead-us")
+                .get("x-rapid-overhead-us")
                 .and_then(|v| v.to_str().ok())
                 .and_then(|v| v.parse().ok());
             let _ = res.bytes().await.unwrap();
@@ -192,7 +192,7 @@ async fn cmd_overhead(rps: u64, secs: u64, assert_p50: Option<u64>, assert_p99: 
     let (gateway, internal) = run_fixed_rps(&bench.gateway_url, rps, secs).await;
     let (d50, d99) = print_comparison("sync completion round-trip", &direct, &gateway);
     println!(
-        "\ngateway-internal overhead (x-caret-overhead-us): p50 {}µs  p99 {}µs  p99.9 {}µs",
+        "\ngateway-internal overhead (x-rapid-overhead-us): p50 {}µs  p99 {}µs  p99.9 {}µs",
         internal.value_at_quantile(0.5),
         internal.value_at_quantile(0.99),
         internal.value_at_quantile(0.999),

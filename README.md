@@ -1,10 +1,10 @@
-# caret-router
+# rapid-router
 
 **One OpenAI-compatible API in front of every LLM provider — in Rust, with
 microseconds of added latency.**
 
 Point any OpenAI SDK at `http://localhost:8080/v1`, set
-`"model": "anthropic/claude-sonnet-4-5"`, and caret-router translates the
+`"model": "anthropic/claude-sonnet-4-5"`, and rapid-router translates the
 request into Anthropic's wire format, streams the response back as OpenAI
 chunks, load-balances across your keys, and fails over to a backup provider
 when one degrades — from a single static binary that carries its own
@@ -12,7 +12,7 @@ storage and web console.
 
 ```bash
 export OPENAI_API_KEY=sk-... ANTHROPIC_API_KEY=sk-ant-...
-caret-router                       # zero-config start on :8080
+rapid-router                       # zero-config start on :8080
 
 curl http://localhost:8080/v1/chat/completions \
   -H "Content-Type: application/json" \
@@ -55,7 +55,7 @@ immediately. No config file, no database, no sidecar.
 | Web console | Embedded SPA at `/console` — dashboards, config editing, keys, playground; no separate deployment |
 | Fleet mode | N stateless nodes, same binary, sharing one S3 bucket or DynamoDB table — and nothing else |
 | Subscription seats | Claude Code and Codex seats as provider keys, benched on the provider's own quota windows ([caveats](docs/components/agent-subscriptions.md)) |
-| Observability | Prometheus metrics, structured JSON logs, optional OTLP traces, `x-caret-overhead-us` receipt header |
+| Observability | Prometheus metrics, structured JSON logs, optional OTLP traces, `x-rapid-overhead-us` receipt header |
 
 ## Providers
 
@@ -112,7 +112,7 @@ with the metered API as its fallback:
 ```toml
 [providers.codex]
 type = "codex_subscription"
-keys = [{ name = "seat-1", value = "file:/etc/caret/codex/seat-1/auth.json" }]
+keys = [{ name = "seat-1", value = "file:/etc/rapid/codex/seat-1/auth.json" }]
 
 [fallbacks]
 "codex/gpt-5.5" = ["openai/gpt-4o"]      # overflow to the metered API
@@ -159,7 +159,7 @@ One box works with nothing else installed. N boxes share one external store
 hold no durable identity, and can be added or removed without coordination.
 
 ```bash
-caret-router --store s3 --s3-bucket my-caret-state --advertise $(hostname)
+rapid-router --store s3 --s3-bucket my-rapid-state --advertise $(hostname)
 ```
 
 See [docs/operations/fleet.md](docs/operations/fleet.md).
@@ -172,7 +172,7 @@ reproduce with `cargo bench` and `cargo run --release -p rig -- overhead`):
 
 | Measure | p50 | p99 |
 |---|---|---|
-| Gateway-internal overhead (`x-caret-overhead-us`) | 6 µs | 24 µs |
+| Gateway-internal overhead (`x-rapid-overhead-us`) | 6 µs | 24 µs |
 | Route resolve / key admission | 42 ns / 39 ns | — |
 | Anthropic request translation (tool conversation) | 2.9 µs | — |
 
@@ -184,7 +184,7 @@ methodology.
 ## Build from source
 
 ```bash
-cargo build --release          # binary at target/release/caret-router
+cargo build --release          # binary at target/release/rapid-router
 cargo test --workspace
 cargo bench                    # criterion micro benchmarks
 cargo run --release -p rig -- overhead --rps 1000 --secs 8
@@ -199,10 +199,10 @@ cd console && npm install && npm run build
 Useful CLI:
 
 ```bash
-caret-router check config.toml     # validate and exit
-caret-router key create --name ci  # issue a virtual key (printed once)
-caret-router fleet                 # which nodes are serving this store
-caret-router master-key            # generate the fleet secret-sealing key
+rapid-router check config.toml     # validate and exit
+rapid-router key create --name ci  # issue a virtual key (printed once)
+rapid-router fleet                 # which nodes are serving this store
+rapid-router master-key            # generate the fleet secret-sealing key
 ```
 
 ## Documentation

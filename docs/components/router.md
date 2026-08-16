@@ -72,7 +72,7 @@ Order of attempts: remaining keys of the current provider, then each
 fallback target in order — including cross-dialect targets, where the
 adapter layer re-translates the request transparently. Only safe failures
 advance the chain: connect errors, 429s, and 5xx *before any response byte*.
-Served-by is always disclosed via `x-caret-provider` / `x-caret-model`.
+Served-by is always disclosed via `x-rapid-provider` / `x-rapid-model`.
 
 ## Backpressure
 

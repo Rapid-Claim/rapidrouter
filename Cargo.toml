@@ -14,7 +14,7 @@ members = [
 version = "0.1.0"
 edition = "2024"
 license = "Apache-2.0"
-repository = "https://github.com/ashutoshxhq/caret-router"
+repository = "https://github.com/ashutoshxkd/rapidrouter"
 
 [workspace.dependencies]
 router-core = { path = "crates/router-core" }

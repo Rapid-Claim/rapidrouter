@@ -5,7 +5,7 @@ import solid from "vite-plugin-solid";
 // dev server has no gateway in it: the admin API, the proxy endpoints and
 // the SSE event stream all belong to the running binary, and without this
 // the console loads and then fails every request it makes.
-const GATEWAY = process.env.CARET_GATEWAY ?? "http://127.0.0.1:8080";
+const GATEWAY = process.env.RAPID_GATEWAY ?? "http://127.0.0.1:8080";
 
 export default defineConfig({
   base: "/console/",

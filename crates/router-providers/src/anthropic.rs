@@ -10,7 +10,7 @@ use serde_json::{Map, Value, json};
 pub const VERSION_HEADER: &str = "2023-06-01";
 const DEFAULT_MAX_TOKENS: u64 = 4096;
 /// The tool name used to emulate `response_format: json_schema`.
-const JSON_SCHEMA_TOOL: &str = "__caret_json_output";
+const JSON_SCHEMA_TOOL: &str = "__rapid_json_output";
 
 // ---------------------------------------------------------------------------
 // internal -> Anthropic request

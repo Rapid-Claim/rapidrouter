@@ -349,7 +349,7 @@ fn prometheus_handle() -> &'static PrometheusHandle {
         let handle = PrometheusBuilder::new()
             .install_recorder()
             .expect("no other metrics recorder may be installed");
-        metrics::gauge!("caret_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
+        metrics::gauge!("rapid_build_info", "version" => env!("CARGO_PKG_VERSION")).set(1.0);
         handle
     })
 }
@@ -666,7 +666,7 @@ async fn gateway_auth(
             match state.vkeys.load().verify(token, vkey::unix_now_ms()) {
                 Ok(rt) => ctx.0 = Some(rt),
                 Err(reason) => {
-                    metrics::counter!("caret_vkey_rejects_total", "reason" => format!("{reason:?}"))
+                    metrics::counter!("rapid_vkey_rejects_total", "reason" => format!("{reason:?}"))
                         .increment(1);
                     return proxy::error_response(&GatewayError::new(
                         ErrorClass::Authentication,

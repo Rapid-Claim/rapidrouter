@@ -2,7 +2,7 @@
 
 Agents are the heaviest, most dialect-sensitive LLM clients you run —
 streaming tool use, parallel calls, prompt caching, very long sessions.
-Routing them through caret-router gives you provider failover, key
+Routing them through rapid-router gives you provider failover, key
 management, spend metering, and model swapping without touching the agent.
 Each client below is a scripted scenario in our CI
 ([../api/02-dialects.md](../api/02-dialects.md)).
@@ -53,6 +53,6 @@ best with aliases that shadow the expected names.
 - **Failover mid-outage**: fallback chains keep agents working through a
   provider incident.
 - **Spend visibility per agent**: give each machine its own gateway key and
-  read `caret_cost_usd_total` per key.
-- **Latency receipts**: `x-caret-overhead-us` proves the gateway isn't your
+  read `rapid_cost_usd_total` per key.
+- **Latency receipts**: `x-rapid-overhead-us` proves the gateway isn't your
   bottleneck.

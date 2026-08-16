@@ -79,7 +79,7 @@ export type UsageRecord = {
   latency_ms: number;
 };
 
-const TOKEN_KEY = "caret-admin-session";
+const TOKEN_KEY = "rapid-admin-session";
 
 export function sessionToken(): string {
   return sessionStorage.getItem(TOKEN_KEY) ?? "";

@@ -39,7 +39,7 @@ test("settings lives in the nav footer and exports the config", async ({ page })
   await expect(page.getByRole("heading", { name: "Usage retention" })).toBeVisible();
   const download = page.waitForEvent("download");
   await page.getByRole("button", { name: "Export TOML" }).click();
-  expect((await download).suggestedFilename()).toBe("caret-router.toml");
+  expect((await download).suggestedFilename()).toBe("rapid-router.toml");
 });
 
 test("keyboard shortcuts jump between pages and focus the filter", async ({ page }) => {

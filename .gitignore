@@ -11,4 +11,4 @@ console/playwright-report/
 console/tsconfig.tsbuildinfo
 
 # Local gateway state from `make run`
-/.caret-data
+/.rapid-data

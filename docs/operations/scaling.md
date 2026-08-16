@@ -10,7 +10,7 @@ is never the gateway, only the load balancer and the process manager.
 ## The shape
 
 ```
-clients ──► your LB / DNS ──► N × caret-router :8080 ──► providers
+clients ──► your LB / DNS ──► N × rapid-router :8080 ──► providers
                                     │ :9444 (cluster, optional)
                                     └── data-dir per node
 ```
@@ -44,14 +44,14 @@ Both are first-class; they differ only in where config truth lives.
 Scale on **load, not CPU** — an IO-bound proxy saturates connections while
 CPU idles:
 
-- Primary: requests-per-instance (LB metric) or `caret_inflight` per node.
-- Guardrail: p99 `caret_gateway_overhead_seconds` — the right instance
+- Primary: requests-per-instance (LB metric) or `rapid_inflight` per node.
+- Guardrail: p99 `rapid_gateway_overhead_seconds` — the right instance
   count is whatever keeps that histogram flat.
 - Sizing: instances are small (0.5 vCPU / 512 MB holds thousands of RPS);
   prefer more small instances over few large ones. Scale out fast, in
   slow — LLM traffic is bursty and instances are cheap.
 - The ceiling you'll actually hit first is **provider rate limits**, not
-  gateway capacity — watch `caret_key_state` and 429 rates as you grow.
+  gateway capacity — watch `rapid_key_state` and 429 rates as you grow.
 
 Scale-in semantics: SIGTERM → `/health` flips to draining → in-flight
 requests and streams finish within `drain_timeout_secs` → exit. Give your

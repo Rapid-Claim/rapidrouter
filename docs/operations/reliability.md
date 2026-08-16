@@ -21,13 +21,13 @@ upstream work immediately.
 1. Failures (connect/timeout/5xx/429) count against the specific key.
 2. Key breaker opens after 5 qualifying failures in 30 s → traffic shifts
    to remaining keys (weights renormalized by masking).
-3. All keys open → fallback chain serves; `caret_fallbacks_total{from,to}`
-   and `x-caret-provider` disclose it.
+3. All keys open → fallback chain serves; `rapid_fallbacks_total{from,to}`
+   and `x-rapid-provider` disclose it.
 4. Nothing healthy → fast `503` with `retry-after`, never a hang.
 5. Cooldown (15 s) → half-open probe → recovery is automatic and gradual.
 
-Watch: `caret_key_state`, `caret_fallbacks_total`, `caret_retries_total`,
-`caret_upstream_duration_seconds`.
+Watch: `rapid_key_state`, `rapid_fallbacks_total`, `rapid_retries_total`,
+`rapid_upstream_duration_seconds`.
 
 ## Retry policy (gateway-side)
 

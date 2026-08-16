@@ -47,7 +47,7 @@ upstream body stream (Bytes chunks, arbitrary boundaries)
 
 - **Before the first byte** reaches the client, normal retry/fallback rules
   apply — the client never knows a fallback happened except via the
-  `x-caret-provider` header.
+  `x-rapid-provider` header.
 - **After the first byte**, the gateway never fails over mid-stream (the
   conversation state would be corrupt); errors surface as the dialect's
   terminal error event, then the stream closes cleanly.

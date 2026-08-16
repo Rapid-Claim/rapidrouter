@@ -1,8 +1,8 @@
 # Request Lifecycle
 
 The life of `POST /v1/chat/completions`, stage by stage. "Gateway overhead"
-means everything caret-router adds on top of the provider's own time; it is
-measured per-request and reported in the `x-caret-overhead-us` response
+means everything rapid-router adds on top of the provider's own time; it is
+measured per-request and reported in the `x-rapid-overhead-us` response
 header.
 
 ## Stages
@@ -57,8 +57,8 @@ Streaming: per-event translation as frames arrive
 forward raw frames.
 
 ### ⑧ Respond
-Write status, headers (`x-request-id`, `x-caret-provider`, `x-caret-model`,
-`x-caret-overhead-us`), body or stream. Record histograms, release the
+Write status, headers (`x-request-id`, `x-rapid-provider`, `x-rapid-model`,
+`x-rapid-overhead-us`), body or stream. Record histograms, release the
 permit, update breaker state, run `Hook::post`.
 
 ## Latency budgets (p50, enforced by CI benches)

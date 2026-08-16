@@ -81,7 +81,7 @@ from the last document they read until it returns.
 
 Secrets are sealed with XChaCha20-Poly1305 before they reach the store,
 so the bucket or table holds only ciphertext. The key is fleet-wide and
-supplied out of band as `CARET_MASTER_KEY`; a node pointed at a shared
+supplied out of band as `RAPID_MASTER_KEY`; a node pointed at a shared
 store without one refuses to start, because sealing under a key no other
 node holds fails silently and presents as a bad API key.
 
@@ -100,7 +100,7 @@ immediately. That is the entirety of membership — see
 | `managed` (default) | the replicated store; an optional config file acts as **first-boot seed** | read-write | "run the binary, configure in the browser, it persists and replicates" |
 | `file` | the config file, hot-reloaded; store not used for config | read-only | GitOps / immutable infra — your deploy tool distributes the file to every node |
 
-`caret-router config export` writes the managed store's current document
+`rapid-router config export` writes the managed store's current document
 out as a TOML file at any time — migration between modes (and disaster
 recovery) is a file copy, never a lock-in.
 
@@ -112,7 +112,7 @@ Both reference forms work everywhere, including mixed:
   Best when a platform (ECS, Kubernetes, systemd credentials) injects
   secrets; the gateway never stores anything.
 - **`store.openai_key`** — the value was entered once via console or
-  `caret-router secret set openai_key`, is encrypted with
+  `rapid-router secret set openai_key`, is encrypted with
   XChaCha20-Poly1305 under a data-encryption key generated at first boot
   (`data-dir/node.key`, mode 0600), and replicates as ciphertext.
   Decrypted only in memory, into the same `SecretString` type as env
@@ -157,7 +157,7 @@ database"; deployments that can't accept it configure the sink.
 ## On disk
 
 ```
-/var/lib/caret-router/
+/var/lib/rapid-router/
 ├── node.key            # DEK + node identity (0600)
 ├── raft/               # WAL + snapshots (the replicated store)
 └── usage/dt=2026-08-15/*.jsonl.zst

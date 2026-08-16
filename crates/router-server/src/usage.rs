@@ -427,7 +427,7 @@ impl UsagePipeline {
             let retention_days = cfg.retention_days;
             let node = node_id.to_owned();
             std::thread::Builder::new()
-                .name("caret-usage-flush".into())
+                .name("rapid-usage-flush".into())
                 .spawn(move || flusher(dir, rx, flush_interval, retention_days, node))
                 .expect("spawn usage flusher");
             tx
@@ -452,8 +452,8 @@ impl UsagePipeline {
             }
             recent.push_back(rec.clone());
         }
-        metrics::counter!("caret_tokens_total", "kind" => "input").increment(rec.input_tokens);
-        metrics::counter!("caret_tokens_total", "kind" => "output").increment(rec.output_tokens);
+        metrics::counter!("rapid_tokens_total", "kind" => "input").increment(rec.input_tokens);
+        metrics::counter!("rapid_tokens_total", "kind" => "output").increment(rec.output_tokens);
         if self.per_key_metrics
             && let Some(vk) = &rec.vkey
         {
@@ -468,7 +468,7 @@ impl UsagePipeline {
                     .len()
             };
             if distinct <= self.key_label_cap {
-                metrics::counter!("caret_tokens_total", "kind" => "total", "vkey" => vk.clone())
+                metrics::counter!("rapid_tokens_total", "kind" => "total", "vkey" => vk.clone())
                     .increment(rec.input_tokens + rec.output_tokens);
             }
         }
@@ -477,7 +477,7 @@ impl UsagePipeline {
             && tx.try_send(rec).is_err()
         {
             self.dropped.fetch_add(1, Ordering::Relaxed);
-            metrics::counter!("caret_usage_dropped_total").increment(1);
+            metrics::counter!("rapid_usage_dropped_total").increment(1);
         }
     }
 

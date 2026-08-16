@@ -1,7 +1,7 @@
 # Virtual Keys
 
 Virtual keys are the gateway's own credentials: you hand applications,
-teams, and machines a **caret key** instead of a provider key. Each key
+teams, and machines a **rapid key** instead of a provider key. Each key
 carries its own scope, budget, and rate limits; provider credentials never
 leave the gateway. Rotating a provider key touches one config entry, not a
 hundred deployments — and revoking an app's access is one click, not a
@@ -76,19 +76,19 @@ Every usage record and request log line carries the key id (never the
 secret). The console's per-key views — spend against budget, tokens, error
 rates, model mix — and `/admin/api/keys/{id}/usage` are aggregations of
 those records. Metrics expose bounded per-key counters
-(`caret_tokens_total{vkey=…}`) only when `metrics.per_key = true` and the
+(`rapid_tokens_total{vkey=…}`) only when `metrics.per_key = true` and the
 key count is under a configured cardinality cap.
 
 ## Lifecycle
 
 ```bash
-caret-router key create --name checkout-service \
+rapid-router key create --name checkout-service \
   --models openai/gpt-4o-mini,fast --budget-usd 250/monthly --rpm 600
 # → prints the full key once
 
-caret-router key ls | rotate <id> | disable <id> | enable <id> | rm <id>
+rapid-router key ls | rotate <id> | disable <id> | enable <id> | rm <id>
 
-caret-router key hash            # a secret_hash for a file-mode entry
+rapid-router key hash            # a secret_hash for a file-mode entry
 ```
 
 - **Rotate** issues a new secret for the same id/attributes with an overlap

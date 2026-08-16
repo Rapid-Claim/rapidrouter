@@ -1,6 +1,6 @@
 # The JSON Engine
 
-JSON handling is where gateway latency lives or dies, so caret-router treats
+JSON handling is where gateway latency lives or dies, so rapid-router treats
 it as a tiered engine: the common case does the least possible work, and
 every shortcut is fuzz-proven equivalent to the straightforward path.
 

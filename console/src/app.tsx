@@ -171,9 +171,9 @@ export function App() {
     <Show when={authenticated()} fallback={<Login onSuccess={() => setAuthenticated(true)} />}>
     <div class="app-shell">
       <aside class="sidebar">
-        <a class="brand" href="#usage" aria-label="Caret Router usage">
+        <a class="brand" href="#usage" aria-label="Rapid Router usage">
           <span class="brand-mark"><Boxes size={18} /></span>
-          <span><strong>Caret</strong><small>Router</small></span>
+          <span><strong>Rapid</strong><small>Router</small></span>
         </a>
         <nav aria-label="Main navigation">
           <For each={navigation}>{(item) => (
@@ -233,7 +233,7 @@ function Login(props: { onSuccess: () => void }) {
       finally { setPending(false); }
     }}>
       <span class="brand-mark large"><Boxes size={22} /></span>
-      <div><p class="eyebrow">Caret Router</p><h1>Operator sign in</h1><p class="muted">Use the admin key configured on this gateway.</p></div>
+      <div><p class="eyebrow">Rapid Router</p><h1>Operator sign in</h1><p class="muted">Use the admin key configured on this gateway.</p></div>
       <label>Admin key<input autofocus type="password" autocomplete="current-password" value={key()} onInput={(e) => setKey(e.currentTarget.value)} /></label>
       <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
       <button class="button primary" disabled={pending() || !key()}>{pending() ? "Signing in…" : "Sign in"}<ChevronRight size={16} /></button>
@@ -388,7 +388,7 @@ function Routing(props: { refresh: () => number }) {
     </div>
     <Show when={config()?.read_only}><div class="notice">File mode is read-only. Edit the source file and reload the gateway.</div></Show>
     <Show when={message()}><p class="success-message" role="status">{message()}</p></Show><Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
-    <label class="code-editor"><span>caret-router.toml</span><textarea spellcheck={false} value={text()} onInput={(e) => setText(e.currentTarget.value)} readOnly={config()?.read_only} /></label>
+    <label class="code-editor"><span>rapid-router.toml</span><textarea spellcheck={false} value={text()} onInput={(e) => setText(e.currentTarget.value)} readOnly={config()?.read_only} /></label>
   </section>;
 }
 
@@ -662,7 +662,7 @@ function Playground() {
   const [model, setModel] = createSignal("openai/gpt-4.1-mini"); const [key, setKey] = createSignal(""); const [prompt, setPrompt] = createSignal("Reply with one short sentence."); const [output, setOutput] = createSignal(""); const [meta, setMeta] = createSignal(""); const [pending, setPending] = createSignal(false);
   return <div class="playground"><section class="playground-input"><h2>Test a route</h2><label>Model<input value={model()} onInput={(e) => setModel(e.currentTarget.value)} /></label><label>Virtual key<input type="password" value={key()} onInput={(e) => setKey(e.currentTarget.value)} /></label><label>Prompt<textarea value={prompt()} onInput={(e) => setPrompt(e.currentTarget.value)} /></label><button class="button primary" disabled={pending() || !key()} onClick={async () => {
     setPending(true); setOutput(""); setMeta(""); const started = performance.now();
-    try { const response = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key()}` }, body: JSON.stringify({ model: model(), messages: [{ role: "user", content: prompt() }] }) }); const body = await response.json(); if (!response.ok) throw new Error(body?.error?.message ?? `HTTP ${response.status}`); setOutput(body.choices?.[0]?.message?.content ?? JSON.stringify(body, null, 2)); setMeta(`${Math.round(performance.now() - started)} ms · ${response.headers.get("x-caret-provider") ?? "provider"} · ${response.headers.get("x-caret-overhead-us") ?? "0"} µs gateway`); }
+    try { const response = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key()}` }, body: JSON.stringify({ model: model(), messages: [{ role: "user", content: prompt() }] }) }); const body = await response.json(); if (!response.ok) throw new Error(body?.error?.message ?? `HTTP ${response.status}`); setOutput(body.choices?.[0]?.message?.content ?? JSON.stringify(body, null, 2)); setMeta(`${Math.round(performance.now() - started)} ms · ${response.headers.get("x-rapid-provider") ?? "provider"} · ${response.headers.get("x-rapid-overhead-us") ?? "0"} µs gateway`); }
     catch (err) { setOutput(err instanceof Error ? err.message : "Request failed"); }
     finally { setPending(false); }
   }}><Play size={16} />{pending() ? "Running…" : "Run"}</button></section><section class="playground-output" aria-live="polite"><div><p class="eyebrow">Response</p><span>{meta()}</span></div><pre>{output() || "The model response will appear here."}</pre></section></div>;
@@ -737,10 +737,10 @@ function Fleet(props: { refresh: () => number }) {
 function Settings(props: { refresh: () => number }) {
   const [config] = createResource(props.refresh, api.config);
   const [fleet] = createResource(props.refresh, api.fleet);
-  const [theme, setTheme] = createSignal(localStorage.getItem("caret-theme") ?? "system");
+  const [theme, setTheme] = createSignal(localStorage.getItem("rapid-theme") ?? "system");
   createEffect(() => {
     const choice = theme();
-    localStorage.setItem("caret-theme", choice);
+    localStorage.setItem("rapid-theme", choice);
     document.documentElement.dataset.theme = choice === "system" ? "" : choice;
   });
   const setting = (name: string) => {
@@ -752,7 +752,7 @@ function Settings(props: { refresh: () => number }) {
     const url = URL.createObjectURL(blob);
     const anchor = document.createElement("a");
     anchor.href = url;
-    anchor.download = "caret-router.toml";
+    anchor.download = "rapid-router.toml";
     anchor.click();
     URL.revokeObjectURL(url);
   };
