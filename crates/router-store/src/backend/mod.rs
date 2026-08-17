@@ -86,6 +86,9 @@ pub enum ControlPlaneError {
     /// Misconfiguration or corruption — a human has to fix it.
     #[error("control-plane store fault: {0}")]
     Fault(String),
+    /// The backend does not offer this capability.
+    #[error("{0}")]
+    Unsupported(String),
 }
 
 impl ControlPlaneError {
@@ -134,6 +137,35 @@ pub trait ControlPlane: Send + Sync + 'static {
     /// the liveness window.
     async fn depart(&self, _id: &str) -> Result<(), ControlPlaneError> {
         Ok(())
+    }
+
+    /// Store an opaque object beside the control-plane document.
+    ///
+    /// Usage history is shipped through here rather than through a second
+    /// client: the backend already holds credentials, endpoint and TLS
+    /// configuration that an operator got working once, and a separate
+    /// path would be a separate thing to configure and a separate thing
+    /// to break. Backends with nowhere to put objects say so, and the
+    /// caller keeps history local.
+    async fn put_blob(&self, _key: &str, _body: Vec<u8>) -> Result<(), ControlPlaneError> {
+        Err(ControlPlaneError::Unsupported(
+            "this store cannot hold usage objects".into(),
+        ))
+    }
+
+    /// List object keys under `prefix`.
+    async fn list_blobs(&self, _prefix: &str) -> Result<Vec<String>, ControlPlaneError> {
+        Ok(Vec::new())
+    }
+
+    /// Read one object back.
+    async fn get_blob(&self, _key: &str) -> Result<Option<Vec<u8>>, ControlPlaneError> {
+        Ok(None)
+    }
+
+    /// Whether this backend can hold usage objects at all.
+    fn holds_blobs(&self) -> bool {
+        false
     }
 }
 

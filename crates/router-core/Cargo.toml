@@ -19,6 +19,7 @@ thiserror = { workspace = true }
 toml = { workspace = true }
 zeroize = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
+argon2 = "0.5.3"
 
 [dev-dependencies]
 criterion = { workspace = true }

@@ -154,12 +154,19 @@ pub struct RawUsage {
     pub flush_interval_secs: u64,
     /// Emit bounded per-key metrics labels (`vkey=…`).
     pub per_key_metrics: bool,
+    /// `"off"`, `"errors"` or `"all"`.
+    pub capture_bodies: String,
+    pub body_limit_bytes: usize,
+    pub body_retention_days: u32,
 }
 
 impl Default for RawUsage {
     fn default() -> Self {
         Self {
             retention_days: 30,
+            capture_bodies: "all".into(),
+            body_limit_bytes: 256 * 1024,
+            body_retention_days: 30,
             flush_interval_secs: 10,
             per_key_metrics: false,
         }

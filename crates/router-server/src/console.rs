@@ -13,6 +13,12 @@ pub async fn root() -> Response {
     asset(None).await
 }
 
+/// Browsers request the icon at the domain root on their own, and a page
+/// visited at `/console` (no slash) resolves relative links there too.
+pub async fn favicon() -> Response {
+    asset(Some(Path("favicon.svg".to_owned()))).await
+}
+
 pub async fn asset(path: Option<Path<String>>) -> Response {
     let requested = path.map(|Path(path)| path).unwrap_or_default();
     let name = if requested.is_empty() {

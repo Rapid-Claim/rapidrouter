@@ -19,8 +19,8 @@ PORT    ?=
 # remembers the last config it was given, so a shared data dir means
 # `make run` silently inherits state from whatever you ran days ago.
 # Keeping it in-tree (and gitignored) makes a dev run reproducible and
-# leaves ~/.rapid-router — a real deployment's state — untouched.
-DATA_DIR ?= .rapid-data
+# leaves ~/.rapidrouter — a real deployment's state — untouched.
+DATA_DIR ?= .rapidrouter
 # The dev gateway's config, generated on first use with a random admin
 # key. It lives in DATA_DIR so it is gitignored and `make reset` clears
 # it — a checked-in admin key is a credential in the repo.
@@ -87,10 +87,9 @@ dev-config: ## Create the dev config with a fresh admin key, if absent
 	    '[console]' \
 	    "admin_keys = [\"$$key\"]" \
 	    '' \
-	    '# Providers discovered from .env are NOT picked up once a config' \
-	    '# file exists — add them here instead.' \
-	    '[providers.ollama]' \
-	    'auth = "none"' > $(DEV_CONFIG); \
+	    '# No providers yet — add them from the console (Providers -> Add' \
+	    '# provider), or list them here. Note that once this file exists,' \
+	    '# zero-config discovery from .env no longer applies.' > $(DEV_CONFIG); \
 	  echo "created $(DEV_CONFIG)"; \
 	}
 

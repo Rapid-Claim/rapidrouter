@@ -166,6 +166,63 @@ pub struct UsageConfig {
     pub retention_days: u32,
     pub flush_interval: Duration,
     pub per_key_metrics: bool,
+    /// Whether request and response bodies are kept for inspection.
+    ///
+    /// On by default: being able to open a request and read what was
+    /// actually sent is the difference between a usage log and a
+    /// debugging tool. Two things follow from that and are handled
+    /// rather than assumed away — bodies are two orders of magnitude
+    /// larger than the metadata, so they are written to their own stream
+    /// and never touched by a log listing; and they contain whatever
+    /// callers send, so anyone routing regulated data should know these
+    /// are stored.
+    pub capture_bodies: BodyCapture,
+    /// Bytes kept per body. Longer ones are truncated with a marker
+    /// rather than dropped: the head of a prompt identifies the request,
+    /// and one pathological caller should not be able to fill the disk.
+    pub body_limit_bytes: usize,
+    /// How long captured bodies live. Defaults to the same window as the
+    /// metadata they belong to, so a request that appears in the log can
+    /// always be opened.
+    pub body_retention_days: u32,
+}
+
+/// Which requests keep their bodies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum BodyCapture {
+    Off,
+    /// Only requests that failed — the debugging case, at a fraction of
+    /// the volume and usually without a successful answer to store.
+    Errors,
+    #[default]
+    All,
+}
+
+impl BodyCapture {
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "off" | "none" | "false" => Some(Self::Off),
+            "errors" => Some(Self::Errors),
+            "all" | "true" => Some(Self::All),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Off => "off",
+            Self::Errors => "errors",
+            Self::All => "all",
+        }
+    }
+
+    pub fn wants(self, status: u16) -> bool {
+        match self {
+            Self::Off => false,
+            Self::Errors => status >= 400,
+            Self::All => true,
+        }
+    }
 }
 
 impl Default for UsageConfig {
@@ -174,6 +231,9 @@ impl Default for UsageConfig {
             retention_days: 30,
             flush_interval: Duration::from_secs(10),
             per_key_metrics: false,
+            capture_bodies: BodyCapture::All,
+            body_limit_bytes: 256 * 1024,
+            body_retention_days: 30,
         }
     }
 }

@@ -14,9 +14,7 @@ printf '%s\n' \
   '' \
   '[console]' \
   'admin_keys = ["admin-e2e-key"]' \
-  '' \
-  '[providers.ollama]' \
-  'auth = "none"' > "$CONFIG"
+  '' > "$CONFIG"
 cd "$ROOT"
 cargo run --quiet -p router-bin -- --data-dir "$DATA" config import "$CONFIG"
 exec cargo run --quiet -p router-bin -- --data-dir "$DATA"

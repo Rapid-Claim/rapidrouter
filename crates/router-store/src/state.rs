@@ -24,6 +24,12 @@ pub struct StoreState {
     /// Console/admin settings (retention, appearance, …).
     #[serde(default)]
     pub settings: BTreeMap<String, String>,
+    /// Console users (password hashes only, never passwords).
+    #[serde(default)]
+    pub users: BTreeMap<String, router_core::access::UserDef>,
+    /// Teams: membership, model scope, and access level.
+    #[serde(default)]
+    pub teams: BTreeMap<String, router_core::access::TeamDef>,
 }
 
 /// A log entry. Applying is infallible and deterministic — all validation
@@ -39,6 +45,10 @@ pub enum Command {
     DeleteSecret { name: String },
     PutSetting { name: String, value: String },
     DeleteSetting { name: String },
+    PutUser { def: router_core::access::UserDef },
+    DeleteUser { id: String },
+    PutTeam { def: router_core::access::TeamDef },
+    DeleteTeam { id: String },
 }
 
 impl StoreState {
@@ -62,6 +72,23 @@ impl StoreState {
             }
             Command::DeleteSetting { name } => {
                 self.settings.remove(name);
+            }
+            Command::PutUser { def } => {
+                self.users.insert(def.id.clone(), def.clone());
+            }
+            Command::DeleteUser { id } => {
+                self.users.remove(id);
+                // Membership references the id; a deleted user must not
+                // linger as a ghost member that a rename could resurrect.
+                for team in self.teams.values_mut() {
+                    team.members.remove(id);
+                }
+            }
+            Command::PutTeam { def } => {
+                self.teams.insert(def.id.clone(), def.clone());
+            }
+            Command::DeleteTeam { id } => {
+                self.teams.remove(id);
             }
         }
     }

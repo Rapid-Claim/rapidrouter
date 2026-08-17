@@ -13,7 +13,7 @@
 
 ```bash
 rapid-router                              # zero-config: :8080, env-var provider discovery,
-                                          #   data dir at /var/lib/rapid-router (fallback ~/.rapid-router)
+                                          #   data dir at /var/lib/rapid-router (fallback ~/.rapidrouter)
 rapid-router --config rapid-router.toml   # seed (managed mode) or source of truth (file mode)
 rapid-router check rapid-router.toml      # validate only (CI)
 rapid-router --watch                      # file mode: hot reload on change (else: SIGHUP)

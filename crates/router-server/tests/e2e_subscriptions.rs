@@ -449,3 +449,50 @@ async fn a_codex_seat_is_benched_from_headers_alone() {
 async fn a_claude_seat_is_benched_for_the_reported_window() {
     seat_is_benched_after_a_429("claude-max/quota-claude").await;
 }
+
+/// A streaming Responses request reaches a Codex seat verbatim.
+///
+/// The Codex backend *is* the Responses API, so the surface must not be
+/// forced through the stateless chat core on the way: that round trip
+/// rejected every input item the core does not model — `additional_tools`
+/// among them — turning a request the backend understands perfectly into
+/// a 400 from us. Relaying keeps unknown-to-us-but-known-to-them items
+/// intact, which is the only way this stays compatible as OpenAI adds to
+/// the surface.
+#[tokio::test]
+async fn codex_relays_the_responses_surface_verbatim() {
+    let (url, mock, _dir) = gateway().await;
+    let res = reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&json!({
+            "model": "codex/gpt-5.5",
+            "stream": true,
+            "instructions": "You are Codex.",
+            "input": [
+                { "type": "message", "role": "user",
+                  "content": [{ "type": "input_text", "text": "hi" }] },
+                { "type": "additional_tools", "tools": ["web_search"] }
+            ]
+        }))
+        .send()
+        .await
+        .unwrap();
+    let status = res.status();
+    let text = res.text().await.unwrap();
+    assert_eq!(status, 200, "{text}");
+
+    let request = mock.last_request();
+    assert_eq!(request.path, "/backend-api/codex/responses");
+    let sent = &request.body;
+    let items = sent["input"].as_array().expect("input relayed as sent");
+    assert!(
+        items.iter().any(|i| i["type"] == "additional_tools"),
+        "an input item the chat core cannot model must still reach the backend: {sent}",
+    );
+    assert_eq!(
+        sent["model"], "gpt-5.5",
+        "the routed model replaces the alias"
+    );
+    assert_eq!(sent["stream"], true, "the backend speaks only SSE");
+    assert_eq!(sent["store"], false, "the backend keeps no state for us");
+}

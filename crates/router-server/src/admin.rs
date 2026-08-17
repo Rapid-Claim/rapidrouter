@@ -26,7 +26,36 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/keys/{id}/rotate", post(rotate_key))
         .route("/usage", get(usage))
         .route("/requests", get(requests))
-        .route("/providers", get(providers))
+        .route("/requests/{id}/bodies", get(request_bodies))
+        .route("/providers", get(providers).post(create_provider))
+        .route(
+            "/providers/{name}",
+            put(update_provider).delete(delete_provider),
+        )
+        .route("/providers/{name}/keys", post(add_provider_key))
+        .route("/providers/{name}/keys/bulk", post(add_provider_keys))
+        .route("/providers/{name}/probe", post(probe_provider))
+        .route("/providers/{name}/models", post(add_model))
+        .route(
+            "/providers/{name}/models/{model}",
+            axum::routing::delete(delete_model),
+        )
+        .route(
+            "/providers/{name}/keys/{key}",
+            axum::routing::delete(delete_provider_key),
+        )
+        .route("/catalog", get(catalog))
+        .route("/pricing/refresh", post(refresh_pricing))
+        .route("/secrets", post(put_secret))
+        .route("/credential-files", post(put_credential_file))
+        .route("/credential-files/bulk", post(put_credential_files))
+        .route("/users", get(list_users).post(create_user))
+        .route("/users/{id}", put(update_user).delete(delete_user))
+        .route("/teams", get(list_teams).post(put_team))
+        .route("/teams/{id}", put(put_team_by_id).delete(delete_team))
+        .route("/me", get(whoami))
+        .route("/routes", get(list_routes).post(put_route))
+        .route("/routes/{name}", axum::routing::delete(delete_route))
         .route("/history", get(history))
         .route("/fleet", get(fleet))
         .route("/events", get(events))
@@ -76,13 +105,21 @@ fn commit_error(err: ControlPlaneError) -> Response {
         ControlPlaneError::Conflict { .. } => StatusCode::CONFLICT,
         ControlPlaneError::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
         ControlPlaneError::Fault(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        // A capability this backend does not have is a configuration
+        // fact, not a transient failure.
+        ControlPlaneError::Unsupported(_) => StatusCode::CONFLICT,
     };
     api_error(status, err.to_string())
 }
 
 #[derive(Deserialize)]
 struct SessionRequest {
-    key: String,
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    email: Option<String>,
+    #[serde(default)]
+    password: Option<String>,
 }
 
 async fn create_session(
@@ -90,23 +127,52 @@ async fn create_session(
     Json(input): Json<SessionRequest>,
 ) -> Response {
     let config = state.config.load();
-    if !config.console.enabled()
-        || !config
-            .console
-            .admin_keys
-            .iter()
-            .any(|key| key.verify(&input.key))
-    {
-        return api_error(StatusCode::UNAUTHORIZED, "invalid admin key");
+    if !config.console.enabled() {
+        return api_error(StatusCode::UNAUTHORIZED, "console is disabled");
     }
+    let principal = match (&input.key, &input.email, &input.password) {
+        (Some(key), _, _) => {
+            if !config.console.admin_keys.iter().any(|k| k.verify(key)) {
+                return api_error(StatusCode::UNAUTHORIZED, "invalid admin key");
+            }
+            crate::Principal::AdminKey
+        }
+        (None, Some(email), Some(password)) => {
+            // The same answer for "no such user" and "wrong password":
+            // login errors must not confirm which emails exist.
+            let user = state.store_read().and_then(|(snapshot, _)| {
+                snapshot
+                    .users
+                    .values()
+                    .find(|u| u.email.eq_ignore_ascii_case(email))
+                    .cloned()
+            });
+            match user {
+                Some(user)
+                    if router_core::access::verify_password(password, &user.password_hash) =>
+                {
+                    crate::Principal::User { id: user.id }
+                }
+                _ => return api_error(StatusCode::UNAUTHORIZED, "invalid email or password"),
+            }
+        }
+        _ => {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                "send `key`, or `email` and `password`",
+            );
+        }
+    };
     let token = format!("cs_{}{}", uuid::Uuid::now_v7().simple(), fastrand::u64(..));
     let expires_ms =
         vkey::unix_now_ms() + config.console.session_ttl.as_millis().min(u64::MAX as u128) as u64;
-    state
-        .sessions
-        .lock()
-        .unwrap()
-        .insert(token.clone(), expires_ms);
+    state.sessions.lock().unwrap().insert(
+        token.clone(),
+        crate::Session {
+            expires_ms,
+            principal,
+        },
+    );
     let mut response = Json(json!({ "token": token, "expires_ms": expires_ms })).into_response();
     if let Ok(cookie) = format!(
         "rapid_session={}; Path=/admin/api; HttpOnly; SameSite=Strict; Max-Age={}",
@@ -148,15 +214,99 @@ async fn admin_auth(State(state): State<Arc<AppState>>, request: Request, next: 
             .any(|key| key.verify(token))
     });
     let now = vkey::unix_now_ms();
-    let valid_session = bearer.or(cookie).is_some_and(|token| {
-        let mut sessions = state.sessions.lock().unwrap();
-        sessions.retain(|_, expiry| *expiry >= now);
-        sessions.get(token).is_some_and(|expiry| *expiry >= now)
-    });
-    if !valid_static && !valid_session {
+    let principal = if valid_static {
+        Some(crate::Principal::AdminKey)
+    } else {
+        bearer.or(cookie).and_then(|token| {
+            let mut sessions = state.sessions.lock().unwrap();
+            sessions.retain(|_, session| session.expires_ms >= now);
+            sessions.get(token).map(|session| session.principal.clone())
+        })
+    };
+    let Some(principal) = principal else {
         return api_error(StatusCode::UNAUTHORIZED, "missing or invalid admin session");
+    };
+
+    let authz = resolve_authz(&state, &principal);
+    let method = request.method().clone();
+    let path = request.uri().path().to_owned();
+    if let Err(response) = enforce(&authz, &method, &path) {
+        return *response;
     }
+    let mut request = request;
+    request.extensions_mut().insert(authz);
     next.run(request).await
+}
+
+/// A resolved authorization: who this is and what they were granted.
+#[derive(Debug, Clone)]
+pub(crate) struct Authz {
+    pub user_id: Option<String>,
+    pub is_admin: bool,
+    pub grant: router_core::access::Grant,
+}
+
+fn resolve_authz(state: &AppState, principal: &crate::Principal) -> Authz {
+    use router_core::access::{Grant, UserRole};
+    match principal {
+        crate::Principal::AdminKey => Authz {
+            user_id: None,
+            is_admin: true,
+            grant: Grant::admin(),
+        },
+        crate::Principal::User { id } => {
+            let snapshot = state.store_read().map(|(s, _)| s);
+            let user = snapshot.as_ref().and_then(|s| s.users.get(id).cloned());
+            let is_admin = user.as_ref().is_some_and(|u| u.role == UserRole::Admin);
+            let grant = if is_admin {
+                Grant::admin()
+            } else {
+                Grant::for_member(id, snapshot.iter().flat_map(|s| s.teams.values()))
+            };
+            Authz {
+                user_id: Some(id.clone()),
+                is_admin,
+                grant,
+            }
+        }
+    }
+}
+
+/// The coarse gate, applied to every admin route by method and path.
+///
+/// Reads are open to every signed-in principal — the console is an
+/// observability surface first, and read-only is a real access level, not
+/// a punishment. Writes need `Full`, except the virtual-key routes, which
+/// need `Keys` (their model-scope check lives in the handlers, which can
+/// see the body). Users and teams are admin-only: the people who can
+/// grant access must be a strict superset of the people access is granted
+/// to, or membership in a `Full` team would be self-escalating.
+fn enforce(authz: &Authz, method: &axum::http::Method, path: &str) -> Result<(), Box<Response>> {
+    use router_core::access::TeamAccess;
+    if method == axum::http::Method::GET || authz.is_admin {
+        return Ok(());
+    }
+    if path.starts_with("/users") || path.starts_with("/teams") {
+        return Err(Box::new(api_error(
+            StatusCode::FORBIDDEN,
+            "managing users and teams needs an admin",
+        )));
+    }
+    let needed = if path.starts_with("/keys") {
+        TeamAccess::Keys
+    } else {
+        TeamAccess::Full
+    };
+    if authz.grant.access < needed {
+        return Err(Box::new(api_error(
+            StatusCode::FORBIDDEN,
+            match needed {
+                TeamAccess::Keys => "your teams do not allow managing virtual keys",
+                _ => "your teams grant read-only or key access, not configuration changes",
+            },
+        )));
+    }
+    Ok(())
 }
 
 async fn get_config(State(state): State<Arc<AppState>>) -> Response {
@@ -262,12 +412,44 @@ async fn list_keys(State(state): State<Arc<AppState>>) -> Response {
     Json(json!({ "data": defs.iter().map(key_view).collect::<Vec<_>>() })).into_response()
 }
 
-async fn create_key(State(state): State<Arc<AppState>>, Json(input): Json<KeyInput>) -> Response {
+async fn create_key(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(authz): axum::Extension<Authz>,
+    Json(input): Json<KeyInput>,
+) -> Response {
     if let Err(response) = writable(&state) {
         return response;
     }
     if input.name.trim().is_empty() {
         return api_error(StatusCode::UNPROCESSABLE_ENTITY, "name must not be empty");
+    }
+    // A scoped member may only mint keys inside their teams' models — and
+    // an unscoped key (empty list = every model) would be the widest key
+    // of all, so it needs an unscoped grant.
+    if authz.grant.models.is_some() {
+        if input.models.is_empty() {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "your teams are scoped to specific models; pick which ones this key may use",
+            );
+        }
+        if !authz
+            .grant
+            .allows_models(input.models.iter().map(String::as_str))
+        {
+            return api_error(
+                StatusCode::FORBIDDEN,
+                "one or more models are outside your teams' access",
+            );
+        }
+    }
+    let mut tags = input.tags;
+    if let Some(team) = authz.grant.teams.first() {
+        // Recorded, not user-supplied: this is what scopes later edits.
+        tags.insert("team".into(), team.clone());
+    }
+    if let Some(user) = &authz.user_id {
+        tags.insert("created_by".into(), user.clone());
     }
     let generated = vkey::generate();
     let def = VirtualKeyDef {
@@ -279,7 +461,7 @@ async fn create_key(State(state): State<Arc<AppState>>, Json(input): Json<KeyInp
         budget: input.budget,
         rate: input.rate,
         expires_ms: input.expires_ms,
-        tags: input.tags,
+        tags,
         enabled: true,
         created_ms: vkey::unix_now_ms(),
     };
@@ -451,7 +633,19 @@ struct RequestsQuery {
     #[serde(default)]
     provider: Option<String>,
     #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
     errors: bool,
+    /// Window to search, unix milliseconds. Defaults to the last hour,
+    /// which is what a live tail wants and what keeps an unqualified
+    /// request from walking a month of partitions.
+    #[serde(default)]
+    since_ms: Option<u64>,
+    #[serde(default)]
+    until_ms: Option<u64>,
+    /// Opaque page cursor from the previous response.
+    #[serde(default)]
+    after: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -462,15 +656,1263 @@ async fn requests(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RequestsQuery>,
 ) -> Response {
+    let now = crate::vkey::unix_now_ms();
+    let since = query
+        .since_ms
+        .unwrap_or_else(|| now.saturating_sub(3_600_000));
+    let filter = crate::usage::HistoryFilter {
+        provider: query.provider.clone().filter(|v| !v.is_empty()),
+        model: query.model.clone().filter(|v| !v.is_empty()),
+        vkey: query.key.clone().filter(|v| !v.is_empty()),
+    };
+    // The cursor is opaque to the console: "ts:request_id", which is
+    // exactly the ordering key the reader pages by.
+    let after = query.after.as_deref().and_then(|cursor| {
+        let (ts, id) = cursor.split_once(':')?;
+        Some((ts.parse::<u64>().ok()?, id.to_owned()))
+    });
+    let (data, next) = state.usage.page_from_disk(
+        query.limit.clamp(1, 1_000),
+        since,
+        query.until_ms.unwrap_or(now),
+        &filter,
+        query.errors,
+        after,
+    );
     Json(json!({
-        "data": state.usage.recent(
-            query.limit,
-            query.key.as_deref(),
-            query.errors.then_some(400),
-            query.provider.as_deref(),
-        )
+        "data": data,
+        "next": next.map(|(ts, id)| format!("{ts}:{id}")),
     }))
     .into_response()
+}
+
+#[derive(Deserialize)]
+struct BodiesQuery {
+    /// The record's timestamp, which says which day partition to open.
+    ts: u64,
+}
+
+/// What was sent and what came back, for one request.
+async fn request_bodies(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Query(query): Query<BodiesQuery>,
+) -> Response {
+    match state.usage.bodies_for(&id, query.ts) {
+        Some(bodies) => Json(json!({
+            "request_id": bodies.request_id,
+            "input": bodies.input,
+            "output": bodies.output,
+            "truncated": bodies.truncated,
+        }))
+        .into_response(),
+        None => Json(json!({
+            "request_id": id,
+            "input": null,
+            "output": null,
+            // The honest reasons a body is missing, so the console can
+            // say which one applies rather than showing an empty panel.
+            "reason": if state.config.load().usage.capture_bodies
+                == router_core::config::BodyCapture::Off
+            {
+                "body capture is off for this gateway"
+            } else {
+                "no stored bodies for this request; it may predate capture or have aged out"
+            },
+        }))
+        .into_response(),
+    }
+}
+
+use router_core::access::{TeamAccess, TeamDef, UserDef, UserRole, hash_password};
+
+/// Who am I, and what may I do — the console shapes itself around this.
+async fn whoami(
+    State(state): State<Arc<AppState>>,
+    axum::Extension(authz): axum::Extension<Authz>,
+) -> Response {
+    let email = authz.user_id.as_ref().and_then(|id| {
+        state
+            .store_read()
+            .and_then(|(s, _)| s.users.get(id).map(|u| u.email.clone()))
+    });
+    Json(json!({
+        "principal": if authz.user_id.is_some() { "user" } else { "admin_key" },
+        "email": email,
+        "is_admin": authz.is_admin,
+        "access": match authz.grant.access {
+            TeamAccess::Full => "full",
+            TeamAccess::Keys => "keys",
+            TeamAccess::ReadOnly => "read_only",
+        },
+        "models": authz.grant.models,
+        "teams": authz.grant.teams,
+    }))
+    .into_response()
+}
+
+async fn list_users(State(state): State<Arc<AppState>>) -> Response {
+    let snapshot = state.store_read().map(|(s, _)| s);
+    let teams: Vec<TeamDef> = snapshot
+        .as_ref()
+        .map(|s| s.teams.values().cloned().collect())
+        .unwrap_or_default();
+    let data: Vec<Value> = snapshot
+        .iter()
+        .flat_map(|s| s.users.values())
+        .map(|user| {
+            json!({
+                "id": user.id,
+                "email": user.email,
+                "role": match user.role { UserRole::Admin => "admin", UserRole::Member => "member" },
+                "created_ms": user.created_ms,
+                "teams": teams
+                    .iter()
+                    .filter(|t| t.members.contains(&user.id))
+                    .map(|t| json!({ "id": t.id, "name": t.name }))
+                    .collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(json!({ "data": data })).into_response()
+}
+
+#[derive(Deserialize)]
+struct UserWrite {
+    email: String,
+    #[serde(default)]
+    password: Option<String>,
+    #[serde(default)]
+    role: Option<String>,
+}
+
+fn parse_role(role: Option<&str>) -> Result<UserRole, Box<Response>> {
+    match role {
+        None | Some("member") => Ok(UserRole::Member),
+        Some("admin") => Ok(UserRole::Admin),
+        Some(other) => Err(Box::new(api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("unknown role `{other}`; use `admin` or `member`"),
+        ))),
+    }
+}
+
+async fn create_user(State(state): State<Arc<AppState>>, Json(input): Json<UserWrite>) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let email = input.email.trim().to_ascii_lowercase();
+    if email.is_empty() || !email.contains('@') {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a valid email is required",
+        );
+    }
+    let Some(password) = input.password.as_deref().filter(|p| p.len() >= 8) else {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a password of at least 8 characters is required",
+        );
+    };
+    if state
+        .store_read()
+        .is_some_and(|(s, _)| s.users.values().any(|u| u.email == email))
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            "a user with this email already exists",
+        );
+    }
+    let role = match parse_role(input.role.as_deref()) {
+        Ok(role) => role,
+        Err(response) => return *response,
+    };
+    let hash = match hash_password(password) {
+        Ok(hash) => hash,
+        Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+    };
+    let def = UserDef {
+        id: format!("u_{}", uuid::Uuid::now_v7().simple()),
+        email,
+        password_hash: hash,
+        role,
+        created_ms: vkey::unix_now_ms(),
+    };
+    match state
+        .commit(None, Command::PutUser { def: def.clone() })
+        .await
+    {
+        Ok(_) => Json(json!({ "data": { "id": def.id, "email": def.email } })).into_response(),
+        Err(err) => commit_error(err),
+    }
+}
+
+async fn update_user(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(input): Json<UserWrite>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let Some(mut user) = state
+        .store_read()
+        .and_then(|(s, _)| s.users.get(&id).cloned())
+    else {
+        return api_error(StatusCode::NOT_FOUND, "no such user");
+    };
+    if let Some(password) = input.password.as_deref() {
+        if password.len() < 8 {
+            return api_error(StatusCode::UNPROCESSABLE_ENTITY, "password too short");
+        }
+        user.password_hash = match hash_password(password) {
+            Ok(hash) => hash,
+            Err(err) => return api_error(StatusCode::INTERNAL_SERVER_ERROR, err),
+        };
+    }
+    if input.role.is_some() {
+        user.role = match parse_role(input.role.as_deref()) {
+            Ok(role) => role,
+            Err(response) => return *response,
+        };
+    }
+    match state.commit(None, Command::PutUser { def: user }).await {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(err) => commit_error(err),
+    }
+}
+
+async fn delete_user(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    // Sessions are revoked immediately: a deleted user with a live token
+    // is not deleted.
+    state
+        .sessions
+        .lock()
+        .unwrap()
+        .retain(|_, session| session.principal != crate::Principal::User { id: id.clone() });
+    match state.commit(None, Command::DeleteUser { id }).await {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(err) => commit_error(err),
+    }
+}
+
+async fn list_teams(State(state): State<Arc<AppState>>) -> Response {
+    let data: Vec<Value> = state
+        .store_read()
+        .iter()
+        .flat_map(|(s, _)| s.teams.values())
+        .map(|team| {
+            json!({
+                "id": team.id,
+                "name": team.name,
+                "members": team.members,
+                "models": team.models,
+                "access": match team.access {
+                    TeamAccess::Full => "full",
+                    TeamAccess::Keys => "keys",
+                    TeamAccess::ReadOnly => "read_only",
+                },
+                "created_ms": team.created_ms,
+            })
+        })
+        .collect();
+    Json(json!({ "data": data })).into_response()
+}
+
+#[derive(Deserialize)]
+struct TeamWrite {
+    name: String,
+    #[serde(default)]
+    members: Vec<String>,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    access: Option<String>,
+}
+
+async fn upsert_team(state: Arc<AppState>, id: Option<String>, input: TeamWrite) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    if input.name.trim().is_empty() {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, "a team name is required");
+    }
+    let access = match input.access.as_deref() {
+        None | Some("keys") => TeamAccess::Keys,
+        Some("full") => TeamAccess::Full,
+        Some("read_only") => TeamAccess::ReadOnly,
+        Some(other) => {
+            return api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("unknown access `{other}`; use `full`, `keys` or `read_only`"),
+            );
+        }
+    };
+    let snapshot = state.store_read().map(|(s, _)| s);
+    let known_users: std::collections::BTreeSet<String> = snapshot
+        .iter()
+        .flat_map(|s| s.users.keys().cloned())
+        .collect();
+    if let Some(ghost) = input.members.iter().find(|m| !known_users.contains(*m)) {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            format!("`{ghost}` is not a user on this gateway"),
+        );
+    }
+    let created_ms = id
+        .as_ref()
+        .and_then(|id| snapshot.as_ref().and_then(|s| s.teams.get(id)))
+        .map(|t| t.created_ms)
+        .unwrap_or_else(vkey::unix_now_ms);
+    let def = TeamDef {
+        id: id.unwrap_or_else(|| format!("t_{}", uuid::Uuid::now_v7().simple())),
+        name: input.name.trim().to_owned(),
+        members: input.members.into_iter().collect(),
+        models: input.models.into_iter().collect(),
+        access,
+        created_ms,
+    };
+    match state
+        .commit(None, Command::PutTeam { def: def.clone() })
+        .await
+    {
+        Ok(_) => Json(json!({ "data": { "id": def.id } })).into_response(),
+        Err(err) => commit_error(err),
+    }
+}
+
+async fn put_team(State(state): State<Arc<AppState>>, Json(input): Json<TeamWrite>) -> Response {
+    upsert_team(state, None, input).await
+}
+
+async fn put_team_by_id(
+    State(state): State<Arc<AppState>>,
+    Path(id): Path<String>,
+    Json(input): Json<TeamWrite>,
+) -> Response {
+    upsert_team(state, Some(id), input).await
+}
+
+async fn delete_team(State(state): State<Arc<AppState>>, Path(id): Path<String>) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    match state.commit(None, Command::DeleteTeam { id }).await {
+        Ok(_) => Json(json!({ "ok": true })).into_response(),
+        Err(err) => commit_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct SecretWrite {
+    name: String,
+    value: String,
+}
+
+/// Seal a secret into the store, for `store.<name>` references.
+///
+/// This is how a pasted credential (a Claude setup token) reaches the
+/// config without ever appearing in the config document: the document
+/// carries the reference, the store carries ciphertext, and the console
+/// never reads it back.
+async fn put_secret(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<SecretWrite>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let name = input.name.trim().to_owned();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "secret names use letters, digits, `_` and `-`",
+        );
+    }
+    if input.value.trim().is_empty() {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "an empty secret is not a secret",
+        );
+    }
+    let Some(store) = state.store.as_deref() else {
+        return api_error(StatusCode::CONFLICT, "this node has no control-plane store");
+    };
+    let sealed = store.seal_secret(input.value.trim());
+    match state
+        .commit(
+            None,
+            Command::PutSecret {
+                name: name.clone(),
+                sealed,
+            },
+        )
+        .await
+    {
+        Ok(_) => Json(json!({ "reference": format!("store.{name}") })).into_response(),
+        Err(err) => commit_error(err),
+    }
+}
+
+#[derive(Deserialize)]
+struct CredentialFileWrite {
+    name: String,
+    /// The full document, e.g. an uploaded Codex auth.json.
+    content: String,
+}
+
+/// Persist an uploaded credential document under the data dir and return
+/// a `file:` reference to it.
+///
+/// A file rather than a store secret, deliberately: Codex credentials
+/// rotate their refresh token on every renewal and the refresher
+/// persists the merged document back to its source path. A store-backed
+/// credential would serve until the first restart after a rotation, then
+/// silently die. Single-node by nature — the file lives on this box —
+/// which matches how subscription seats are deployed anyway.
+async fn put_credential_file(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<CredentialFileWrite>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let name = input.name.trim().to_owned();
+    if name.is_empty()
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "credential file names use letters, digits, `_` and `-`",
+        );
+    }
+    if serde_json::from_str::<Value>(&input.content).is_err() {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "the uploaded file is not valid JSON",
+        );
+    }
+    let Some(dir) = state.data_dir.as_deref() else {
+        return api_error(StatusCode::CONFLICT, "this node has no data directory");
+    };
+    let credentials = dir.join("credentials");
+    if let Err(err) = std::fs::create_dir_all(&credentials) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    let path = credentials.join(format!("{name}.json"));
+    if let Err(err) = std::fs::write(&path, input.content.as_bytes()) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+    }
+    Json(json!({ "reference": format!("file:{}", path.display()) })).into_response()
+}
+
+#[derive(Deserialize)]
+struct CredentialFileBulk {
+    files: Vec<CredentialFileWrite>,
+}
+
+/// Persist many uploaded credential documents in one request.
+///
+/// Onboarding a subscription pool means dozens of `auth.json` files at
+/// once; one request per file would be dozens of round trips before the
+/// config is even touched. Partial success is reported rather than
+/// rolled back — a malformed file among eighty should not cost the
+/// operator the other seventy-nine.
+async fn put_credential_files(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<CredentialFileBulk>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let Some(dir) = state.data_dir.as_deref() else {
+        return api_error(StatusCode::CONFLICT, "this node has no data directory");
+    };
+    let credentials = dir.join("credentials");
+    if let Err(err) = std::fs::create_dir_all(&credentials) {
+        return api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string());
+    }
+
+    let mut written = Vec::new();
+    let mut failed = Vec::new();
+    for file in input.files {
+        let name = file.name.trim().to_owned();
+        if name.is_empty()
+            || !name
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+        {
+            failed.push(json!({ "name": file.name, "error": "invalid credential file name" }));
+            continue;
+        }
+        if serde_json::from_str::<Value>(&file.content).is_err() {
+            failed.push(json!({ "name": name, "error": "not valid JSON" }));
+            continue;
+        }
+        let path = credentials.join(format!("{name}.json"));
+        if let Err(err) = std::fs::write(&path, file.content.as_bytes()) {
+            failed.push(json!({ "name": name, "error": err.to_string() }));
+            continue;
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        }
+        written.push(json!({ "name": name, "reference": format!("file:{}", path.display()) }));
+    }
+    Json(json!({ "written": written, "failed": failed })).into_response()
+}
+
+#[derive(Deserialize)]
+struct KeyBulk {
+    keys: Vec<NewKey>,
+}
+
+/// Add many credentials to a provider in a single config commit.
+///
+/// One commit rather than one per key: each commit is a full read-modify-
+/// write of the store document (an S3 round trip in production), and
+/// eighty of them in sequence would both crawl and give every other
+/// writer eighty chances to collide. Existing names are skipped and
+/// reported, so re-running an import is safe.
+async fn add_provider_keys(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(input): Json<KeyBulk>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(provider) = doc
+        .get_mut("providers")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|p| p.get_mut(&name))
+    else {
+        return api_error(StatusCode::NOT_FOUND, format!("no provider `{name}`"));
+    };
+
+    if provider.get("keys").and_then(|k| k.as_array()).is_none() {
+        provider["keys"] = toml_edit::value(toml_edit::Array::new());
+    }
+    let Some(keys) = provider.get_mut("keys").and_then(|k| k.as_array_mut()) else {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("`{name}` has a malformed keys list"),
+        );
+    };
+
+    let existing: Vec<String> = keys
+        .iter()
+        .filter_map(|k| k.as_inline_table())
+        .filter_map(|t| t.get("name").and_then(|n| n.as_str()).map(str::to_owned))
+        .collect();
+
+    let mut added = Vec::new();
+    let mut skipped = Vec::new();
+    for key in &input.keys {
+        if existing.contains(&key.name) || added.contains(&key.name) {
+            skipped.push(key.name.clone());
+            continue;
+        }
+        keys.push(toml_edit::Value::InlineTable(key_entry(key, &[])));
+        added.push(key.name.clone());
+    }
+    if added.is_empty() {
+        return Json(json!({ "added": added, "skipped": skipped })).into_response();
+    }
+
+    let response = commit_document(&state, version, doc).await;
+    if !response.status().is_success() {
+        return response;
+    }
+    Json(json!({ "added": added, "skipped": skipped })).into_response()
+}
+
+#[derive(Deserialize)]
+struct ProbeRequest {
+    /// Probe one credential; absent means every credential of the provider.
+    key: Option<String>,
+    /// Override the model to probe with; otherwise the first one declared.
+    model: Option<String>,
+}
+
+/// Check credentials by actually using them.
+///
+/// A seat that has served no traffic has never reported its plan
+/// windows, so its state is genuinely unknown until something asks. This
+/// sends the smallest valid request per credential through the ordinary
+/// dispatch path and reports what came back — and because the reply's
+/// quota headers are recorded on the way through, a check also fills in
+/// the windows the console draws.
+///
+/// Credentials are probed concurrently but capped: eighty seats firing
+/// at one provider at once is a self-inflicted rate limit.
+async fn probe_provider(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(input): Json<ProbeRequest>,
+) -> Response {
+    let table = state.table.load();
+    let Some(provider) = table.providers().find(|p| p.name == name).cloned() else {
+        return api_error(StatusCode::NOT_FOUND, format!("no provider `{name}`"));
+    };
+
+    let targets: Vec<String> = match input.key.as_deref() {
+        Some(key) => {
+            if !provider.keys.iter().any(|k| k.name == key) {
+                return api_error(StatusCode::NOT_FOUND, format!("no credential `{key}`"));
+            }
+            vec![key.to_owned()]
+        }
+        None => provider.keys.iter().map(|k| k.name.clone()).collect(),
+    };
+    if targets.is_empty() {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("`{name}` has no credentials to check"),
+        );
+    }
+
+    let semaphore = Arc::new(tokio::sync::Semaphore::new(6));
+    let mut tasks = tokio::task::JoinSet::new();
+    for key_name in targets {
+        let model = match input
+            .model
+            .clone()
+            .or_else(|| probe_model(&provider, &key_name))
+        {
+            Some(model) => model,
+            None => {
+                tasks.spawn(async move {
+                    json!({
+                        "key": key_name,
+                        "status": "unknown",
+                        "detail": "no model declared for this credential — add one on the Models page",
+                    })
+                });
+                continue;
+            }
+        };
+        let state = state.clone();
+        let provider = provider.clone();
+        let semaphore = semaphore.clone();
+        tasks.spawn(async move {
+            let _permit = semaphore.acquire_owned().await.ok();
+            let outcome = crate::proxy::probe_key(&state, provider, &key_name, &model).await;
+            json!({
+                "key": key_name,
+                "model": model,
+                "status": outcome.status,
+                "detail": outcome.detail,
+                "http_status": outcome.http_status,
+            })
+        });
+    }
+
+    let mut results = Vec::new();
+    while let Some(joined) = tasks.join_next().await {
+        if let Ok(value) = joined {
+            results.push(value);
+        }
+    }
+    Json(json!({ "results": results })).into_response()
+}
+
+/// The model a probe should ask for: whatever this credential declares
+/// first, else whatever the provider serves.
+fn probe_model(provider: &router_core::router::ProviderRuntime, key_name: &str) -> Option<String> {
+    provider
+        .keys
+        .iter()
+        .find(|k| k.name == key_name)
+        .and_then(|k| k.models.as_ref().and_then(|m| m.first().cloned()))
+        .or_else(|| {
+            provider
+                .keys
+                .iter()
+                .find_map(|k| k.models.as_ref().and_then(|m| m.first().cloned()))
+        })
+}
+
+/// Fetch the public price catalog and swap it in.
+///
+/// Costs are computed at request time from whatever pricing is loaded,
+/// so a refresh only affects traffic from here on — historical spend is
+/// already written and is deliberately not restated. An operator who
+/// wants old numbers repriced has the raw token counts to do it with.
+async fn refresh_pricing(State(state): State<Arc<AppState>>) -> Response {
+    let url = std::env::var("RAPID_PRICE_CATALOG_URL")
+        .unwrap_or_else(|_| crate::usage::DEFAULT_PRICE_CATALOG_URL.to_owned());
+    match crate::usage::fetch_catalog(&state.upstream, &url).await {
+        Ok(catalog) => {
+            let count = catalog.len();
+            let updated = state.pricing.load().with_catalog(Arc::new(catalog));
+            state.pricing.store(Arc::new(updated));
+            Json(json!({ "models": count, "source": url })).into_response()
+        }
+        Err(err) => api_error(StatusCode::BAD_GATEWAY, err),
+    }
+}
+
+/// Everything the console needs to offer an "add provider" form: the
+/// presets it can start from, and the models each is seeded with.
+async fn catalog(State(state): State<Arc<AppState>>) -> Response {
+    use router_core::config::presets;
+    let configured: Vec<String> = state
+        .table
+        .load()
+        .providers()
+        .map(|p| p.name.clone())
+        .collect();
+    let kinds: Vec<Value> = presets::ALL_PRESETS
+        .iter()
+        .map(|name| {
+            let preset = presets::preset(name);
+            json!({
+                "name": name,
+                "base_url": preset.as_ref().and_then(|p| p.base_url),
+                "discovery_env": preset.as_ref().and_then(|p| p.discovery_env),
+                "keyless_ok": preset.as_ref().is_some_and(|p| p.keyless_ok),
+                "models": presets::catalog(name).iter().map(|m| json!({
+                    "id": m.id, "format": m.format.as_str(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    let custom = json!({
+        "name": "openai_compat",
+        "custom": true,
+        "base_url": null,
+        "keyless_ok": true,
+        "models": [],
+    });
+    // The two subscription kinds are not presets — they are configured by
+    // `type`, not by name — but the console offers them in the same
+    // picker, so they are listed here too.
+    let subscriptions: Vec<Value> = ["claude_subscription", "codex_subscription"]
+        .iter()
+        .map(|name| {
+            json!({
+                "name": name,
+                "subscription": true,
+                "models": presets::catalog(name).iter().map(|m| json!({
+                    "id": m.id, "format": m.format.as_str(),
+                })).collect::<Vec<_>>(),
+            })
+        })
+        .collect();
+    Json(json!({ "presets": kinds, "subscriptions": subscriptions, "custom": custom, "configured": configured }))
+        .into_response()
+}
+
+/// Read the config document for editing, as a `toml_edit` tree.
+///
+/// Format-preserving: an operator's comments and key order survive a
+/// change made from the console, which a parse-and-reserialize round trip
+/// would silently discard.
+fn config_document(state: &AppState) -> Result<(u64, toml_edit::DocumentMut), Box<Response>> {
+    let (text, version) = state
+        .store_read()
+        .map(|(snapshot, version)| (snapshot.config_text.unwrap_or_default(), version))
+        .unwrap_or_default();
+    text.parse::<toml_edit::DocumentMut>()
+        .map(|doc| (version, doc))
+        .map_err(|err| {
+            Box::new(api_error(
+                StatusCode::UNPROCESSABLE_ENTITY,
+                format!("config is not valid TOML: {err}"),
+            ))
+        })
+}
+
+/// Validate and commit an edited document.
+async fn commit_document(
+    state: &Arc<AppState>,
+    version: u64,
+    doc: toml_edit::DocumentMut,
+) -> Response {
+    let text = doc.to_string();
+    let env = |name: &str| {
+        if let Some(secret) = name.strip_prefix("store.") {
+            state
+                .store
+                .as_deref()
+                .and_then(|s| s.resolve_secret(secret))
+        } else {
+            std::env::var(name).ok()
+        }
+    };
+    if let Err(err) = Config::from_str_with_env(&text, Format::Toml, &env) {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, err.to_string());
+    }
+    match state
+        .commit(Some(version), Command::PutConfig { text })
+        .await
+    {
+        Ok(version) => {
+            // Adopt through the same path a remote change takes, so there
+            // is one place where a config becomes live on a node. Without
+            // this the write reaches the store and the node that made it
+            // keeps serving the old routing table — the change appears to
+            // have been ignored.
+            state.adopt_store_state();
+            Json(json!({ "version": version })).into_response()
+        }
+        Err(ControlPlaneError::Conflict { .. }) => api_error(
+            StatusCode::CONFLICT,
+            "the configuration changed since it was read; reload and try again",
+        ),
+        Err(err) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+    }
+}
+
+#[derive(Deserialize)]
+struct NewProvider {
+    name: String,
+    /// A preset name (`openai`) or an explicit adapter (`claude_subscription`).
+    kind: Option<String>,
+    base_url: Option<String>,
+    /// `"none"` for keyless servers; omitted otherwise.
+    auth: Option<String>,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    keys: Vec<NewKey>,
+}
+
+#[derive(Deserialize)]
+struct NewKey {
+    name: String,
+    /// `env.VAR`, `file:/path`, `store.name`, or a literal.
+    value: String,
+    weight: Option<f64>,
+    rpm: Option<u64>,
+    tpm: Option<u64>,
+    #[serde(default)]
+    models: Vec<String>,
+}
+
+fn key_entry(key: &NewKey, fallback_models: &[String]) -> toml_edit::InlineTable {
+    let mut entry = toml_edit::InlineTable::new();
+    entry.insert("name", key.name.clone().into());
+    entry.insert("value", key.value.clone().into());
+    if let Some(weight) = key.weight {
+        entry.insert("weight", weight.into());
+    }
+    if let Some(rpm) = key.rpm {
+        entry.insert("rpm", (rpm as i64).into());
+    }
+    if let Some(tpm) = key.tpm {
+        entry.insert("tpm", (tpm as i64).into());
+    }
+    let models = if key.models.is_empty() {
+        fallback_models
+    } else {
+        &key.models
+    };
+    if !models.is_empty() {
+        let mut list = toml_edit::Array::new();
+        for model in models {
+            list.push(model.as_str());
+        }
+        entry.insert("models", toml_edit::Value::Array(list));
+    }
+    entry
+}
+
+async fn create_provider(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<NewProvider>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    if input.name.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "name is required");
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    if doc
+        .get("providers")
+        .and_then(|p| p.get(&input.name))
+        .is_some()
+    {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("provider `{}` already exists", input.name),
+        );
+    }
+
+    let providers = doc["providers"].or_insert(toml_edit::table());
+    if let Some(table) = providers.as_table_mut() {
+        table.set_implicit(true);
+    }
+    let mut entry = toml_edit::Table::new();
+    if let Some(kind) = &input.kind
+        && kind != &input.name
+    {
+        entry["type"] = toml_edit::value(kind.as_str());
+    }
+    if let Some(base) = &input.base_url {
+        entry["base_url"] = toml_edit::value(base.as_str());
+    }
+    if let Some(auth) = &input.auth {
+        entry["auth"] = toml_edit::value(auth.as_str());
+    }
+    let mut keys = toml_edit::Array::new();
+    for key in &input.keys {
+        keys.push(toml_edit::Value::InlineTable(key_entry(key, &input.models)));
+    }
+    if !keys.is_empty() {
+        entry["keys"] = toml_edit::value(keys);
+    }
+    providers[input.name.as_str()] = toml_edit::Item::Table(entry);
+    commit_document(&state, version, doc).await
+}
+
+#[derive(Deserialize)]
+struct ProviderUpdate {
+    /// `Some("")` clears the override back to the preset default.
+    base_url: Option<String>,
+}
+
+async fn update_provider(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(input): Json<ProviderUpdate>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(provider) = doc
+        .get_mut("providers")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|p| p.get_mut(&name))
+    else {
+        return api_error(StatusCode::NOT_FOUND, format!("no provider `{name}`"));
+    };
+    if let Some(base) = input.base_url {
+        let trimmed = base.trim();
+        if trimmed.is_empty() {
+            if let Some(table) = provider.as_table_like_mut() {
+                table.remove("base_url");
+            }
+        } else {
+            provider["base_url"] = toml_edit::value(trimmed);
+        }
+    }
+    commit_document(&state, version, doc).await
+}
+
+async fn delete_provider(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(providers) = doc.get_mut("providers").and_then(|p| p.as_table_like_mut()) else {
+        return api_error(StatusCode::NOT_FOUND, "no providers configured");
+    };
+    if providers.remove(&name).is_none() {
+        return api_error(StatusCode::NOT_FOUND, format!("no provider `{name}`"));
+    }
+    commit_document(&state, version, doc).await
+}
+
+async fn add_provider_key(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(input): Json<NewKey>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(provider) = doc
+        .get_mut("providers")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|p| p.get_mut(&name))
+    else {
+        return api_error(StatusCode::NOT_FOUND, format!("no provider `{name}`"));
+    };
+    let entry = key_entry(&input, &[]);
+    match provider.get_mut("keys").and_then(|k| k.as_array_mut()) {
+        Some(keys) => keys.push(toml_edit::Value::InlineTable(entry)),
+        None => {
+            let mut keys = toml_edit::Array::new();
+            keys.push(toml_edit::Value::InlineTable(entry));
+            provider["keys"] = toml_edit::value(keys);
+        }
+    }
+    commit_document(&state, version, doc).await
+}
+
+async fn delete_provider_key(
+    State(state): State<Arc<AppState>>,
+    Path((name, key)): Path<(String, String)>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(keys) = doc
+        .get_mut("providers")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|p| p.get_mut(&name))
+        .and_then(|p| p.get_mut("keys"))
+        .and_then(|k| k.as_array_mut())
+    else {
+        return api_error(StatusCode::NOT_FOUND, format!("no keys on `{name}`"));
+    };
+    let before = keys.len();
+    keys.retain(|entry| {
+        entry
+            .as_inline_table()
+            .and_then(|t| t.get("name"))
+            .and_then(|v| v.as_str())
+            != Some(key.as_str())
+    });
+    if keys.len() == before {
+        return api_error(StatusCode::NOT_FOUND, format!("no key `{key}` on `{name}`"));
+    }
+    commit_document(&state, version, doc).await
+}
+
+#[derive(Deserialize)]
+struct ModelWrite {
+    id: String,
+}
+
+/// Add a model to every key of a provider that already names models.
+///
+/// A model is routable when a key lists it, so "add a model" is "widen
+/// the keys' model lists". A key with no list already serves everything
+/// the provider offers and is left alone — narrowing it to an explicit
+/// list here would *remove* routes as a side effect of adding one.
+async fn add_model(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(input): Json<ModelWrite>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let model = input.id.trim().to_owned();
+    if model.is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "a model id is required");
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(keys) = doc
+        .get_mut("providers")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|p| p.get_mut(&name))
+        .and_then(|p| p.get_mut("keys"))
+        .and_then(|k| k.as_array_mut())
+    else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("no provider `{name}` with keys"),
+        );
+    };
+    let mut touched = false;
+    for entry in keys.iter_mut() {
+        let Some(table) = entry.as_inline_table_mut() else {
+            continue;
+        };
+        match table.get_mut("models").and_then(|m| m.as_array_mut()) {
+            Some(models) => {
+                if models.iter().any(|m| m.as_str() == Some(model.as_str())) {
+                    continue;
+                }
+                models.push(model.as_str());
+                touched = true;
+            }
+            None => {
+                // A key with no list served "whatever the provider has";
+                // the first declared model converts it to an explicit
+                // list, which is the console's contract: models are
+                // declared, never assumed.
+                let mut models = toml_edit::Array::new();
+                models.push(model.as_str());
+                table.insert("models", toml_edit::Value::Array(models));
+                touched = true;
+            }
+        }
+    }
+    if !touched {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("every key of `{name}` already lists `{model}`"),
+        );
+    }
+    commit_document(&state, version, doc).await
+}
+
+async fn delete_model(
+    State(state): State<Arc<AppState>>,
+    Path((name, model)): Path<(String, String)>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(keys) = doc
+        .get_mut("providers")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|p| p.get_mut(&name))
+        .and_then(|p| p.get_mut("keys"))
+        .and_then(|k| k.as_array_mut())
+    else {
+        return api_error(StatusCode::NOT_FOUND, format!("no provider `{name}`"));
+    };
+    for entry in keys.iter_mut() {
+        if let Some(models) = entry
+            .as_inline_table_mut()
+            .and_then(|t| t.get_mut("models"))
+            .and_then(|m| m.as_array_mut())
+        {
+            models.retain(|m| m.as_str() != Some(model.as_str()));
+        }
+    }
+    commit_document(&state, version, doc).await
+}
+
+/// A routing group: one name callers use, and the ordered list of targets
+/// it resolves to.
+///
+/// This is `[aliases]` and `[fallbacks]` presented as the single thing
+/// they always were. An alias is a group's first target; the fallback
+/// chain is the rest. Splitting them across two tables made a routing
+/// decision something you had to reconstruct from two places.
+async fn list_routes(State(state): State<Arc<AppState>>) -> Response {
+    let table = state.table.load();
+    let data: Vec<Value> = table
+        .aliases()
+        .iter()
+        .map(|(name, target)| {
+            let primary = format!("{}/{}", target.provider, target.model);
+            let mut targets = vec![primary];
+            if let Some(chain) = table.fallbacks_for(target) {
+                targets.extend(chain.iter().map(|t| format!("{}/{}", t.provider, t.model)));
+            }
+            json!({ "name": name, "targets": targets })
+        })
+        .collect();
+    Json(json!({ "data": data })).into_response()
+}
+
+#[derive(Deserialize)]
+struct RouteWrite {
+    name: String,
+    /// Ordered `provider/model` targets; the first is primary.
+    targets: Vec<String>,
+}
+
+async fn put_route(State(state): State<Arc<AppState>>, Json(input): Json<RouteWrite>) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let Some(primary) = input.targets.first() else {
+        return api_error(StatusCode::BAD_REQUEST, "a group needs at least one target");
+    };
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let aliases = doc["aliases"].or_insert(toml_edit::table());
+    if let Some(table) = aliases.as_table_mut() {
+        table.set_implicit(false);
+    }
+    aliases[input.name.as_str()] = toml_edit::value(primary.as_str());
+
+    let rest: Vec<&String> = input.targets.iter().skip(1).collect();
+    let fallbacks = doc["fallbacks"].or_insert(toml_edit::table());
+    if let Some(table) = fallbacks.as_table_mut() {
+        table.set_implicit(false);
+    }
+    if rest.is_empty() {
+        if let Some(table) = fallbacks.as_table_like_mut() {
+            table.remove(primary);
+        }
+    } else {
+        let mut chain = toml_edit::Array::new();
+        for target in rest {
+            chain.push(target.as_str());
+        }
+        fallbacks[primary.as_str()] = toml_edit::value(chain);
+    }
+    commit_document(&state, version, doc).await
+}
+
+async fn delete_route(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let primary = doc
+        .get("aliases")
+        .and_then(|a| a.get(&name))
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    if let Some(aliases) = doc.get_mut("aliases").and_then(|a| a.as_table_like_mut()) {
+        aliases.remove(&name);
+    }
+    // The chain is keyed by the target, so it is only orphaned if no other
+    // alias still points there.
+    if let Some(primary) = primary {
+        let still_used = doc
+            .get("aliases")
+            .and_then(|a| a.as_table_like())
+            .is_some_and(|a| a.iter().any(|(_, v)| v.as_str() == Some(primary.as_str())));
+        if !still_used
+            && let Some(fallbacks) = doc.get_mut("fallbacks").and_then(|f| f.as_table_like_mut())
+        {
+            fallbacks.remove(&primary);
+        }
+    }
+    commit_document(&state, version, doc).await
 }
 
 #[derive(Deserialize)]
@@ -479,6 +1921,12 @@ struct HistoryQuery {
     days: u32,
     #[serde(default)]
     by: Option<String>,
+    #[serde(default)]
+    provider: Option<String>,
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    key: Option<String>,
 }
 
 fn default_days() -> u32 {
@@ -501,7 +1949,13 @@ async fn history(
     } else {
         ""
     };
-    Json(json!({ "data": state.usage.history(query.days.clamp(1, 365), by) })).into_response()
+    let filter = crate::usage::HistoryFilter {
+        provider: query.provider.filter(|v| !v.is_empty()),
+        model: query.model.filter(|v| !v.is_empty()),
+        vkey: query.key.filter(|v| !v.is_empty()),
+    };
+    Json(json!({ "data": state.usage.history(query.days.clamp(1, 365), by, &filter) }))
+        .into_response()
 }
 
 /// Per-provider, per-credential state for the console's Providers page.
@@ -547,6 +2001,13 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                         "weight": k.weight,
                         "models": k.models,
                         "health": k.breaker.health(now),
+                        // The breaker only knows about failures. A seat
+                        // sitting at 100% of its plan window has failed
+                        // nothing yet and would read "healthy" right up
+                        // until the first refusal, which is precisely
+                        // when an operator needs the warning. Fold the
+                        // provider's own quota view in.
+                        "status": effective_status(k, now),
                         // Reported as a wall-clock instant, not a
                         // duration: the console renders a countdown, and a
                         // duration computed here would be stale by the
@@ -568,6 +2029,7 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                         // does not. `null` for "unknown" is meaningful —
                         // an opaque token carries no readable expiry.
                         "credential": seat.as_ref().map(|s| json!({
+                            "email": s.email,
                             "expires_at_ms": s.expires_at_ms,
                             "can_refresh": s.refresh_token.is_some(),
                             "expired": s.is_expired(now_unix),
@@ -586,6 +2048,37 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
         })
         .collect();
     Json(json!({ "data": data })).into_response()
+}
+
+/// One word for the state of a credential, folding together the three
+/// things that can be wrong with it: the breaker (has it been failing),
+/// the plan quota (is it out of headroom), and the credential itself
+/// (can it still authenticate).
+fn effective_status(key: &router_core::router::KeyRuntime, now: u64) -> &'static str {
+    let health = key.breaker.health(now);
+    if health == "benched" {
+        return "exhausted";
+    }
+    if let Some(snapshot) = key.quota() {
+        let quota = snapshot.quota;
+        if quota.primary.is_some_and(|w| w.rejected) || quota.secondary.is_some_and(|w| w.rejected)
+        {
+            return "exhausted";
+        }
+        if let Some(peak) = quota.peak_utilization() {
+            if peak >= 1.0 {
+                return "exhausted";
+            }
+            if peak >= 0.9 {
+                return "near_limit";
+            }
+        }
+    }
+    match health {
+        "healthy" => "ready",
+        "probing" => "probing",
+        other => other,
+    }
 }
 
 /// What the console's Fleet page reads: which store is authoritative,

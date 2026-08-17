@@ -109,6 +109,12 @@ fn meter(response: Response, mut hook: UsageHook, dialect: Dialect, stream: bool
 
 /// Attribute a request that failed before (or instead of) serving a
 /// response body.
+///
+/// The parameter list is long because a usage record genuinely needs all
+/// of it and this is the one place that assembles one for a failure;
+/// bundling them into a struct here would only move the same fields
+/// behind a name that adds nothing.
+#[allow(clippy::too_many_arguments)]
 fn record_failure(
     state: &AppState,
     vk: &Option<Arc<VkRuntime>>,
@@ -117,11 +123,32 @@ fn record_failure(
     err: &GatewayError,
     started: Instant,
     headers: &HeaderMap,
+    input: Option<&[u8]>,
 ) {
-    let hook = build_hook(state, vk, endpoint, requested, headers, started);
-    let mut hook = hook;
+    let mut hook = match input {
+        Some(body) => build_hook_with_input(state, vk, endpoint, requested, headers, started, body),
+        None => build_hook(state, vk, endpoint, requested, headers, started),
+    };
     hook.provider = err.provider.clone().unwrap_or_default();
     hook.complete(err.class.http_status(), TokenUsage::default());
+}
+
+/// A hook that also remembers the request body, for the log drawer.
+fn build_hook_with_input(
+    state: &AppState,
+    vk: &Option<Arc<VkRuntime>>,
+    endpoint: &'static str,
+    requested: &str,
+    headers: &HeaderMap,
+    started: Instant,
+    input: &[u8],
+) -> UsageHook {
+    let mut hook = build_hook(state, vk, endpoint, requested, headers, started);
+    // Only materialise the body when something will store it.
+    if state.usage.capture_limit_for(200) > 0 {
+        hook.input_body = Some(String::from_utf8_lossy(input).into_owned());
+    }
+    hook
 }
 
 fn build_hook(
@@ -157,6 +184,7 @@ fn build_hook(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
         seat: None,
+        input_body: None,
     }
 }
 
@@ -213,6 +241,14 @@ pub enum InboundChat {
 }
 
 impl InboundChat {
+    /// The request as the caller sent it, for the log drawer.
+    pub fn raw_body(&self) -> String {
+        match self {
+            Self::OpenAi { body, .. } => String::from_utf8_lossy(body).into_owned(),
+            Self::Anthropic { value, .. } | Self::Gemini { value, .. } => value.to_string(),
+        }
+    }
+
     pub fn from_openai(body: Bytes) -> Result<Self, GatewayError> {
         if let Some(probe) = json::probe(&body) {
             let stream = probe.stream == Some(true);
@@ -374,12 +410,29 @@ pub async fn handle_chat(
     match run_chat(&state, &inbound, &headers, started, vk.as_deref()).await {
         Ok(response) => meter(
             response,
-            build_hook(&state, &vk, "chat", &requested, &headers, started),
+            build_hook_with_input(
+                &state,
+                &vk,
+                "chat",
+                &requested,
+                &headers,
+                started,
+                inbound.raw_body().as_bytes(),
+            ),
             dialect,
             stream,
         ),
         Err(err) => {
-            record_failure(&state, &vk, "chat", &requested, &err, started, &headers);
+            record_failure(
+                &state,
+                &vk,
+                "chat",
+                &requested,
+                &err,
+                started,
+                &headers,
+                Some(inbound.raw_body().as_bytes()),
+            );
             error_response_in(dialect, &err)
         }
     }
@@ -1010,7 +1063,7 @@ fn finalize(
     record_request_metrics(&route.provider.name, response.status());
 }
 
-fn build_upstream_request(
+pub(crate) fn build_upstream_request(
     route: &ResolvedRoute,
     out_dialect: Dialect,
     path: &str,
@@ -1204,6 +1257,130 @@ fn build_upstream_request(
 // The OpenAI-only relay endpoints (completions, embeddings)
 // ---------------------------------------------------------------------------
 
+/// Send one minimal request through a named credential and report what
+/// the provider said.
+///
+/// This is the console's "check now": a seat that has served no traffic
+/// has never reported its plan windows, so the only way to know its
+/// state is to ask. The request is deliberately the smallest valid one
+/// for the dialect (one token, no streaming) and it goes through the
+/// same builder as real traffic, so what it exercises is what production
+/// exercises — base URL, auth, refresh, headers and all.
+///
+/// The reply's quota headers are recorded exactly as a real response's
+/// would be, so a probe also refreshes the windows the console draws.
+pub(crate) async fn probe_key(
+    state: &AppState,
+    provider: Arc<router_core::router::ProviderRuntime>,
+    key_name: &str,
+    model: &str,
+) -> ProbeOutcome {
+    let route = ResolvedRoute {
+        provider: provider.clone(),
+        upstream_model: model.to_owned(),
+    };
+    let key = provider.keys.iter().find(|k| k.name == key_name);
+    let Some(dialect) = router_providers::wire_dialect(provider.kind) else {
+        return ProbeOutcome {
+            status: "unreachable".into(),
+            detail: format!("`{}` has no wire dialect to probe", provider.name),
+            http_status: None,
+        };
+    };
+    let (path, body) = match dialect {
+        Dialect::Anthropic => (
+            "/v1/messages",
+            serde_json::json!({
+                "model": model,
+                "max_tokens": 1,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }),
+        ),
+        Dialect::Gemini => (
+            "/v1beta/models:generateContent",
+            serde_json::json!({ "contents": [{ "parts": [{ "text": "hi" }] }] }),
+        ),
+        _ => (
+            "/chat/completions",
+            serde_json::json!({
+                "model": model,
+                "max_tokens": 1,
+                "messages": [{ "role": "user", "content": "hi" }],
+            }),
+        ),
+    };
+
+    let empty = HeaderMap::new();
+    let request = match build_upstream_request(
+        &route,
+        dialect,
+        path,
+        &empty,
+        key,
+        Bytes::from(body.to_string()),
+    ) {
+        Ok(request) => request,
+        Err(err) => {
+            return ProbeOutcome {
+                status: "unreachable".into(),
+                detail: err.to_string(),
+                http_status: None,
+            };
+        }
+    };
+
+    let result = state
+        .upstream
+        .send(&provider.name, request, provider.timeout)
+        .await;
+
+    match result {
+        Err(err) => ProbeOutcome {
+            status: "unreachable".into(),
+            detail: err.to_string(),
+            http_status: None,
+        },
+        Ok(response) => {
+            let http_status = response.status();
+            let headers = response.headers().clone();
+            // Record the windows exactly as a real response would, and
+            // bench the seat if the provider says it is out — a probe
+            // that learns a seat is exhausted should leave the router
+            // knowing it too, not just the operator.
+            let breaker = provider.breaker_for(key);
+            bench_exhausted_seat(&route, breaker, key, &headers, http_status);
+
+            let status = match http_status.as_u16() {
+                429 => "rate_limited",
+                401 | 403 => "unauthorized",
+                s if s >= 500 => "provider_error",
+                s if s >= 400 => "rejected",
+                _ => "ok",
+            };
+            let detail = if http_status.is_success() {
+                String::new()
+            } else {
+                let body = axum::body::to_bytes(Body::new(response.into_body()), 8192)
+                    .await
+                    .unwrap_or_default();
+                extract_upstream_error(&body).unwrap_or_else(|| http_status.to_string())
+            };
+            ProbeOutcome {
+                status: status.into(),
+                detail,
+                http_status: Some(http_status.as_u16()),
+            }
+        }
+    }
+}
+
+/// What a probe learned about one credential.
+pub(crate) struct ProbeOutcome {
+    pub status: String,
+    pub detail: String,
+    pub http_status: Option<u16>,
+}
+
 pub async fn handle_relay(
     state: Arc<AppState>,
     endpoint: Endpoint,
@@ -1231,6 +1408,7 @@ pub async fn handle_relay(
                 &err,
                 started,
                 &headers,
+                None,
             );
             error_response(&err)
         }
@@ -1369,7 +1547,9 @@ pub async fn handle_stream_relay(
         match read_multipart_model_prefix(body).await {
             Ok(parts) => parts,
             Err(err) => {
-                record_failure(&state, &vk, endpoint, "unknown", &err, started, &headers);
+                record_failure(
+                    &state, &vk, endpoint, "unknown", &err, started, &headers, None,
+                );
                 return error_response(&err);
             }
         }
@@ -1403,7 +1583,9 @@ pub async fn handle_stream_relay(
             false,
         ),
         Err(err) => {
-            record_failure(&state, &vk, endpoint, &requested, &err, started, &headers);
+            record_failure(
+                &state, &vk, endpoint, &requested, &err, started, &headers, None,
+            );
             error_response(&err)
         }
     }
@@ -1445,7 +1627,9 @@ pub async fn handle_provider_relay(
             false,
         ),
         Err(err) => {
-            record_failure(&state, &vk, endpoint, &requested, &err, started, &headers);
+            record_failure(
+                &state, &vk, endpoint, &requested, &err, started, &headers, None,
+            );
             error_response(&err)
         }
     }
@@ -1798,10 +1982,20 @@ pub async fn handle_responses(
     let stream = value
         .as_ref()
         .is_some_and(|v| v["stream"] == Value::Bool(true));
+    // Cloning a `Bytes` is a refcount bump, not a copy.
+    let sent = body.clone();
     match run_responses(&state, &headers, body, started, vk.as_deref()).await {
         Ok(response) => meter(
             response,
-            build_hook(&state, &vk, "responses", &requested, &headers, started),
+            build_hook_with_input(
+                &state,
+                &vk,
+                "responses",
+                &requested,
+                &headers,
+                started,
+                &sent,
+            ),
             Dialect::OpenAi,
             stream,
         ),
@@ -1814,6 +2008,7 @@ pub async fn handle_responses(
                 &err,
                 started,
                 &headers,
+                Some(&sent),
             );
             error_response_for(RenderTarget::Responses, &err)
         }
@@ -1872,19 +2067,43 @@ async fn run_responses(
             continue;
         };
 
-        // OpenAI-dialect targets relay the Responses surface natively;
-        // everything else translates the stateless core.
-        let relay = out_dialect == Dialect::OpenAi;
+        // Providers that speak Responses on the wire relay the surface
+        // natively; everything else translates the stateless core.
+        //
+        // Codex counts: its backend *is* the Responses API, so relaying
+        // is both the faithful thing and the only way newer surface
+        // features survive the trip. It answers in SSE and nothing else,
+        // so a caller who wants a whole body still goes the translated
+        // route, where the stream is aggregated at our end.
+        let codex_relay = out_dialect == Dialect::CodexResponses && stream && !wants_state;
+        let relay = out_dialect == Dialect::OpenAi || codex_relay;
         let (out_body, path, emulated) = if relay {
-            let rewritten = match json::probe(&body) {
-                Some(probe) => json::splice_model(&body, probe.model_span, &route.upstream_model),
-                None => {
-                    let mut v = value.clone();
-                    v["model"] = Value::String(route.upstream_model.clone());
-                    Bytes::from(serde_json::to_vec(&v).expect("serializable"))
+            let rewritten = if codex_relay {
+                Bytes::from(
+                    serde_json::to_vec(&router_providers::subscription::codex_relay_body(
+                        &value,
+                        &route.upstream_model,
+                    ))
+                    .expect("serializable"),
+                )
+            } else {
+                match json::probe(&body) {
+                    Some(probe) => {
+                        json::splice_model(&body, probe.model_span, &route.upstream_model)
+                    }
+                    None => {
+                        let mut v = value.clone();
+                        v["model"] = Value::String(route.upstream_model.clone());
+                        Bytes::from(serde_json::to_vec(&v).expect("serializable"))
+                    }
                 }
             };
-            (rewritten, "/responses".to_owned(), false)
+            let path = if codex_relay {
+                "/backend-api/codex/responses".to_owned()
+            } else {
+                "/responses".to_owned()
+            };
+            (rewritten, path, false)
         } else {
             if wants_state {
                 return Err(GatewayError::new(
@@ -2044,6 +2263,7 @@ pub async fn handle_passthrough(
                 &err,
                 started,
                 &headers,
+                None,
             );
             return error_response(&err);
         }
@@ -2062,6 +2282,7 @@ pub async fn handle_passthrough(
                 &err,
                 started,
                 &headers,
+                None,
             );
             return error_response(&err);
         }
@@ -2096,6 +2317,7 @@ pub async fn handle_passthrough(
                 &err,
                 started,
                 &headers,
+                None,
             );
             error_response(&err)
         }
