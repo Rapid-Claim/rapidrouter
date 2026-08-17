@@ -28,6 +28,22 @@ jobs:
       - name: musl tools
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # `console/dist` is embedded into the binary at compile time and is
+      # gitignored, so a fresh checkout has none. Without this the build
+      # falls back to the placeholder page in `router-server/build.rs`
+      # and the release ships a gateway whose console is a paragraph
+      # explaining that the console was not built. CI already does this
+      # before its cargo steps; a release that does not is the only build
+      # anyone actually downloads getting it wrong.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: console
+      - run: npm run build
+        working-directory: console
       - run: cargo build --release --target ${{ matrix.target }} -p router-bin
       - name: Package
         run: |
