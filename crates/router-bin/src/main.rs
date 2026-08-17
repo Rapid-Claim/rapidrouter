@@ -801,6 +801,9 @@ fn run(cli: Cli) -> ExitCode {
         state.spawn_price_refresher();
         // Usage history out of reach of a lost instance.
         state.spawn_usage_shipper();
+        // Subscription credentials are renewed on their own beat rather
+        // than only when a request happens to need one.
+        state.spawn_seat_maintenance(Duration::from_secs(60));
         state.spawn_heartbeat(
             Duration::from_secs(tuning.heartbeat_interval_secs),
             Duration::from_secs(tuning.liveness_window_secs),

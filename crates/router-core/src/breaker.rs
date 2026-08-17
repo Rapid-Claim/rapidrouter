@@ -81,10 +81,23 @@ impl Breaker {
     /// without consuming anyone's probe slot.
     ///
     /// A benched key never looks healthy, so selection skips it without
-    /// needing to know why it is out.
-    pub fn looks_healthy(&self) -> bool {
-        unpack(self.word.load(Ordering::Acquire)).1 == CLOSED
-            && self.bench_until_ms.load(Ordering::Acquire) == 0
+    /// needing to know why it is out — but only while the bench is still
+    /// running. `now_ms` is required for exactly that reason: reading the
+    /// deadline alone treated an expired bench as current, so a seat whose
+    /// window had rolled stayed out of the healthy pool until some other
+    /// path happened to call [`Self::admit`] and clear the flag. That made
+    /// the first request after every recovery fail against a pool that
+    /// had capacity.
+    pub fn looks_healthy(&self, now_ms: u64) -> bool {
+        unpack(self.word.load(Ordering::Acquire)).1 == CLOSED && !self.is_benched(now_ms)
+    }
+
+    /// Whether a bench is set *and* has not yet elapsed.
+    pub fn is_benched(&self, now_ms: u64) -> bool {
+        match self.bench_until_ms.load(Ordering::Acquire) {
+            0 => false,
+            deadline => now_ms < deadline,
+        }
     }
 
     /// Bench this key until `until_ms`, no matter what the breaker's own
@@ -115,7 +128,7 @@ impl Breaker {
     /// breaker's cooldown, when the truth is a provider quota window they
     /// cannot shorten.
     pub fn health(&self, now_ms: u64) -> &'static str {
-        if self.benched_until_ms().is_some_and(|until| now_ms < until) {
+        if self.is_benched(now_ms) {
             return "benched";
         }
         match unpack(self.word.load(Ordering::Acquire)).1 {
@@ -233,8 +246,10 @@ impl Breaker {
         }
     }
 
-    pub fn is_open(&self) -> bool {
-        !self.looks_healthy()
+    /// Observability only. Takes `now_ms` so an elapsed bench does not
+    /// read as open forever.
+    pub fn is_open(&self, now_ms: u64) -> bool {
+        !self.looks_healthy(now_ms)
     }
 }
 
@@ -313,7 +328,7 @@ mod tests {
         let b = breaker();
         assert_eq!(b.admit(0), Admission::Yes);
         b.bench_until(5_000);
-        assert!(!b.looks_healthy(), "a benched key must not look healthy");
+        assert!(!b.looks_healthy(100), "a benched key must not look healthy");
         assert_eq!(b.admit(100), Admission::No);
         // Not even a probe — the breaker's cooldown is irrelevant here.
         assert_eq!(b.admit(4_999), Admission::No);
@@ -363,6 +378,24 @@ mod tests {
         // Expiry is observed through admit, which clears it.
         assert_eq!(b.admit(1_000), Admission::Yes);
         assert_eq!(b.benched_until_ms(), None);
+    }
+
+    /// A bench that has elapsed is not a bench. Reading the deadline
+    /// without comparing it to now kept a recovered seat out of the
+    /// healthy pool until something else happened to call `admit`, which
+    /// made the first request after every recovery fail.
+    #[test]
+    fn an_elapsed_bench_stops_holding_the_key_out() {
+        let b = breaker();
+        b.bench_until(5_000);
+        assert!(!b.looks_healthy(4_999), "still benched a moment before");
+        assert!(b.is_benched(4_999));
+        assert_eq!(b.admit(4_999), Admission::No);
+
+        assert!(!b.is_benched(5_000), "the deadline is not still out");
+        assert!(b.looks_healthy(5_000), "selection must see it again");
+        assert_eq!(b.health(5_000), "healthy");
+        assert_eq!(b.admit(5_000), Admission::Yes);
     }
 
     #[test]

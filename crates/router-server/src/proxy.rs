@@ -30,6 +30,32 @@ use serde_json::Value;
 use crate::AppState;
 use crate::usage::{self, TokenUsage, UsageHook};
 
+/// Upper bound on attempts against one target, however large its pool.
+///
+/// A caller waits for every attempt serially, so an unbounded walk of a
+/// ninety-seat pool would trade one client's failed request for a minute
+/// of latency. Eight is enough to step over a run of bad seats — the odds
+/// of eight consecutive picks all being unusable are negligible once the
+/// bad ones are being benched as they are found — without letting one
+/// request become a stampede.
+const MAX_ATTEMPTS_PER_TARGET: u32 = 8;
+
+/// How many times to try one target: the configured budget, raised to the
+/// number of keys that could actually serve, capped.
+///
+/// The configured `max_attempts` (2 by default) is right for a couple of
+/// metered keys and wrong for a subscription pool, where each seat is an
+/// independent chance to be served and a bad seat says nothing about the
+/// next one.
+fn attempt_budget(route: &ResolvedRoute, plan: &RoutePlan, now_ms: u64) -> u32 {
+    let available = route
+        .provider
+        .healthy_key_count(&route.upstream_model, now_ms);
+    plan.max_attempts_per_target
+        .max(available)
+        .min(MAX_ATTEMPTS_PER_TARGET)
+}
+
 /// Enforce a virtual key's scope, rate limits, and budget — after model
 /// extraction, before any upstream work.
 fn vk_gate(vk: &VkRuntime, requested: &str, plan: &RoutePlan) -> Result<(), GatewayError> {
@@ -510,34 +536,42 @@ async fn run_chat(
             tracing::debug!(provider = %route.provider.name, param, "dropped unsupported parameter");
         }
 
-        for a_idx in 0..plan.max_attempts_per_target {
-            let is_last_candidate =
-                t_idx + 1 == n_targets && a_idx + 1 == plan.max_attempts_per_target;
+        // How many times this target is worth trying. The configured
+        // budget is a floor, not a ceiling: a pool of ninety seats is
+        // ninety chances to serve, and stopping at two meant one expired
+        // or exhausted seat ended a request the pool could have served.
+        // Bounded so a huge pool cannot turn one client request into a
+        // hundred upstream calls.
+        let budget = attempt_budget(route, &plan, clock::now_ms());
+        for a_idx in 0..budget {
+            let is_last_candidate = t_idx + 1 == n_targets && a_idx + 1 == budget;
             let now = clock::now_ms();
             let Some(choice) = route.provider.admit_key(&route.upstream_model, now) else {
                 // A subscription pool with every seat out of quota is rate
                 // limited, not out of capacity. The distinction is what
                 // the caller does next: a 503 invites an immediate retry,
                 // a 429 tells them there is a window to wait for.
-                last_error = Some(if route.provider.all_keys_benched(&route.upstream_model) {
-                    GatewayError::new(
-                        ErrorClass::RateLimited,
-                        format!(
-                            "every seat of provider `{}` is out of quota for model `{}`",
-                            route.provider.name, route.upstream_model
-                        ),
-                    )
-                    .with_provider(&route.provider.name)
-                } else {
-                    GatewayError::new(
-                        ErrorClass::NoCapacity,
-                        format!(
-                            "no healthy key of provider `{}` for model `{}`",
-                            route.provider.name, route.upstream_model
-                        ),
-                    )
-                    .with_provider(&route.provider.name)
-                });
+                last_error = Some(
+                    if route.provider.all_keys_benched(&route.upstream_model, now) {
+                        GatewayError::new(
+                            ErrorClass::RateLimited,
+                            format!(
+                                "every seat of provider `{}` is out of quota for model `{}`",
+                                route.provider.name, route.upstream_model
+                            ),
+                        )
+                        .with_provider(&route.provider.name)
+                    } else {
+                        GatewayError::new(
+                            ErrorClass::NoCapacity,
+                            format!(
+                                "no healthy key of provider `{}` for model `{}`",
+                                route.provider.name, route.upstream_model
+                            ),
+                        )
+                        .with_provider(&route.provider.name)
+                    },
+                );
                 break;
             };
             let Ok(permit) = route.provider.semaphore.clone().try_acquire_owned() else {
@@ -665,10 +699,24 @@ async fn attempt(
         }
         Ok(response) => {
             let status = response.status();
+            // A subscription seat's 401 is a fact about that seat's
+            // credential, not about the request: the other seats hold
+            // their own tokens and most of them work. Retrying it on the
+            // next seat is always right, and is not configurable for the
+            // same reason a connect error to one host does not stop us
+            // trying the next — the caller asked for an answer, not for a
+            // particular credential.
+            let seat_auth_failure =
+                route.provider.kind.is_subscription() && matches!(status.as_u16(), 401 | 403);
             let retryable = (status.as_u16() == 429 && plan.retry_on.contains(&RetryOn::Status429))
-                || (status.is_server_error() && plan.retry_on.contains(&RetryOn::Status5xx));
+                || (status.is_server_error() && plan.retry_on.contains(&RetryOn::Status5xx))
+                || seat_auth_failure;
 
-            if status.is_server_error() || status.as_u16() == 429 {
+            // A seat that cannot authenticate must leave the healthy pool,
+            // or every request keeps rediscovering it. Counted as a
+            // breaker failure so it opens after the configured threshold
+            // and is stepped over until it recovers.
+            if status.is_server_error() || status.as_u16() == 429 || seat_auth_failure {
                 breaker.record_failure(clock::now_ms());
             } else {
                 breaker.record_success(clock::now_ms());
@@ -688,8 +736,13 @@ async fn attempt(
                 // a seat that stays broken until someone notices: the
                 // proactive path only fires near a *known* expiry, and an
                 // out-of-band revocation has no expiry to be near.
+                // Not gated on `is_last_candidate`: renewing is worth
+                // doing even when there is no attempt left to spend on
+                // it, because the renewed token is what makes the *next*
+                // request succeed. Skipping it on the final attempt is
+                // how eighteen seats sat expired while every request that
+                // landed on one returned 401 to the caller.
                 if status.as_u16() == 401
-                    && !is_last_candidate
                     && let Some(key) = key
                     && let Some(seat) = key.seat()
                     && let Some(path) = key.source_path.as_deref()
@@ -708,16 +761,24 @@ async fn attempt(
                         "provider" => route.provider.name.clone(),
                     )
                     .increment(1);
-                    return AttemptOutcome::Retry(
-                        GatewayError::new(
-                            ErrorClass::UpstreamError,
-                            format!(
-                                "seat credential of provider `{}` was renewed; retrying",
-                                route.provider.name
-                            ),
-                        )
-                        .with_provider(&route.provider.name),
-                    );
+                    if !is_last_candidate {
+                        return AttemptOutcome::Retry(
+                            GatewayError::new(
+                                ErrorClass::UpstreamError,
+                                format!(
+                                    "seat credential of provider `{}` was renewed; retrying",
+                                    route.provider.name
+                                ),
+                            )
+                            .with_provider(&route.provider.name),
+                        );
+                    }
+                    // Out of attempts, but the seat is now usable again.
+                    // Clearing the failure we just recorded keeps it in
+                    // the pool for the next request instead of holding a
+                    // working seat out on the strength of a 401 we have
+                    // already fixed.
+                    breaker.record_success(clock::now_ms());
                 }
             }
 
@@ -1467,8 +1528,9 @@ async fn run_relay(
             );
             continue;
         }
-        for a_idx in 0..plan.max_attempts_per_target {
-            let is_last = t_idx + 1 == n_targets && a_idx + 1 == plan.max_attempts_per_target;
+        let budget = attempt_budget(route, &plan, clock::now_ms());
+        for a_idx in 0..budget {
+            let is_last = t_idx + 1 == n_targets && a_idx + 1 == budget;
             let now = clock::now_ms();
             let Some(choice) = route.provider.admit_key(&route.upstream_model, now) else {
                 last_error = Some(

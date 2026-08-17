@@ -24,7 +24,8 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use router_core::config::Config;
+use router_core::config::{Config, ProviderKind};
+use router_core::credential::Seat;
 use router_core::router::RoutingTable;
 use router_core::vkey::{self, VirtualKeyDef, VkRuntime, VkTable};
 use router_core::{ErrorClass, GatewayError};
@@ -342,6 +343,86 @@ impl AppState {
                     Err(err) => tracing::warn!(%err, "could not refresh model prices"),
                 }
                 tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+            }
+        });
+    }
+
+    /// Keep every subscription seat's credential fresh, off the request
+    /// path.
+    ///
+    /// Renewal used to happen only when a request was already in flight —
+    /// proactively just before a token was used, or reactively on the 401
+    /// it caused. A seat nobody happened to route to therefore sat expired
+    /// until traffic found it, and the request that found it was the one
+    /// that paid: a pool of eighty-nine seats accumulated eighteen expired
+    /// credentials, and better than half of all requests were answering
+    /// 401 to callers.
+    ///
+    /// This closes that gap. Renewal is *ahead* of expiry (the same skew
+    /// the request path uses), so a seat is ready before anything needs
+    /// it, and a token that cannot be renewed is a fact the console can
+    /// show rather than one discovered by failing a caller.
+    ///
+    /// Deliberately renewal only, not probing. A probe spends real quota
+    /// on every seat on every tick, which on a subscription plan is the
+    /// resource being conserved; expiry is knowable from the token itself,
+    /// so this reads it instead of asking the provider.
+    pub fn spawn_seat_maintenance(self: &Arc<Self>, interval: Duration) {
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                tokio::time::sleep(interval).await;
+                let table = state.table.load();
+                // Collected first so the routing snapshot is not held
+                // across an await; a reload may swap it underneath us.
+                let seats: Vec<(ProviderKind, String, Arc<Seat>, String)> = table
+                    .providers()
+                    .filter(|p| p.kind.is_subscription())
+                    .flat_map(|p| {
+                        p.keys.iter().filter_map(|k| {
+                            Some((
+                                p.kind,
+                                p.name.clone(),
+                                k.seat()?.clone(),
+                                k.source_path.clone()?,
+                            ))
+                        })
+                    })
+                    .collect();
+                drop(table);
+
+                let mut renewed = 0usize;
+                let mut failed = 0usize;
+                for (kind, provider, seat, path) in seats {
+                    let now = vkey::unix_now_ms();
+                    if !seat.current().wants_refresh(now, refresh::REFRESH_SKEW_MS)
+                        && !seat.current().is_expired(now)
+                    {
+                        continue;
+                    }
+                    if refresh::refresh_now(
+                        &state.upstream,
+                        &state.refreshes,
+                        kind,
+                        &seat,
+                        &refresh::Persist::File(path),
+                        now,
+                    )
+                    .await
+                    {
+                        renewed += 1;
+                        metrics::counter!(
+                            "rapid_seat_refresh_total",
+                            "provider" => provider.clone(),
+                        )
+                        .increment(1);
+                    } else {
+                        failed += 1;
+                    }
+                }
+                if renewed > 0 || failed > 0 {
+                    tracing::info!(renewed, failed, "subscription seats renewed");
+                }
             }
         });
     }

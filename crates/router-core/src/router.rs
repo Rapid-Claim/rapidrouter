@@ -410,7 +410,7 @@ impl ProviderRuntime {
         let healthy: Vec<&KeyRuntime> = eligible
             .iter()
             .copied()
-            .filter(|k| k.breaker.looks_healthy())
+            .filter(|k| k.breaker.looks_healthy(now_ms))
             .collect();
         // Weighted pick among the healthy, skipping any key that is over
         // its own rate ceiling. A rate-limited key is not *unhealthy* —
@@ -428,15 +428,47 @@ impl ProviderRuntime {
             candidates.retain(|k| !std::ptr::eq(*k, picked));
         }
 
+        // Nothing looked healthy. `admit` is the authority and it also
+        // clears a bench that has elapsed, so a seat whose window rolled
+        // between the filter above and here answers `Yes` — take it.
+        // Insisting on `Probe` here used to drop that seat on the floor
+        // and report the whole pool exhausted.
         for key in eligible {
-            if key.breaker.admit(now_ms) == Admission::Probe {
-                return Some(KeyChoice {
-                    key: Some(key),
-                    admission: Admission::Probe,
-                });
+            match key.breaker.admit(now_ms) {
+                Admission::No => continue,
+                admission => {
+                    if admission == Admission::Yes && !key.try_admit_request(now_ms) {
+                        continue;
+                    }
+                    return Some(KeyChoice {
+                        key: Some(key),
+                        admission,
+                    });
+                }
             }
         }
         None
+    }
+
+    /// How many eligible keys could serve `model` right now.
+    ///
+    /// The dispatch loop sizes its retry budget from this. A fixed budget
+    /// of two attempts is a sane default for a pool of two metered keys
+    /// and badly wrong for a subscription pool of ninety seats: one bad
+    /// seat would end the request while eighty-eight healthy ones sat
+    /// idle. Counting the *healthy* keys rather than all of them keeps the
+    /// budget honest — retrying more times than there are seats to try
+    /// only burns the caller's latency.
+    pub fn healthy_key_count(&self, model: &str, now_ms: u64) -> u32 {
+        if self.keys.is_empty() {
+            return 1;
+        }
+        self.keys
+            .iter()
+            .filter(|k| k.models.as_ref().is_none_or(|m| m.contains(model)))
+            .filter(|k| k.breaker.looks_healthy(now_ms))
+            .count()
+            .max(1) as u32
     }
 
     /// Whether every eligible key for `model` is benched on a quota
@@ -448,13 +480,16 @@ impl ProviderRuntime {
     /// exhausted subscription pool is a rate limit with a known reset —
     /// and telling a caller "no capacity" when the truth is "out of quota
     /// until Tuesday" sends them into a retry loop that cannot succeed.
-    pub fn all_keys_benched(&self, model: &str) -> bool {
+    pub fn all_keys_benched(&self, model: &str, now_ms: u64) -> bool {
         let mut eligible = self
             .keys
             .iter()
             .filter(|k| k.models.as_ref().is_none_or(|m| m.contains(model)))
             .peekable();
-        eligible.peek().is_some() && eligible.all(|k| k.breaker.benched_until_ms().is_some())
+        // Only benches that are still running count. Answering "out of
+        // quota until Tuesday" off a deadline that passed on Sunday sends
+        // the caller away from a pool that is ready to serve.
+        eligible.peek().is_some() && eligible.all(|k| k.breaker.is_benched(now_ms))
     }
 
     /// The breaker an attempt outcome should be recorded against.
@@ -593,7 +628,7 @@ keys = [
         }
         // Being out of allowance is not a fault: nothing failed upstream,
         // and the key must come back on its own without a probe.
-        assert!(slow.breaker.looks_healthy());
+        assert!(slow.breaker.looks_healthy(61_000));
         assert!(
             slow.try_admit_request(61_000),
             "a minute later the allowance has refilled"
@@ -746,6 +781,69 @@ fast = "groq/llama-3.3-70b"
         for _ in 0..50 {
             assert_eq!(r.provider.select_key("other-model").unwrap().name, "b");
         }
+    }
+
+    /// A pool is only worth its healthy seats, and the dispatch loop
+    /// sizes its retry budget from this. Benched seats must not count:
+    /// budgeting attempts for seats that cannot serve spends the
+    /// caller's latency on picks that are refused before they leave.
+    #[test]
+    fn the_healthy_count_tracks_the_pool() {
+        let t = table(
+            r#"
+[providers.openai]
+keys = [
+  { name = "a", value = "sk-a" },
+  { name = "b", value = "sk-b" },
+  { name = "c", value = "sk-c" },
+]
+"#,
+        );
+        let r = t.resolve("openai/gpt-4o").unwrap();
+        assert_eq!(r.provider.healthy_key_count("gpt-4o", 0), 3);
+
+        r.provider.keys[0].breaker.bench_until(10_000);
+        r.provider.keys[1].breaker.bench_until(10_000);
+        assert_eq!(r.provider.healthy_key_count("gpt-4o", 5_000), 1);
+        assert!(!r.provider.all_keys_benched("gpt-4o", 5_000));
+
+        // Every seat out: a rate limit, not a capacity problem.
+        r.provider.keys[2].breaker.bench_until(10_000);
+        assert!(r.provider.all_keys_benched("gpt-4o", 5_000));
+        assert_eq!(
+            r.provider.healthy_key_count("gpt-4o", 5_000),
+            1,
+            "floors at 1"
+        );
+
+        // Once the windows roll, the pool is whole again without anyone
+        // having had to fail a request to discover it.
+        assert!(!r.provider.all_keys_benched("gpt-4o", 10_000));
+        assert_eq!(r.provider.healthy_key_count("gpt-4o", 10_000), 3);
+    }
+
+    /// The seat whose bench just elapsed has to be *returned*, not merely
+    /// un-benched. The recovery loop only accepted `Probe`, so a pool of
+    /// freshly recovered seats answered "nothing admitted" and the caller
+    /// saw a 429 against a pool that was ready.
+    #[test]
+    fn a_pool_coming_off_the_bench_admits_immediately() {
+        let t = table(
+            r#"
+[providers.openai]
+keys = [{ name = "only", value = "sk-a" }]
+"#,
+        );
+        let r = t.resolve("openai/gpt-4o").unwrap();
+        r.provider.keys[0].breaker.bench_until(10_000);
+        assert!(r.provider.admit_key("gpt-4o", 9_999).is_none());
+
+        let choice = r
+            .provider
+            .admit_key("gpt-4o", 10_000)
+            .expect("the window rolled; the seat serves again");
+        assert_eq!(choice.key.unwrap().name, "only");
+        assert_eq!(choice.admission, Admission::Yes);
     }
 
     #[test]

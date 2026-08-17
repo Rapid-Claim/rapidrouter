@@ -487,6 +487,7 @@ function Providers(props: { refresh: () => number }) {
     </section>
 
     <Drawer
+      wide
       open={Boolean(current())}
       title={current() ? providerMeta(current()!.name, current()!.kind).label : ""}
       subtitle={current()?.name}
@@ -576,9 +577,18 @@ function codexEmailFrom(content: string): string | null {
   }
 }
 
+/// A seat name that identifies the *account*, not just its mailbox.
+///
+/// This used to take the local part alone, so `ali@one.com` and
+/// `ali@two.com` collided and the uploader numbered them `ali`, `ali-2`
+/// as though one account had been added twice. That is worse than a
+/// cosmetic naming problem: each seat entry carries its own breaker, so
+/// two entries for one account let traffic keep hitting an account whose
+/// twin was just benched for being out of quota. The whole address keeps
+/// distinct accounts distinct.
 function seatNameFrom(email: string | null, fallback: string): string {
   if (!email) return fallback;
-  return email.split("@")[0].toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+  return email.toLowerCase().replace(/[^a-z0-9_-]/g, "-").replace(/-+/g, "-").replace(/^-|-$/g, "");
 }
 
 export type Seat = { name: string; email: string | null; content: string; file: string };
@@ -590,10 +600,18 @@ export type Seat = { name: string; email: string | null; content: string; file: 
 /// real thing in an exported pool (the same login authorised twice), so
 /// duplicates are numbered rather than silently collapsed — the operator
 /// can see them and drop the extras.
-export async function seatsFromFiles(files: File[]): Promise<{ seats: Seat[]; rejected: string[] }> {
+export async function seatsFromFiles(
+  files: File[],
+  taken: Iterable<string> = [],
+): Promise<{ seats: Seat[]; rejected: string[] }> {
   const seats: Seat[] = [];
   const rejected: string[] = [];
   const used = new Map<string, number>();
+  // Names already on the provider count as used. Without this a second
+  // upload produced names the gateway had to reject or silently skip, so
+  // adding forty files could yield fewer than forty seats with nothing
+  // said about which were dropped.
+  for (const name of taken) used.set(name, 1);
   for (const file of files) {
     const content = await file.text();
     let parsed: any;
@@ -629,6 +647,9 @@ function CredentialField(props: {
   onToken: (token: string) => void;
   onFile: (content: string, email: string | null) => void;
   onSeats?: (seats: Seat[], rejected: string[]) => void;
+  /// Names already configured on this provider, so an upload does not
+  /// propose one the gateway would reject or skip.
+  taken?: string[];
 }) {
   const [fileName, setFileName] = createSignal("");
   const [seats, setSeats] = createSignal<Seat[]>([]);
@@ -659,7 +680,7 @@ function CredentialField(props: {
             const picked = [...(e.currentTarget.files ?? [])];
             if (!picked.length) return;
             if (props.onSeats) {
-              const result = await seatsFromFiles(picked);
+              const result = await seatsFromFiles(picked, props.taken ?? []);
               setSeats(result.seats);
               setRejected(result.rejected);
               setFileName(picked.length === 1 ? picked[0].name : `${picked.length} files`);
@@ -1118,6 +1139,7 @@ function AddCredential(props: { provider: Provider; onDone: () => void; onError:
           <CredentialField
             kind={kind()}
             placeholder="env.OPENAI_API_KEY, file:/path or store.name"
+            taken={props.provider.keys.map((k) => k.name)}
             onToken={setValue}
             onFile={(content, email) => {
               setFileContent(content);
