@@ -310,9 +310,13 @@ impl AppState {
                 if shipped > 0 || failed > 0 {
                     tracing::debug!(shipped, failed, "usage partitions shipped");
                 }
-                // Other nodes' rollups, refreshed on the same beat so the
-                // console's fleet totals are at most a minute stale.
-                let rows = usage::fleet_rollups(&store, 90, &node).await;
+                // Everything the local disk does not already hold,
+                // refreshed on the same beat so the console's fleet
+                // totals are at most a minute stale. Shipping first
+                // matters: this node's newest files are on disk and in
+                // the store by the time the read runs, and the read
+                // skips the ones it can see locally.
+                let rows = usage::fleet_rollups(&store, 90, &dir).await;
                 state.usage.set_fleet_rollups(rows);
                 tokio::time::sleep(Duration::from_secs(60)).await;
             }

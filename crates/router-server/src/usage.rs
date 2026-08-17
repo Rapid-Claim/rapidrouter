@@ -1709,12 +1709,20 @@ pub async fn ship_partitions(
 /// spend and an operator would have no way to tell. Rollups are small
 /// enough that reading the whole window from the store is cheap, and the
 /// result is cached briefly so a page of charts is one read, not eight.
+///
+/// What this must not do is count traffic twice, and the only rows at
+/// risk are the ones `history` has already read off local disk. Those
+/// are identified by the file that holds them, not by the node that
+/// wrote it: node identity is minted fresh every boot, so a gateway that
+/// keeps its data dir across a restart would no longer recognise its own
+/// shipped objects and would add them to the rows it just read locally.
 pub async fn fleet_rollups(
     store: &router_store::Store,
     days: u32,
-    exclude_node: &str,
+    local_dir: &std::path::Path,
 ) -> Vec<RollupRow> {
     let cutoff = day_partition(vkey::unix_now_ms().saturating_sub(days.max(1) as u64 * 86_400_000));
+    let local = local_rollup_files(&local_dir.join("rollup"));
     let Ok(keys) = store.list_blobs("rollup/").await else {
         return Vec::new();
     };
@@ -1722,14 +1730,16 @@ pub async fn fleet_rollups(
     for key in keys {
         // rollup/dt=YYYY-MM-DD/node=<id>/<file>
         let mut parts = key.split('/');
-        let (Some(_), Some(day), Some(node)) = (parts.next(), parts.next(), parts.next()) else {
+        let (Some(_), Some(day), Some(_), Some(file)) =
+            (parts.next(), parts.next(), parts.next(), parts.next())
+        else {
             continue;
         };
         if day < cutoff.as_str() {
             continue;
         }
-        // This node's own rows are already read from local disk.
-        if node.trim_start_matches("node=") == exclude_node {
+        // Already read from local disk, whichever identity shipped it.
+        if local.contains(&(day.to_owned(), file.to_owned())) {
             continue;
         }
         let Ok(Some(body)) = store.get_blob(&key).await else {
@@ -1746,6 +1756,33 @@ pub async fn fleet_rollups(
         }
     }
     rows
+}
+
+/// Every rollup file on local disk, as the `(day, file name)` pair that
+/// also names its shipped object. Rollup file names carry the writing
+/// node's id, so a name is unique across the fleet without the node
+/// segment — which is what lets this survive the id changing.
+fn local_rollup_files(rollup_dir: &std::path::Path) -> BTreeSet<(String, String)> {
+    let mut out = BTreeSet::new();
+    let Ok(days) = std::fs::read_dir(rollup_dir) else {
+        return out;
+    };
+    for day in days.flatten() {
+        let day_name = day.file_name().to_string_lossy().into_owned();
+        if !day_name.starts_with("dt=") {
+            continue;
+        }
+        let Ok(files) = std::fs::read_dir(day.path()) else {
+            continue;
+        };
+        for file in files.flatten() {
+            let name = file.file_name().to_string_lossy().into_owned();
+            if name.ends_with(".zst") {
+                out.insert((day_name.clone(), name));
+            }
+        }
+    }
+    out
 }
 
 /// Day partitions at or after `cutoff`, sorted.
@@ -2296,5 +2333,41 @@ mod tests {
             .collect();
         assert_eq!(partitions.len(), 1);
         assert_eq!(partitions[0], day_partition(now));
+    }
+
+    /// A node that keeps its data dir across a restart writes under a
+    /// new identity but still holds the old files. Both are read from
+    /// local disk, so the fleet read has to recognise both shipped
+    /// objects as its own — otherwise every pre-restart day is counted
+    /// twice.
+    #[test]
+    fn a_restart_does_not_make_this_nodes_own_rollups_look_foreign() {
+        let dir = tempfile::tempdir().unwrap();
+        let now = vkey::unix_now_ms();
+        let rec = record(now, "openai", "gpt-4o-mini", Some("k1"), 200);
+        let batch = std::slice::from_ref(&rec);
+        write_rollups(dir.path(), "node-before", 0, &roll_up(batch)).unwrap();
+        write_rollups(dir.path(), "node-after", 1, &roll_up(batch)).unwrap();
+
+        let local = local_rollup_files(&dir.path().join("rollup"));
+        assert_eq!(local.len(), 2);
+
+        // The keys `ship_partitions` uploads for those same two files.
+        let day = day_partition(now);
+        for node in ["node-before", "node-after"] {
+            let seq = if node == "node-before" { 0 } else { 1 };
+            let key = format!("rollup/{day}/node={node}/{node}-{seq:08}.jsonl.zst");
+            let mut parts = key.split('/');
+            let (_, day_part, _, file) = (
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+                parts.next().unwrap(),
+            );
+            assert!(
+                local.contains(&(day_part.to_owned(), file.to_owned())),
+                "{key} should be recognised as already read from local disk",
+            );
+        }
     }
 }

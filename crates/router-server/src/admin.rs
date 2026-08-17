@@ -1338,7 +1338,16 @@ async fn probe_provider(
 }
 
 /// The model a probe should ask for: whatever this credential declares
-/// first, else whatever the provider serves.
+/// first, else whatever the provider serves, else — for a subscription
+/// seat — whatever the plan is known to serve.
+///
+/// That last step exists because a seat's model set is not an operator
+/// choice the way a metered provider's is: the plan decides it, and the
+/// catalog already records it. Without it a freshly added seat cannot be
+/// checked at all, and the console reports "no model declared" for a
+/// credential that is perfectly able to answer. A metered provider gets
+/// no such guess — an id the account cannot reach would fail the check
+/// and blame the credential.
 fn probe_model(provider: &router_core::router::ProviderRuntime, key_name: &str) -> Option<String> {
     provider
         .keys
@@ -1350,6 +1359,16 @@ fn probe_model(provider: &router_core::router::ProviderRuntime, key_name: &str) 
                 .keys
                 .iter()
                 .find_map(|k| k.models.as_ref().and_then(|m| m.first().cloned()))
+        })
+        .or_else(|| {
+            let preset = match provider.kind {
+                router_core::config::ProviderKind::ClaudeSubscription => "claude_subscription",
+                router_core::config::ProviderKind::CodexSubscription => "codex_subscription",
+                _ => return None,
+            };
+            router_core::config::presets::catalog(preset)
+                .first()
+                .map(|m| m.id.to_owned())
         })
 }
 
