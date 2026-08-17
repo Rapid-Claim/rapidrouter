@@ -522,9 +522,7 @@ async fn probe(url: &str, provider: &str, model: &str) -> Value {
         .expect("a session token")
         .to_owned();
     client
-        .post(format!(
-            "{url}/admin/api/providers/{provider}/probe"
-        ))
+        .post(format!("{url}/admin/api/providers/{provider}/probe"))
         .bearer_auth(&token)
         .json(&if model.is_empty() {
             json!({})
