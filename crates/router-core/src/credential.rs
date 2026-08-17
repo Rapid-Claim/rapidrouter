@@ -45,6 +45,12 @@ pub struct SeatState {
     /// ChatGPT account id, for the `ChatGPT-Account-Id` header. Codex
     /// only; `None` on every other credential shape.
     pub account_id: Option<String>,
+    /// The account this seat signs in as, when the credential says so.
+    ///
+    /// Read once at parse time rather than on demand: it is the only
+    /// human-readable handle a pool of eighty seats has, and decoding a
+    /// JWT per console render to recover it would be absurd.
+    pub email: Option<String>,
     /// Expiry in epoch milliseconds, when it can be determined — from a
     /// JWT `exp` claim (Codex) or an explicit field (Claude Code).
     /// `None` means "unknown", which is treated as "do not pre-emptively
@@ -181,6 +187,7 @@ pub fn parse_codex_auth_json(document: &str) -> Result<SeatState, CredentialErro
         access_token: SecretString::new(access_token.to_owned()),
         refresh_token: field("refresh_token").map(|t| SecretString::new(t.to_owned())),
         account_id: Some(account_id),
+        email: id_token.and_then(jwt_email),
         document: SecretString::new(document.to_owned()),
     })
 }
@@ -220,6 +227,8 @@ pub fn parse_claude_oauth_json(document: &str) -> Result<SeatState, CredentialEr
             .get("expiresAt")
             .or_else(|| oauth.get("expires_at"))
             .and_then(Value::as_u64),
+        // Claude's document carries no account claim.
+        email: None,
         document: SecretString::new(document.to_owned()),
     })
 }
@@ -237,6 +246,8 @@ pub fn inline_token(token: &str) -> Result<SeatState, CredentialError> {
         access_token: SecretString::new(token.to_owned()),
         refresh_token: None,
         account_id: None,
+        // Claude's document carries no account claim.
+        email: None,
         document: SecretString::new(String::new()),
     })
 }
@@ -355,6 +366,22 @@ pub fn jwt_expiry_ms(token: &str) -> Option<u64> {
 ///
 /// It lives under a namespaced claim (`https://api.openai.com/auth`) and,
 /// on some tokens, at the top level; both are checked.
+/// The account email from an OpenAI id_token's claims.
+fn jwt_email(id_token: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let claims: Value = serde_json::from_slice(&base64url_decode(payload)?).ok()?;
+    claims
+        .get("email")
+        .or_else(|| {
+            claims
+                .get("https://api.openai.com/profile")
+                .and_then(|p| p.get("email"))
+        })
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .map(str::to_owned)
+}
+
 fn chatgpt_account_id(id_token: &str) -> Option<String> {
     let payload = id_token.split('.').nth(1)?;
     let claims: Value = serde_json::from_slice(&base64url_decode(payload)?).ok()?;
@@ -535,6 +562,7 @@ mod tests {
     #[test]
     fn expiry_is_fail_open_when_unknown() {
         let state = SeatState {
+            email: None,
             access_token: SecretString::new("opaque".into()),
             refresh_token: None,
             account_id: None,

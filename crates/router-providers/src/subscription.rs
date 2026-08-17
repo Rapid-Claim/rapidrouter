@@ -1252,3 +1252,29 @@ pub fn aggregate_sse(body: &[u8], model: &str) -> Value {
     }
     aggregate_chunks(&chunks)
 }
+
+/// Prepare a Responses-shaped body for a native relay to the Codex
+/// backend.
+///
+/// The Codex backend *is* the Responses API, so a Responses request
+/// belongs on the wire almost verbatim: translating it down to the
+/// stateless chat core and back loses everything the surface has added
+/// since (`additional_tools` for web search, reasoning items, encrypted
+/// content), and made those requests fail outright rather than degrade.
+///
+/// Only what the backend genuinely requires is imposed: the caller's
+/// model is replaced with the routed one, `stream` is forced on (the
+/// backend offers nothing else), `store` off (it keeps no state for us),
+/// and `instructions` defaulted when absent, which the backend demands.
+pub fn codex_relay_body(value: &Value, model: &str) -> Value {
+    let mut body = value.clone();
+    if let Some(object) = body.as_object_mut() {
+        object.insert("model".into(), json!(model));
+        object.insert("stream".into(), json!(true));
+        object.insert("store".into(), json!(false));
+        if !object.get("instructions").is_some_and(|i| i.is_string()) {
+            object.insert("instructions".into(), json!("You are Codex."));
+        }
+    }
+    body
+}

@@ -197,7 +197,7 @@ fn data_dir(cli: &Cli) -> PathBuf {
             std::env::var_os("HOME")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("."))
-                .join(".rapid-router")
+                .join(".rapidrouter")
         })
 }
 
@@ -797,6 +797,10 @@ fn run(cli: Cli) -> ExitCode {
         // The two timers that stand in for a cluster: one to notice what
         // other nodes wrote, one to tell them we are here.
         state.spawn_refresher(Duration::from_secs(tuning.refresh_interval_secs));
+        // Model prices, kept current from the public catalog.
+        state.spawn_price_refresher();
+        // Usage history out of reach of a lost instance.
+        state.spawn_usage_shipper();
         state.spawn_heartbeat(
             Duration::from_secs(tuning.heartbeat_interval_secs),
             Duration::from_secs(tuning.liveness_window_secs),

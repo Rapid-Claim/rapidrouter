@@ -43,6 +43,20 @@ const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(15);
 #[derive(Clone, Default)]
 pub struct VkCtx(pub Option<Arc<VkRuntime>>);
 
+/// One console session: when it lapses, and who it belongs to.
+#[derive(Debug, Clone)]
+pub struct Session {
+    pub expires_ms: u64,
+    pub principal: Principal,
+}
+
+/// Who authenticated: the shared admin key, or a stored user.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Principal {
+    AdminKey,
+    User { id: String },
+}
+
 pub struct AppState {
     pub config: ArcSwap<Config>,
     pub table: ArcSwap<RoutingTable>,
@@ -53,10 +67,13 @@ pub struct AppState {
     pub store: Option<Arc<Store>>,
     /// Live console events (request ticks, config applies).
     pub events: tokio::sync::broadcast::Sender<serde_json::Value>,
-    /// Admin session tokens -> unix-ms expiry.
-    pub sessions: Mutex<HashMap<String, u64>>,
+    /// Admin session tokens -> expiry and who holds them.
+    pub sessions: Mutex<HashMap<String, Session>>,
     /// Config's source of truth is a file: admin writes are disabled.
     pub file_managed: bool,
+    /// Where this node keeps local state; uploaded credential files are
+    /// written beneath it.
+    pub data_dir: Option<PathBuf>,
     /// How recently a node must have heartbeated to count as live. Read
     /// by the fleet endpoint and the heartbeat task.
     pub liveness_window: Duration,
@@ -77,6 +94,14 @@ impl AppState {
     /// pure-env deployments.
     pub fn new(config: Config) -> Arc<Self> {
         Self::build(config, None, None, true)
+    }
+
+    /// Ephemeral config with usage persisted to disk. For tests that
+    /// exercise the history and body paths without a control-plane
+    /// store.
+    #[doc(hidden)]
+    pub fn with_data_dir(config: Config, data_dir: PathBuf) -> Arc<Self> {
+        Self::build(config, None, Some(data_dir), true)
     }
 
     /// Managed mode: the store is the source of truth and admin writes
@@ -109,6 +134,7 @@ impl AppState {
         if let Some(dir) = data_dir.as_deref() {
             usage::UsagePipeline::seed_budgets(dir, &vkeys);
         }
+        let retained_data_dir = data_dir.clone();
         let (events, _) = tokio::sync::broadcast::channel(256);
         Arc::new(Self {
             config: ArcSwap::from_pointee(config),
@@ -119,6 +145,7 @@ impl AppState {
             store,
             events,
             sessions: Mutex::new(HashMap::new()),
+            data_dir: retained_data_dir,
             file_managed,
             liveness_window: DEFAULT_LIVENESS_WINDOW,
             applied_text: ArcSwap::from_pointee(None),
@@ -250,6 +277,71 @@ impl AppState {
     /// The cost is that a config change takes up to one interval to reach
     /// the fleet, which for a document a human edits is not a cost worth
     /// engineering away.
+    /// Keep model prices current without anyone maintaining a table.
+    ///
+    /// Fetched once at startup and then daily: prices move rarely, new
+    /// models appear constantly, and a gateway that reports $0.00 for a
+    /// model released last week is worse than useless — it is quietly
+    /// wrong in the direction of "everything is free". A failed fetch is
+    /// logged and left alone; the built-in table and any `[pricing]`
+    /// entries keep working, so this can only improve on what is there.
+    /// Ship usage history to the store, and keep a fleet-wide rollup
+    /// view warm.
+    ///
+    /// Every minute rather than on every flush: uploads are per file and
+    /// a busy gateway writes one file per flush interval, so batching the
+    /// scan keeps object counts and request costs sane while still
+    /// putting history out of reach of a lost instance within a minute.
+    pub fn spawn_usage_shipper(self: &Arc<Self>) {
+        let Some(store) = self.store.clone() else {
+            return;
+        };
+        if !store.holds_blobs() {
+            return;
+        }
+        let Some(dir) = self.data_dir.clone() else {
+            return;
+        };
+        let state = self.clone();
+        let node = store.node_id().to_owned();
+        tokio::spawn(async move {
+            loop {
+                let (shipped, failed) = usage::ship_partitions(&store, &dir, &node).await;
+                if shipped > 0 || failed > 0 {
+                    tracing::debug!(shipped, failed, "usage partitions shipped");
+                }
+                // Other nodes' rollups, refreshed on the same beat so the
+                // console's fleet totals are at most a minute stale.
+                let rows = usage::fleet_rollups(&store, 90, &node).await;
+                state.usage.set_fleet_rollups(rows);
+                tokio::time::sleep(Duration::from_secs(60)).await;
+            }
+        });
+    }
+
+    pub fn spawn_price_refresher(self: &Arc<Self>) {
+        let url = std::env::var("RAPID_PRICE_CATALOG_URL")
+            .unwrap_or_else(|_| usage::DEFAULT_PRICE_CATALOG_URL.to_owned());
+        if url.eq_ignore_ascii_case("off") {
+            return;
+        }
+        let state = self.clone();
+        tokio::spawn(async move {
+            loop {
+                match usage::fetch_catalog(&state.upstream, &url).await {
+                    Ok(catalog) => {
+                        let count = catalog.len();
+                        let updated = state.pricing.load().with_catalog(Arc::new(catalog));
+                        state.pricing.store(Arc::new(updated));
+                        tracing::info!(models = count, "model price catalog loaded");
+                    }
+                    Err(err) => tracing::warn!(%err, "could not refresh model prices"),
+                }
+                tokio::time::sleep(Duration::from_secs(24 * 60 * 60)).await;
+            }
+        });
+    }
+
     pub fn spawn_refresher(self: &Arc<Self>, interval: Duration) {
         let Some(store) = self.store.clone() else {
             return;
@@ -391,6 +483,8 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         .layer(axum::middleware::from_fn(request_id));
     #[cfg(feature = "console")]
     let app = app
+        .route("/favicon.svg", get(console::favicon))
+        .route("/favicon.ico", get(console::favicon))
         .route("/console", get(console::root))
         .route("/console/", get(console::root))
         .route("/console/{*path}", get(console::asset));

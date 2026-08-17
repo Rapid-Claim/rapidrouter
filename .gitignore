@@ -11,4 +11,9 @@ console/playwright-report/
 console/tsconfig.tsbuildinfo
 
 # Local gateway state from `make run`
+/.rapidrouter
+# The pre-rename data dir, so an older checkout does not commit one.
 /.rapid-data
+
+# macOS finder droppings
+.DS_Store

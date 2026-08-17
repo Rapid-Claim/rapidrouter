@@ -314,10 +314,32 @@ fn validate_usage(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> super::Usag
             "must be between 1 and 300",
         ));
     }
+    let capture_bodies = super::BodyCapture::parse(&u.capture_bodies).unwrap_or_else(|| {
+        errors.push(ConfigError::new(
+            "usage.capture_bodies",
+            "must be `off`, `errors` or `all`",
+        ));
+        super::BodyCapture::Off
+    });
+    if u.body_limit_bytes > 4 * 1_048_576 {
+        errors.push(ConfigError::new(
+            "usage.body_limit_bytes",
+            "must be 4 MiB or less per body",
+        ));
+    }
+    if !(1..=3650).contains(&u.body_retention_days) {
+        errors.push(ConfigError::new(
+            "usage.body_retention_days",
+            "must be between 1 and 3650",
+        ));
+    }
     super::UsageConfig {
         retention_days: u.retention_days,
         flush_interval: Duration::from_secs(u.flush_interval_secs),
         per_key_metrics: u.per_key_metrics,
+        capture_bodies,
+        body_limit_bytes: u.body_limit_bytes,
+        body_retention_days: u.body_retention_days,
     }
 }
 

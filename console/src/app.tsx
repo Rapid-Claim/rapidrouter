@@ -2,21 +2,26 @@ import {
   Activity,
   Boxes,
   ChartNoAxesCombined,
+  Coins,
   ChevronRight,
   CircleGauge,
   Copy,
   KeyRound,
   LogOut,
-  Network,
+  PanelLeft,
   Play,
   Plus,
   RefreshCw,
   Route,
   ScrollText,
+  UserRound,
+  Users,
   Save,
   Server,
   Settings as SettingsIcon,
+  Stethoscope,
   Trash2,
+  X,
 } from "lucide-solid";
 import {
   For,
@@ -31,6 +36,20 @@ import {
   onMount,
 } from "solid-js";
 import uPlot from "uplot";
+import logo from "./logo.svg";
+import {
+  Combobox,
+  Loading,
+  Skeleton,
+  Drawer,
+  FilterBar,
+  MultiCombobox,
+  RangePicker,
+  escapeCloses,
+  resolveRange,
+  type Option,
+  type TimeRange,
+} from "./ui";
 import {
   api,
   clearSession,
@@ -40,12 +59,19 @@ import {
   type Provider,
   type ProviderKey,
   type QuotaWindow,
+  type CatalogPreset,
+  type InternalUser,
+  type RouteGroup,
+  type Team,
   type UsageRecord,
   type VirtualKey,
 } from "./api";
 
 type Page =
+  | "users"
+  | "teams"
   | "usage"
+  | "cost"
   | "activity"
   | "keys"
   | "providers"
@@ -53,22 +79,23 @@ type Page =
   | "routing"
   | "playground"
   | "logs"
-  | "cluster"
   | "settings";
 
 /// Ordered by how often an operator needs them, not by the shape of the
 /// backend. Usage leads because "what is this costing" is the question
 /// people arrive with; configuration sits below the things you watch.
-const navigation: Array<{ id: Page; label: string; icon: typeof CircleGauge; group?: string }> = [
+const navigation: Array<{ id: Page; label: string; icon: typeof CircleGauge; group?: string; adminOnly?: boolean }> = [
   { id: "usage", label: "Usage", icon: ChartNoAxesCombined, group: "Observe" },
+  { id: "cost", label: "Cost", icon: Coins },
   { id: "activity", label: "Model activity", icon: Activity },
   { id: "logs", label: "Logs", icon: ScrollText },
   { id: "keys", label: "Virtual keys", icon: KeyRound, group: "Configure" },
   { id: "providers", label: "Providers", icon: Server },
   { id: "models", label: "Models", icon: Boxes },
-  { id: "routing", label: "Routing", icon: Route },
-  { id: "playground", label: "Playground", icon: Play, group: "Tools" },
-  { id: "cluster", label: "Cluster", icon: Network },
+  { id: "routing", label: "Routing groups", icon: Route },
+  { id: "playground", label: "Playground", icon: Play },
+  { id: "users", label: "Internal users", icon: UserRound, group: "Access control", adminOnly: true },
+  { id: "teams", label: "Teams", icon: Users, adminOnly: true },
 ];
 
 /// Settings is deliberately not a first-class page: it lives in the nav
@@ -82,6 +109,7 @@ const settingsNav: { id: Page; label: string; icon: typeof CircleGauge; group?: 
 /// `g` then a letter jumps to a page; `/` focuses the page's filter.
 const jumps: Record<string, Page> = {
   u: "usage",
+  o: "cost",
   a: "activity",
   l: "logs",
   k: "keys",
@@ -89,23 +117,13 @@ const jumps: Record<string, Page> = {
   m: "models",
   r: "routing",
   y: "playground",
-  c: "cluster",
+  i: "users",
+  t: "teams",
   ",": "settings",
 };
 
-/// The nav group a page belongs to, for the header eyebrow: groups are
-/// declared on the first item of each run, so a later page inherits the
-/// last heading above it.
-function sectionOf(page: Page): string {
-  let group = "";
-  for (const item of navigation) {
-    if (item.group) group = item.group;
-    if (item.id === page) return group;
-  }
-  return "Settings";
-}
-
 function routeFromHash(): Page {
+  if (location.hash.slice(1) === "cluster") return "settings";
   const candidate = location.hash.slice(1) as Page;
   const known = [...navigation, settingsNav];
   return known.some((item) => item.id === candidate) ? candidate : "usage";
@@ -118,11 +136,36 @@ function isTyping(target: EventTarget | null): boolean {
   return ["INPUT", "TEXTAREA", "SELECT"].includes(el.tagName) || el.isContentEditable;
 }
 
+export /// How often live traffic may trigger a refetch.
+///
+/// The gateway emits an event per request, so an unthrottled console
+/// refetches at the request rate — a hundred admin queries a second on a
+/// busy gateway. Charts are read by humans; five seconds is under the
+/// threshold where anyone notices, and it turns an unbounded cost into a
+/// fixed one.
+const TRAFFIC_REFRESH_MS = 5_000;
+
+/// Rows per page in the request log.
+const PAGE_SIZE = 100;
+
 export function App() {
+  const savedTheme = localStorage.getItem("rapid-theme");
+  if (savedTheme === "light" || savedTheme === "dark") {
+    document.documentElement.dataset.theme = savedTheme;
+  }
   const [authenticated, setAuthenticated] = createSignal(Boolean(sessionToken()));
+  const [me] = createResource(authenticated, (ok) => (ok ? api.me().catch(() => undefined) : undefined));
+  const visibleNav = createMemo(() =>
+    navigation.filter((item) => !item.adminOnly || me()?.is_admin !== false));
   const [page, setPage] = createSignal<Page>(routeFromHash());
   const [refresh, setRefresh] = createSignal(0);
   const [live, setLive] = createSignal(false);
+  const [collapsed, setCollapsed] = createSignal(localStorage.getItem("rapid-rail") === "collapsed");
+  const toggleRail = () => {
+    const next = !collapsed();
+    setCollapsed(next);
+    localStorage.setItem("rapid-rail", next ? "collapsed" : "expanded");
+  };
 
   const onHash = () => setPage(routeFromHash());
   let pendingJump = false;
@@ -156,8 +199,41 @@ export function App() {
     const events = new EventSource("/admin/api/events");
     events.onopen = () => setLive(true);
     events.onerror = () => setLive(false);
-    events.onmessage = () => setRefresh((value) => value + 1);
-    onCleanup(() => events.close());
+    // The gateway emits an event per *request*, not just per config
+    // change. Refetching everything on each one turns one busy second
+    // into a hundred admin queries — the console DoSing its own gateway,
+    // and every page permanently reloading.
+    //
+    // So: configuration changes refresh immediately (they are rare and
+    // the operator is usually the one who caused them), and traffic
+    // events are coalesced into one refresh every few seconds, which is
+    // faster than anybody reads a chart anyway.
+    let pendingTraffic = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const scheduleTraffic = () => {
+      pendingTraffic = true;
+      if (timer) return;
+      timer = setTimeout(() => {
+        timer = undefined;
+        if (!pendingTraffic) return;
+        pendingTraffic = false;
+        setRefresh((value) => value + 1);
+      }, TRAFFIC_REFRESH_MS);
+    };
+    events.onmessage = (event) => {
+      let type = "";
+      try {
+        type = JSON.parse(event.data)?.type ?? "";
+      } catch {
+        // An unparseable event still means something happened.
+      }
+      if (type === "request") scheduleTraffic();
+      else setRefresh((value) => value + 1);
+    };
+    onCleanup(() => {
+      if (timer) clearTimeout(timer);
+      events.close();
+    });
   });
   onCleanup(() => {
     removeEventListener("hashchange", onHash);
@@ -169,17 +245,19 @@ export function App() {
   );
   return (
     <Show when={authenticated()} fallback={<Login onSuccess={() => setAuthenticated(true)} />}>
-    <div class="app-shell">
+    <div class="app-shell" classList={{ collapsed: collapsed() }}>
       <aside class="sidebar">
-        <a class="brand" href="#usage" aria-label="Rapid Router usage">
-          <span class="brand-mark"><Boxes size={18} /></span>
-          <span><strong>Rapid</strong><small>Router</small></span>
-        </a>
+        <div class="brand-row">
+          <a class="brand" href="#usage" aria-label="Rapid Router">
+            <img class="brand-logo" src={logo} alt="" />
+            <span class="brand-name"><small>Rapid</small><strong>Router</strong></span>
+          </a>
+        </div>
         <nav aria-label="Main navigation">
-          <For each={navigation}>{(item) => (
+          <For each={visibleNav()}>{(item) => (
             <>
               <Show when={item.group}><p class="nav-group">{item.group}</p></Show>
-              <a href={`#${item.id}`} aria-label={item.label} classList={{ active: page() === item.id }}>
+              <a href={`#${item.id}`} aria-label={item.label} title={item.label} classList={{ active: page() === item.id }}>
                 <item.icon size={17} aria-hidden="true" />
                 <span>{item.label}</span>
               </a>
@@ -187,22 +265,43 @@ export function App() {
           )}</For>
         </nav>
         <div class="sidebar-foot">
-          <a href="#settings" class="foot-link" aria-label="Settings" classList={{ active: page() === "settings" }} title="Settings (g ,)"><SettingsIcon size={17} aria-hidden="true" /></a>
-          <div class="live-state"><span classList={{ online: live() }} />{live() ? "Live" : "Reconnecting"}</div>
-          <button class="icon-button" title="Sign out" aria-label="Sign out" onClick={() => {
+          <a href="#settings" class="foot-link" aria-label="Settings" classList={{ active: page() === "settings" }} title="Settings (g ,)">
+            <SettingsIcon size={16} aria-hidden="true" />
+          </a>
+          <span class="foot-spacer" />
+          <button class="foot-link" title="Sign out" aria-label="Sign out" onClick={() => {
             clearSession();
             setAuthenticated(false);
-          }}><LogOut size={17} /></button>
+          }}><LogOut size={16} /></button>
         </div>
       </aside>
       <main>
         <header class="page-header">
-          <div><p class="eyebrow">{current().group ?? sectionOf(page())}</p><h1>{current().label}</h1></div>
-          <button class="icon-button" title="Refresh data" aria-label="Refresh data" onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={17} /></button>
+          <div class="page-header-left">
+            <button
+              class="rail-toggle"
+              aria-label={collapsed() ? "Expand sidebar" : "Collapse sidebar"}
+              aria-pressed={collapsed()}
+              title={collapsed() ? "Expand sidebar" : "Collapse sidebar"}
+              onClick={toggleRail}
+            >
+              <PanelLeft size={15} />
+            </button>
+            <span class="top-bar-divider" aria-hidden="true" />
+            <h1>{current().label}</h1>
+          </div>
+          <div class="page-header-right">
+            <div class="live-state" title={live() ? "Streaming live updates" : "Reconnecting to the gateway"}>
+              <span class="dot" classList={{ online: live() }} />
+              <span class="live-label">{live() ? "Live" : "Reconnecting"}</span>
+            </div>
+            <button class="icon-button" title="Refresh data" aria-label="Refresh data" onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={16} /></button>
+          </div>
         </header>
-        <div class="page-content">
+        <div class="page-content" classList={{ flush: page() === "playground" }}>
           <Switch>
             <Match when={page() === "usage"}><Usage refresh={refresh} /></Match>
+            <Match when={page() === "cost"}><Cost refresh={refresh} /></Match>
             <Match when={page() === "activity"}><ModelActivity refresh={refresh} /></Match>
             <Match when={page() === "logs"}><Requests refresh={refresh} /></Match>
             <Match when={page() === "keys"}><Keys refresh={refresh} bump={() => setRefresh((v) => v + 1)} /></Match>
@@ -210,7 +309,8 @@ export function App() {
             <Match when={page() === "models"}><Models refresh={refresh} /></Match>
             <Match when={page() === "routing"}><Routing refresh={refresh} /></Match>
             <Match when={page() === "playground"}><Playground /></Match>
-            <Match when={page() === "cluster"}><Fleet refresh={refresh} /></Match>
+            <Match when={page() === "users"}><UsersPage refresh={refresh} /></Match>
+            <Match when={page() === "teams"}><TeamsPage refresh={refresh} /></Match>
             <Match when={page() === "settings"}><Settings refresh={refresh} /></Match>
           </Switch>
         </div>
@@ -221,73 +321,553 @@ export function App() {
 }
 
 function Login(props: { onSuccess: () => void }) {
+  const [mode, setMode] = createSignal<"key" | "email">("email");
   const [key, setKey] = createSignal("");
+  const [email, setEmail] = createSignal("");
+  const [password, setPassword] = createSignal("");
   const [error, setError] = createSignal("");
   const [pending, setPending] = createSignal(false);
   return <main class="login-shell">
     <form class="login-panel" onSubmit={async (event) => {
       event.preventDefault();
       setPending(true); setError("");
-      try { await login(key()); props.onSuccess(); }
-      catch (err) { setError(err instanceof Error ? err.message : "Sign in failed"); }
+      try {
+        await login(mode() === "key" ? { key: key() } : { email: email(), password: password() });
+        props.onSuccess();
+      } catch (err) { setError(err instanceof Error ? err.message : "Sign in failed"); }
       finally { setPending(false); }
     }}>
-      <span class="brand-mark large"><Boxes size={22} /></span>
-      <div><p class="eyebrow">Rapid Router</p><h1>Operator sign in</h1><p class="muted">Use the admin key configured on this gateway.</p></div>
-      <label>Admin key<input autofocus type="password" autocomplete="current-password" value={key()} onInput={(e) => setKey(e.currentTarget.value)} /></label>
+      <img class="brand-logo large" src={logo} alt="" />
+      <div><p class="eyebrow">Rapid Router</p><h1>Sign in</h1><p class="muted">
+        {mode() === "key" ? "Use the admin key configured on this gateway." : "Use the account an admin created for you."}
+      </p></div>
+      <Show when={mode() === "key"} fallback={<>
+        <label>Email<input required type="email" autocomplete="email" value={email()} onInput={(e) => setEmail(e.currentTarget.value)} /></label>
+        <label>Password<input required type="password" autocomplete="current-password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} /></label>
+      </>}>
+        <label>Admin key<input autofocus type="password" autocomplete="current-password" value={key()} onInput={(e) => setKey(e.currentTarget.value)} /></label>
+      </Show>
       <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
-      <button class="button primary" disabled={pending() || !key()}>{pending() ? "Signing in…" : "Sign in"}<ChevronRight size={16} /></button>
+      <button class="button primary" disabled={pending() || (mode() === "key" ? !key() : !email() || !password())}>
+        {pending() ? "Signing in…" : "Sign in"}<ChevronRight size={16} />
+      </button>
+      <button type="button" class="button ghost" onClick={() => { setMode(mode() === "key" ? "email" : "key"); setError(""); }}>
+        {mode() === "key" ? "Use email and password" : "Use admin key"}
+      </button>
     </form>
   </main>;
 }
 
-function Providers(props: { refresh: () => number }) {
-  const [providers] = createResource(props.refresh, api.providers);
-  const [selected, setSelected] = createSignal<string>("");
-  const current = createMemo(
-    () => providers()?.data.find((p) => p.name === selected()) ?? providers()?.data[0],
+const PROVIDER_META: Record<string, { label: string; color: string; mark?: string }> = {
+  openai: { label: "OpenAI", color: "#10a37f" },
+  anthropic: { label: "Anthropic", color: "#d97757" },
+  gemini: { label: "Google Gemini", color: "#4285f4", mark: "G" },
+  azure: { label: "Azure OpenAI", color: "#0078d4", mark: "Az" },
+  bedrock: { label: "AWS Bedrock", color: "#ff9900", mark: "B" },
+  vertex: { label: "Vertex AI", color: "#669df6", mark: "V" },
+  databricks: { label: "Databricks", color: "#ff3621", mark: "D" },
+  groq: { label: "Groq", color: "#f55036" },
+  mistral: { label: "Mistral", color: "#fa520f" },
+  cerebras: { label: "Cerebras", color: "#f15a29" },
+  openrouter: { label: "OpenRouter", color: "#6467f2", mark: "OR" },
+  ollama: { label: "Ollama", color: "#4a4a4a", mark: "Ol" },
+  vllm: { label: "vLLM", color: "#3b82f6", mark: "vL" },
+  openai_compat: { label: "OpenAI Compatible", color: "#64748b", mark: "{}" },
+  claude_subscription: { label: "Claude Code", color: "#d97757", mark: "CC" },
+  codex_subscription: { label: "Codex", color: "#10a37f", mark: "Cx" },
+};
+
+function providerMeta(name: string, kind?: string) {
+  return (
+    PROVIDER_META[name] ??
+    PROVIDER_META[(kind ?? "").toLowerCase()] ??
+    PROVIDER_META[(kind ?? "").toLowerCase().replace(/aicompat|compat/, "ai_compat")] ??
+    { label: name.charAt(0).toUpperCase() + name.slice(1), color: "#78716c" }
   );
+}
+
+function ProviderMark(props: { name: string; kind?: string; size?: number }) {
+  const meta = () => providerMeta(props.name, props.kind);
+  return (
+    <span
+      class="provider-mark"
+      style={{ background: meta().color, width: `${props.size ?? 22}px`, height: `${props.size ?? 22}px` }}
+      aria-hidden="true"
+    >
+      {meta().mark ?? meta().label.slice(0, 2)}
+    </span>
+  );
+}
+
+function Providers(props: { refresh: () => number }) {
+  const [providers, { refetch }] = createResource(props.refresh, api.providers);
+  const [catalog] = createResource(props.refresh, api.catalog);
+  const [selected, setSelected] = createSignal<string>("");
+  const [adding, setAdding] = createSignal(false);
+  const [search, setSearch] = createSignal("");
+  const [error, setError] = createSignal("");
+
+  const current = createMemo(() => providers()?.data.find((p) => p.name === selected()));
+  const shown = createMemo(() => {
+    const needle = search().trim().toLowerCase();
+    const all = providers()?.data ?? [];
+    return needle ? all.filter((p) => `${p.name} ${p.kind}`.toLowerCase().includes(needle)) : all;
+  });
+
+  // A check is a real request per credential, so the page says which one
+  // is in flight ("*" for all) and keeps each result until the next run.
+  const [checking, setChecking] = createSignal<string | null>(null);
+  const [probes, setProbes] = createSignal<Record<string, { status: string; detail: string }>>({});
+  const runProbe = async (providerName: string, key?: string) => {
+    setChecking(key ?? "*");
+    setError("");
+    try {
+      const result = await api.probeProvider(providerName, key ? { key } : {});
+      setProbes((prev) => {
+        const next = key ? { ...prev } : {};
+        for (const entry of result.results) next[entry.key] = { status: entry.status, detail: entry.detail };
+        return next;
+      });
+      await refetch();
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Check failed");
+    } finally {
+      setChecking(null);
+    }
+  };
+  const probeSummary = () => {
+    const entries = Object.values(probes());
+    if (!entries.length) return "";
+    const ok = entries.filter((e) => e.status === "ok").length;
+    const limited = entries.filter((e) => e.status === "rate_limited").length;
+    const bad = entries.length - ok - limited;
+    return `Last check: ${ok} ready`
+      + (limited ? `, ${limited} rate limited` : "")
+      + (bad ? `, ${bad} failing` : "")
+      + ".";
+  };
+
   return <div class="stack-lg">
-    <div class="view-toolbar">
-      <p class="muted">Every credential, the ceiling it works against, and what the provider last said about it.</p>
-    </div>
-    <Show when={providers()?.data.length} fallback={<Empty title="No providers configured" action="Add one in Routing, or set a provider environment variable and restart." />}>
-      <div class="two-column">
-        <section class="panel">
-          <SectionTitle title="Configured" subtitle="Select a provider to inspect its credentials" />
-          <div class="table-wrap"><table><thead><tr><th>Provider</th><th>Keys</th><th>Health</th></tr></thead><tbody>
-            <For each={providers()?.data ?? []}>{(provider) => {
-              const worst = () => providerHealth(provider);
-              return <tr class="clickable" classList={{ selected: current()?.name === provider.name }}
-                         onClick={() => setSelected(provider.name)}>
-                <td><strong>{provider.name}</strong><small>{provider.subscription ? "Subscription seats" : provider.kind}</small></td>
-                <td>{provider.keys.length}</td>
-                <td><Status text={worst().label} tone={worst().tone} /></td>
-              </tr>;
-            }}</For>
-          </tbody></table></div>
-        </section>
-        <section class="panel">
-          <Show when={current()} keyed>{(provider) => <>
-            <SectionTitle
-              title={provider.name}
-              subtitle={provider.base_url ?? "Provider default endpoint"}
-              action={<span class="pill" classList={{ accent: provider.subscription }}>{provider.subscription ? "Subscription" : "Metered API"}</span>} />
-            <Show when={provider.keys.length}
-                  fallback={<Empty title="No credentials on this provider"
-                                   action="A keyless provider (a local server) needs none; anything else needs a key in Routing." />}>
-              <For each={provider.keys}>{(key) => <CredentialCard providerKey={key} subscription={provider.subscription} />}</For>
-            </Show>
-          </>}</Show>
-        </section>
-      </div>
+    <FilterBar
+      search={search()}
+      onSearch={setSearch}
+      searchPlaceholder="Search providers (press /)"
+      filters={[]}
+      extra={<button class="button primary" onClick={() => setAdding(true)}><Plus size={15} />Add provider</button>}
+    />
+    <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+    <section class="panel">
+      <SectionTitle title="Providers" subtitle="Select one to inspect its credentials, limits and quota" />
+      <Loading when={providers.loading && !providers()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No providers configured" action="Add one to start routing traffic." />}>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table>
+          <thead><tr><th>Provider</th><th>Type</th><th class="num">Keys</th><th>Health</th><th>Endpoint</th></tr></thead>
+          <tbody><For each={shown()}>{(provider) => {
+            const health = () => providerHealth(provider);
+            return <tr class="clickable" onClick={() => setSelected(provider.name)}>
+              <td>
+                <span class="provider-cell">
+                  <ProviderMark name={provider.name} kind={provider.kind} />
+                  <span>
+                    <strong>{providerMeta(provider.name, provider.kind).label}</strong>
+                    <Show when={providerMeta(provider.name, provider.kind).label.toLowerCase() !== provider.name}>
+                      <small class="mono">{provider.name}</small>
+                    </Show>
+                  </span>
+                </span>
+              </td>
+              <td><span class="pill" classList={{ accent: provider.subscription }}>{provider.subscription ? "Subscription" : provider.kind}</span></td>
+              <td class="num">{provider.keys.length}</td>
+              <td><Status text={health().label} tone={health().tone} /></td>
+              <td class="mono" style={{ color: "var(--muted)" }}>{provider.base_url ?? "provider default"}</td>
+            </tr>;
+          }}</For></tbody>
+        </table></div>
+      </Show>
+      </Loading>
+    </section>
+
+    <Drawer
+      open={Boolean(current())}
+      title={current() ? providerMeta(current()!.name, current()!.kind).label : ""}
+      subtitle={current()?.name}
+      onClose={() => setSelected("")}
+      actions={<button class="button" onClick={async () => {
+        if (!confirm(`Remove provider ${current()!.name}? Routes pointing at it will stop resolving.`)) return;
+        setError("");
+        try { await api.deleteProvider(current()!.name); setSelected(""); await refetch(); }
+        catch (err) { setError(err instanceof Error ? err.message : "Delete failed"); }
+      }}><Trash2 size={14} />Remove</button>}
+    >
+      <Show when={current()} keyed>{(provider) => <>
+        <BaseUrlEditor provider={provider} onDone={refetch} onError={setError} />
+        <div class="drawer-section">
+          <SectionTitle
+            title="Credentials"
+            subtitle={provider.subscription ? "Seats, and the plan windows the provider reports" : "Keys, and the ceilings configured for them"}
+            action={
+              <button
+                class="button outline"
+                disabled={!provider.keys.length || Boolean(checking())}
+                onClick={() => runProbe(provider.name)}
+              >
+                <Show when={checking() === "*"} fallback={<Stethoscope size={14} />}><RefreshCw size={14} class="spin" /></Show>
+                {checking() === "*" ? "Checking…" : "Check all"}
+              </button>
+            }
+          />
+          <Show when={probeSummary()}>
+            <p class="muted">{probeSummary()}</p>
+          </Show>
+          <Show when={provider.keys.length} fallback={<Empty title="No credentials" action="A keyless provider needs none; anything else needs a key." />}>
+            <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+              <table class="dense">
+                <thead><tr>
+                  <th>Credential</th>
+                  <th>{provider.subscription ? "Plan windows" : "Limits"}</th>
+                  <th>Token</th>
+                  <th>Health</th>
+                  <th><span class="sr-only">Actions</span></th>
+                </tr></thead>
+                <tbody><For each={provider.keys}>{(key) => (
+                  <CredentialRow
+                    providerKey={key}
+                    kind={provider.kind}
+                    subscription={provider.subscription}
+                    checking={checking() === "*" || checking() === key.name}
+                    probe={probes()[key.name] ?? null}
+                    onCheck={() => runProbe(provider.name, key.name)}
+                    onRemove={async () => {
+                      setError("");
+                      try { await api.deleteProviderKey(provider.name, key.name); await refetch(); }
+                      catch (err) { setError(err instanceof Error ? err.message : "Remove failed"); }
+                    }}
+                  />
+                )}</For></tbody>
+              </table>
+            </div>
+          </Show>
+        </div>
+        <AddCredential provider={provider} onDone={refetch} onError={setError} />
+      </>}</Show>
+    </Drawer>
+
+    <Show when={adding()}>
+      <AddProviderDialog
+        catalog={catalog()}
+        onClose={() => setAdding(false)}
+        onDone={async () => { setAdding(false); await refetch(); }}
+      />
     </Show>
+  </div>;
+}
+
+/// Pull the account email out of an uploaded Codex auth.json, from the
+/// id_token's JWT claims. Best-effort: a document without one still
+/// uploads, it just gets a generic seat name.
+function codexEmailFrom(content: string): string | null {
+  try {
+    const doc = JSON.parse(content);
+    const idToken: string | undefined = doc?.tokens?.id_token;
+    if (!idToken) return null;
+    const payload = JSON.parse(atob(idToken.split(".")[1].replace(/-/g, "+").replace(/_/g, "/")));
+    return typeof payload.email === "string" ? payload.email : null;
+  } catch {
+    return null;
+  }
+}
+
+function seatNameFrom(email: string | null, fallback: string): string {
+  if (!email) return fallback;
+  return email.split("@")[0].toLowerCase().replace(/[^a-z0-9_-]/g, "-");
+}
+
+export type Seat = { name: string; email: string | null; content: string; file: string };
+
+/// Turn a set of uploaded auth.json documents into named seats.
+///
+/// Seats are named after the account email, which is what an operator
+/// recognises in a list of eighty. Two files for the same account are a
+/// real thing in an exported pool (the same login authorised twice), so
+/// duplicates are numbered rather than silently collapsed — the operator
+/// can see them and drop the extras.
+export async function seatsFromFiles(files: File[]): Promise<{ seats: Seat[]; rejected: string[] }> {
+  const seats: Seat[] = [];
+  const rejected: string[] = [];
+  const used = new Map<string, number>();
+  for (const file of files) {
+    const content = await file.text();
+    let parsed: any;
+    try {
+      parsed = JSON.parse(content);
+    } catch {
+      rejected.push(`${file.name}: not valid JSON`);
+      continue;
+    }
+    if (!parsed?.tokens?.refresh_token) {
+      rejected.push(`${file.name}: no refresh token in it`);
+      continue;
+    }
+    const email = codexEmailFrom(content);
+    const base = seatNameFrom(email, file.name.replace(/\.json$/i, ""));
+    const seen = used.get(base) ?? 0;
+    used.set(base, seen + 1);
+    seats.push({
+      name: seen ? `${base}-${seen + 1}` : base,
+      email,
+      content,
+      file: file.name,
+    });
+  }
+  return { seats, rejected };
+}
+
+/// The per-kind credential field: a setup token for Claude Code, one or
+/// many auth.json uploads for Codex, a reference or literal otherwise.
+function CredentialField(props: {
+  kind: "claude" | "codex" | "plain";
+  placeholder?: string;
+  onToken: (token: string) => void;
+  onFile: (content: string, email: string | null) => void;
+  onSeats?: (seats: Seat[], rejected: string[]) => void;
+}) {
+  const [fileName, setFileName] = createSignal("");
+  const [seats, setSeats] = createSignal<Seat[]>([]);
+  const [rejected, setRejected] = createSignal<string[]>([]);
+  const [email, setEmail] = createSignal<string | null>(null);
+  return <Switch>
+    <Match when={props.kind === "claude"}>
+      <label>Setup token
+        <input
+          type="password"
+          placeholder="sk-ant-oat01-…"
+          autocomplete="off"
+          onInput={(e) => props.onToken(e.currentTarget.value.trim())}
+        />
+      </label>
+      <p class="muted">
+        Run <code class="mono">claude setup-token</code> on any machine with a Claude subscription and
+        paste the result — it is valid for a year and stored sealed in the gateway's store.
+      </p>
+    </Match>
+    <Match when={props.kind === "codex"}>
+      <label>auth.json {props.onSeats ? <span class="optional">One or many</span> : ""}
+        <input
+          type="file"
+          accept=".json,application/json"
+          multiple={Boolean(props.onSeats)}
+          onChange={async (e) => {
+            const picked = [...(e.currentTarget.files ?? [])];
+            if (!picked.length) return;
+            if (props.onSeats) {
+              const result = await seatsFromFiles(picked);
+              setSeats(result.seats);
+              setRejected(result.rejected);
+              setFileName(picked.length === 1 ? picked[0].name : `${picked.length} files`);
+              setEmail(result.seats[0]?.email ?? null);
+              props.onSeats(result.seats, result.rejected);
+              return;
+            }
+            const content = await picked[0].text();
+            const found = codexEmailFrom(content);
+            setFileName(picked[0].name);
+            setEmail(found);
+            props.onFile(content, found);
+          }}
+        />
+      </label>
+      <Show when={seats().length > 1}>
+        <div class="seat-preview">
+          <p class="muted"><strong>{seats().length} seats</strong> ready — named after each account.</p>
+          <div class="seat-chips">
+            <For each={seats().slice(0, 12)}>{(seat) => <span class="chip">{seat.email ?? seat.name}</span>}</For>
+            <Show when={seats().length > 12}><span class="chip muted">+{seats().length - 12} more</span></Show>
+          </div>
+        </div>
+      </Show>
+      <Show when={rejected().length}>
+        <p class="form-error" role="alert">{rejected().length} file{rejected().length > 1 ? "s" : ""} skipped: {rejected().slice(0, 3).join("; ")}{rejected().length > 3 ? "…" : ""}</p>
+      </Show>
+      <Show when={seats().length <= 1}>
+        <p class="muted">
+          {fileName()
+            ? email()
+              ? <>Signed in as <strong>{email()}</strong> — the seat is named after it.</>
+              : `${fileName()} loaded; no email found in it, using a generic seat name.`
+            : <>Upload the <code class="mono">~/.codex/auth.json</code> files the Codex CLI wrote after sign-in
+              — select as many as you like. The gateway keeps its own copies and renews the tokens itself.</>}
+        </p>
+      </Show>
+    </Match>
+    <Match when={true}>
+      <label>Credential
+        <input placeholder={props.placeholder} onInput={(e) => props.onToken(e.currentTarget.value)} />
+      </label>
+    </Match>
+  </Switch>;
+}
+
+function AddProviderDialog(props: {
+  catalog: { presets: CatalogPreset[]; subscriptions: CatalogPreset[]; custom: CatalogPreset; configured: string[] } | undefined;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  escapeCloses(props.onClose);
+  const [preset, setPreset] = createSignal("");
+  const [name, setName] = createSignal("");
+  const [baseUrl, setBaseUrl] = createSignal("");
+  const [keyName, setKeyName] = createSignal("main");
+  const [value, setValue] = createSignal("");
+  const [fileContent, setFileContent] = createSignal("");
+  const [seats, setSeats] = createSignal<Seat[]>([]);
+  const [error, setError] = createSignal("");
+  const [pending, setPending] = createSignal(false);
+
+  const all = createMemo<CatalogPreset[]>(() => [
+    ...(props.catalog ? [props.catalog.custom] : []),
+    ...(props.catalog?.subscriptions ?? []),
+    ...(props.catalog?.presets ?? []),
+  ]);
+  const chosen = createMemo(() => all().find((p) => p.name === preset()));
+  const isCustom = () => Boolean(chosen()?.custom);
+  const options = createMemo<Option[]>(() =>
+    all().map((p) => ({
+      value: p.name,
+      label: providerMeta(p.name).label,
+      hint: p.custom ? "any OpenAI-shaped endpoint" : p.subscription ? "subscription seats" : (p.base_url ?? "custom endpoint"),
+      icon: <ProviderMark name={p.name} size={20} />,
+    })),
+  );
+  createEffect(() => {
+    const p = chosen();
+    if (!p) return;
+    setBaseUrl(p.custom ? "" : (p.base_url ?? ""));
+    if (!name() || all().some((c) => c.name === name() || c.name.replace("_subscription", "") === name()) || name() === "custom") {
+      setName(p.custom ? "custom" : p.subscription ? p.name.replace("_subscription", "") : p.name);
+    }
+  });
+
+  return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
+    <form class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="add-provider-title" onSubmit={async (e) => {
+      e.preventDefault(); setError(""); setPending(true);
+      try {
+        const p = chosen();
+        // Subscription credentials resolve to references first: a pasted
+        // setup token is sealed into the store, an uploaded auth.json is
+        // persisted server-side so the refresher can write rotations
+        // back. The config document only ever carries the reference.
+        // A pool of Codex seats is uploaded in one shot: every document
+        // is persisted in a single request, then the provider is created
+        // with all of its keys in a single config commit.
+        if (p?.name === "codex_subscription" && seats().length > 1) {
+          const written = await api.putCredentialFiles(seats().map((seat) => ({
+            name: `${name()}_${seat.name}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+            content: seat.content,
+          })));
+          if (!written.written.length) throw new Error("no credential files could be saved");
+          await api.createProvider({
+            name: name(),
+            kind: p.name,
+            ...(baseUrl().trim() ? { base_url: baseUrl().trim() } : {}),
+            keys: written.written.map((entry, i) => ({
+              name: seats()[i]?.name ?? entry.name,
+              value: entry.reference,
+            })),
+          });
+          props.onDone();
+          return;
+        }
+        let credential = value();
+        if (p?.name === "claude_subscription" && value()) {
+          const sealed = await api.putSecret(`${name()}_${keyName()}`.replace(/[^a-zA-Z0-9_-]/g, "_"), value());
+          credential = sealed.reference;
+        } else if (p?.name === "codex_subscription" && fileContent()) {
+          const saved = await api.putCredentialFile(`${name()}_${keyName()}`.replace(/[^a-zA-Z0-9_-]/g, "_"), fileContent());
+          credential = saved.reference;
+        }
+        // No model seeding: model line-ups change weekly, so models are
+        // added explicitly on the Models page.
+        await api.createProvider({
+          name: name(),
+          kind: p?.custom ? "openai_compat" : p?.subscription ? p.name : preset(),
+          ...(baseUrl().trim() ? { base_url: baseUrl().trim() } : {}),
+          ...(!credential && (p?.custom || p?.keyless_ok) ? { auth: "none" } : {}),
+          keys: credential ? [{ name: keyName(), value: credential }] : [],
+        });
+        props.onDone();
+      } catch (err) { setError(err instanceof Error ? err.message : "Could not add provider"); }
+      finally { setPending(false); }
+    }}>
+      <header class="dialog-head">
+        <div><h2 id="add-provider-title">Add provider</h2><p class="muted">Models are added afterwards, on the Models page.</p></div>
+        <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={props.onClose}><X size={16} /></button>
+      </header>
+      <label>Provider
+        <Combobox value={preset()} options={options()} onSelect={setPreset} label="Provider" placeholder="Choose a provider…" />
+      </label>
+      <Show when={chosen()}>
+        <div class="field-row">
+          <label>Name in this gateway
+            <input required value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+          </label>
+          <label>Base URL {isCustom() ? "" : <span class="optional">Optional override</span>}
+            <input
+              required={isCustom()}
+              placeholder={isCustom() ? "https://llm.internal.example.com/v1" : "provider default"}
+              value={baseUrl()}
+              onInput={(e) => setBaseUrl(e.currentTarget.value)}
+            />
+          </label>
+        </div>
+        <p class="muted">Callers address it as <code class="mono">{name() || "name"}/model</code>.</p>
+        <div class="field-row">
+          <Show when={seats().length <= 1} fallback={<div><span class="field-label">Credential names</span><p class="muted">Taken from each file's account.</p></div>}>
+            <label>Credential name<input value={keyName()} onInput={(e) => setKeyName(e.currentTarget.value)} /></label>
+          </Show>
+          <div>
+            <CredentialField
+              kind={chosen()!.name === "claude_subscription" ? "claude" : chosen()!.name === "codex_subscription" ? "codex" : "plain"}
+              placeholder={`env.${chosen()!.discovery_env ?? "API_KEY"}`}
+              onToken={setValue}
+              onFile={(content, email) => {
+                setFileContent(content);
+                setValue("uploaded");
+                setKeyName(seatNameFrom(email, keyName() || "seat-1"));
+              }}
+              onSeats={(list) => {
+                setSeats(list);
+                setValue(list.length ? "uploaded" : "");
+                if (list.length === 1) {
+                  setFileContent(list[0].content);
+                  setKeyName(list[0].name);
+                }
+              }}
+            />
+          </div>
+        </div>
+      </Show>
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+      <div class="dialog-actions">
+        <button type="button" class="button outline" onClick={props.onClose}>Cancel</button>
+        <button class="button primary" disabled={pending() || !preset() || !name() || (isCustom() && !baseUrl().trim())}>{pending() ? "Adding…" : seats().length > 1 ? `Add provider with ${seats().length} seats` : "Add provider"}</button>
+      </div>
+    </form>
   </div>;
 }
 
 /// The health of a provider is the state of its worst key: one benched
 /// seat in a healthy pool is the thing an operator needs to see, and an
 /// average would hide it.
+/// A short absolute instant: date for anything beyond today, time for
+/// today, because "expires today" and "expires in 40 minutes" are
+/// different operational facts.
+function formatClock(ms: number): string {
+  const date = new Date(ms);
+  const sameDay = date.toDateString() === new Date().toDateString();
+  return sameDay
+    ? date.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" })
+    : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
+}
+
 function providerHealth(provider: Provider): { label: string; tone: "success" | "danger" | "muted" } {
   if (!provider.keys.length) return { label: "No keys", tone: "muted" };
   if (provider.keys.every((k: ProviderKey) => k.health === "benched")) return { label: "Out of quota", tone: "danger" };
@@ -296,126 +876,539 @@ function providerHealth(provider: Provider): { label: string; tone: "success" | 
   return { label: "Ready", tone: "success" };
 }
 
-/// One credential. The two provider kinds are genuinely different here:
-/// a metered key shows the ceiling *we* configured and how much of it is
-/// left, while a seat shows the plan windows the provider reports and
-/// which of them is currently refusing traffic.
-function CredentialCard(props: { providerKey: ProviderKey; subscription: boolean }) {
+/// One credential as a table row. Claude seats report 5-hour and 7-day
+/// windows; Codex seats a 5-hour and a weekly one — the labels say which,
+/// because "primary window" tells an operator nothing at 2am.
+function CredentialRow(props: {
+  providerKey: ProviderKey;
+  kind: string;
+  subscription: boolean;
+  onRemove: () => void;
+  onCheck: () => void;
+  checking?: boolean;
+  probe?: { status: string; detail: string } | null;
+}) {
   const key = () => props.providerKey;
-  const tone = () => ({
-    healthy: "success", probing: "warning", open: "danger", benched: "danger",
-  } as const)[key().health as "healthy" | "probing" | "open" | "benched"];
-  return <div style={{ "border-top": "1px solid var(--border)", padding: "16px 0" }}>
-    <div class="section-title" style={{ "margin-bottom": "12px" }}>
-      <div>
-        <h2>{key().name}</h2>
-        <p>{key().models?.length ? key().models!.join(", ") : "Serves every model"} · weight {key().weight}</p>
-      </div>
-      <span class="pill" classList={{ success: key().health === "healthy", danger: tone() === "danger", warning: tone() === "warning" }}>
-        {key().health}
-      </span>
+  // The server folds breaker, quota and credential into one word; fall
+  // back to raw breaker health for a gateway that has not been updated.
+  const statusLabel = () => ({
+    ready: "ready",
+    near_limit: "near limit",
+    exhausted: "out of quota",
+    probing: "probing",
+  } as Record<string, string>)[key().status ?? ""] ?? key().health;
+  const statusTone = () => {
+    switch (key().status ?? key().health) {
+      case "ready":
+      case "healthy":
+        return "success";
+      case "near_limit":
+      case "probing":
+        return "warning";
+      default:
+        return "danger";
+    }
+  };
+  const isClaude = () => props.kind.toLowerCase().includes("claude");
+  const windowLabels = () => (isClaude() ? ["5-hour limit", "7-day limit"] : ["5-hour limit", "Weekly limit"]);
+
+  const windowCell = (label: string, w: QuotaWindow | null) => (
+    <Show when={w} keyed>{(win) => {
+      const pct = Math.round(Math.min(win.utilization, 1) * 100);
+      const meterTone = win.rejected || pct >= 100 ? "danger" : pct >= 80 ? "warning" : "";
+      return <div class="cred-window">
+        <span class="cred-window-label">{label}</span>
+        <div class={`meter ${meterTone}`}><i style={{ width: `${pct}%` }} /></div>
+        <span class="cred-window-pct">{pct}%{win.resets_in_s ? ` · resets ${formatDuration(win.resets_in_s)}` : ""}</span>
+      </div>;
+    }}</Show>
+  );
+
+  return <tr>
+    <td>
+      <strong>{key().credential?.email ?? key().name}</strong>
+      <small>
+        <Show when={key().credential?.email}>{key().name} · </Show>
+        {key().models?.length ? `${key().models!.length} model${key().models!.length > 1 ? "s" : ""}` : "every model"} · weight {key().weight}
+      </small>
+    </td>
+    <td>
+      <Show when={props.subscription} fallback={
+        <Show when={key().limits.rpm || key().limits.tpm} fallback={<span class="muted">No ceiling set</span>}>
+          <small>
+            {key().limits.rpm ? `${formatNumber(key().limits.rpm!.remaining ?? 0)} req left this minute` : ""}
+            {key().limits.rpm && key().limits.tpm ? " · " : ""}
+            {key().limits.tpm ? `${formatNumber(key().limits.tpm!.remaining ?? 0)} tok left` : ""}
+          </small>
+        </Show>
+      }>
+        <Show when={key().quota} fallback={<span class="muted">Reports after the first request</span>}>
+          {windowCell(windowLabels()[0], key().quota!.primary)}
+          {windowCell(windowLabels()[1], key().quota!.secondary)}
+        </Show>
+        <Show when={key().health === "benched" && key().benched_until_ms}>
+          <small class="muted">Out until {new Date(key().benched_until_ms!).toLocaleString()}</small>
+        </Show>
+      </Show>
+    </td>
+    <td>
+      <Show when={key().credential} fallback={<span class="muted">—</span>}>
+        {(() => {
+          const cred = key().credential!;
+          const at = cred.expires_at_ms;
+          // An expired access token that can refresh is the normal
+          // resting state of a Codex seat, not a fault: the refresher
+          // renews it on the next request. Only a credential that
+          // cannot refresh is actually a problem worth alarming about.
+          if (cred.can_refresh) {
+            return <>
+              <small>Renews automatically</small>
+              <Show when={at}><small class="muted">{cred.expired ? "renews on next use" : `valid until ${formatClock(at!)}`}</small></Show>
+            </>;
+          }
+          if (!at) return <small class="muted">No readable expiry</small>;
+          const days = Math.round((at - Date.now()) / 86_400_000);
+          return <>
+            <small classList={{ danger: cred.expired || days <= 7 }}>
+              {cred.expired ? "Expired" : days <= 1 ? "Expires today" : `${days} days left`}
+            </small>
+            <small class="muted">{formatClock(at)}</small>
+          </>;
+        })()}
+      </Show>
+    </td>
+    <td>
+      <span class="pill" classList={{
+        success: statusTone() === "success",
+        warning: statusTone() === "warning",
+        danger: statusTone() === "danger",
+      }}>{statusLabel()}</span>
+      <Show when={props.probe}>
+        <small classList={{ danger: props.probe!.status !== "ok", muted: props.probe!.status === "ok" }}>
+          {props.probe!.status === "ok" ? "checked just now" : props.probe!.detail || props.probe!.status}
+        </small>
+      </Show>
+      <Show when={key().credential && !key().credential!.can_refresh && key().credential!.expired}>
+        <small class="danger">re-authorise needed</small>
+      </Show>
+    </td>
+    <td class="actions">
+      <button
+        class="icon-button"
+        title={`Check ${key().name}`}
+        aria-label={`Check ${key().name}`}
+        disabled={props.checking}
+        onClick={props.onCheck}
+      >
+        <Show when={props.checking} fallback={<Stethoscope size={14} />}><RefreshCw size={14} class="spin" /></Show>
+      </button>
+      <button class="icon-button danger" title={`Remove ${key().name}`} aria-label={`Remove ${key().name}`} onClick={props.onRemove}><Trash2 size={14} /></button>
+    </td>
+  </tr>;
+}
+
+function BaseUrlEditor(props: { provider: Provider; onDone: () => void; onError: (msg: string) => void }) {
+  const [value, setValue] = createSignal(props.provider.base_url ?? "");
+  const [pending, setPending] = createSignal(false);
+  const dirty = () => (value().trim() || "") !== (props.provider.base_url ?? "");
+  return <div class="drawer-section">
+    <SectionTitle title="Endpoint" subtitle="Base URL requests are sent to; empty uses the provider default" />
+    <div class="baseurl-row">
+      <input
+        placeholder="https://api.example.com/v1"
+        value={value()}
+        aria-label="Base URL"
+        onInput={(e) => setValue(e.currentTarget.value)}
+      />
+      <button class="button outline" disabled={!dirty() || pending()} onClick={async () => {
+        setPending(true); props.onError("");
+        try {
+          await api.updateProvider(props.provider.name, { base_url: value().trim() });
+          props.onDone();
+        } catch (err) { props.onError(err instanceof Error ? err.message : "Update failed"); }
+        finally { setPending(false); }
+      }}>{pending() ? "Saving…" : "Save"}</button>
     </div>
-
-    <Show when={key().health === "benched" && key().benched_until_ms}>
-      <p class="notice">Out of quota until {new Date(key().benched_until_ms!).toLocaleString()}. Requests route to other keys.</p>
-    </Show>
-
-    <Show when={props.subscription} fallback={<MeteredLimits providerKey={key()} />}>
-      <Show when={key().quota} fallback={<p class="muted">No quota reported yet — the provider states a seat's windows on its responses, so this fills in after the first request.</p>}>
-        <dl class="facts">
-          <QuotaRow label="Primary window" window={key().quota!.primary} />
-          <QuotaRow label="Secondary window" window={key().quota!.secondary} />
-        </dl>
-        <p class="muted">As of {new Date(key().quota!.observed_ms).toLocaleTimeString()}</p>
-      </Show>
-      <Show when={key().credential}>
-        <dl class="facts">
-          <Fact label="Credential expires"
-                value={key().credential!.expires_at_ms
-                  ? new Date(key().credential!.expires_at_ms!).toLocaleString()
-                  : "Unknown — opaque token"} />
-          <Fact label="Can self-renew" value={key().credential!.can_refresh ? "Yes" : "No — needs an operator"} />
-        </dl>
-      </Show>
-    </Show>
   </div>;
 }
 
-function MeteredLimits(props: { providerKey: ProviderKey }) {
-  const limits = () => props.providerKey.limits;
-  return <Show when={limits().rpm || limits().tpm}
-               fallback={<p class="muted">No per-key rate limit configured. Set <code>rpm</code> or <code>tpm</code> on this key to cap it independently of the others.</p>}>
-    <dl class="facts">
-      <Show when={limits().rpm}><Fact label="Requests remaining this minute" value={formatNumber(limits().rpm!.remaining ?? 0)} /></Show>
-      <Show when={limits().tpm}><Fact label="Tokens remaining this minute" value={formatNumber(limits().tpm!.remaining ?? 0)} /></Show>
-    </dl>
-  </Show>;
-}
-
-/// A plan window. Utilization is shown as a bar because the number that
-/// matters is "how close to full", and the reset time because that is
-/// the only thing an operator can actually plan around.
-function QuotaRow(props: { label: string; window: QuotaWindow | null }) {
-  return <Show when={props.window} keyed>{(w) => {
-    const pct = Math.round(Math.min(w.utilization, 1) * 100);
-    const tone = w.rejected || pct >= 100 ? "danger" : pct >= 80 ? "warning" : "";
-    return <div>
-      <dt>{props.label}{w.length_s ? ` · ${formatDuration(w.length_s)}` : ""}</dt>
-      <dd>
-        <div class="meter-row">
-          <div class={`meter ${tone}`}><i style={{ width: `${pct}%` }} /></div>
-          <span>{pct}%</span>
+/// Adding a credential to an existing provider, with the same per-kind
+/// capture as the add dialog: a setup token for Claude Code, an
+/// auth.json upload for Codex, a reference for metered keys.
+function AddCredential(props: { provider: Provider; onDone: () => void; onError: (msg: string) => void }) {
+  const [open, setOpen] = createSignal(false);
+  const [name, setName] = createSignal("");
+  const [value, setValue] = createSignal("");
+  const [fileContent, setFileContent] = createSignal("");
+  const [seats, setSeats] = createSignal<Seat[]>([]);
+  const [rpm, setRpm] = createSignal("");
+  const [tpm, setTpm] = createSignal("");
+  const [pending, setPending] = createSignal(false);
+  const kind = () => {
+    const k = props.provider.kind.toLowerCase();
+    return k.includes("claude") ? "claude" as const : k.includes("codex") ? "codex" as const : "plain" as const;
+  };
+  return <div class="drawer-section">
+    <Show when={open()} fallback={
+      <button class="button outline" onClick={() => setOpen(true)}><Plus size={14} />Add credential</button>
+    }>
+      <form class="panel" onSubmit={async (e) => {
+        e.preventDefault(); setPending(true); props.onError("");
+        try {
+          if (kind() === "codex" && seats().length > 1) {
+            const written = await api.putCredentialFiles(seats().map((seat) => ({
+              name: `${props.provider.name}_${seat.name}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
+              content: seat.content,
+            })));
+            const result = await api.addProviderKeys(
+              props.provider.name,
+              written.written.map((entry, i) => ({
+                name: seats()[i]?.name ?? entry.name,
+                value: entry.reference,
+              })),
+            );
+            if (result.skipped.length) {
+              props.onError(`Added ${result.added.length}; skipped ${result.skipped.length} already present.`);
+            }
+            setOpen(false); setSeats([]); setName(""); setValue(""); setFileContent("");
+            props.onDone();
+            return;
+          }
+          let credential = value();
+          const safe = `${props.provider.name}_${name()}`.replace(/[^a-zA-Z0-9_-]/g, "_");
+          if (kind() === "claude" && value()) {
+            credential = (await api.putSecret(safe, value())).reference;
+          } else if (kind() === "codex" && fileContent()) {
+            credential = (await api.putCredentialFile(safe, fileContent())).reference;
+          }
+          await api.addProviderKey(props.provider.name, {
+            name: name(), value: credential,
+            ...(rpm() ? { rpm: Number(rpm()) } : {}),
+            ...(tpm() ? { tpm: Number(tpm()) } : {}),
+          });
+          setOpen(false); setName(""); setValue(""); setFileContent(""); setRpm(""); setTpm("");
+          props.onDone();
+        } catch (err) { props.onError(err instanceof Error ? err.message : "Add failed"); }
+        finally { setPending(false); }
+      }}>
+        <SectionTitle title="New credential" subtitle={
+          kind() === "claude" ? "Another subscription seat via its setup token"
+          : kind() === "codex" ? "Another seat via its auth.json"
+          : "Stored by reference where possible"} />
+        <Show when={seats().length <= 1}>
+          <label>Name<input required={seats().length <= 1} placeholder="seat-2" value={name()} onInput={(e) => setName(e.currentTarget.value)} /></label>
+        </Show>
+        <div style={{ "margin-top": "12px" }}>
+          <CredentialField
+            kind={kind()}
+            placeholder="env.OPENAI_API_KEY, file:/path or store.name"
+            onToken={setValue}
+            onFile={(content, email) => {
+              setFileContent(content);
+              setValue("uploaded");
+              if (!name()) setName(seatNameFrom(email, "seat-2"));
+            }}
+            onSeats={(list) => {
+              setSeats(list);
+              setValue(list.length ? "uploaded" : "");
+              if (list.length === 1) { setFileContent(list[0].content); setName(list[0].name); }
+            }}
+          />
         </div>
-        <small class="muted">{w.rejected ? "Refusing requests" : "Serving"}{w.resets_in_s ? ` · resets in ${formatDuration(w.resets_in_s)}` : ""}</small>
-      </dd>
-    </div>;
-  }}</Show>;
+        <Show when={kind() === "plain"}>
+          <div class="field-row" style={{ "margin-top": "12px" }}>
+            <label>Requests / min <span class="optional">Optional</span><input type="number" min="1" value={rpm()} onInput={(e) => setRpm(e.currentTarget.value)} /></label>
+            <label>Tokens / min <span class="optional">Optional</span><input type="number" min="1" value={tpm()} onInput={(e) => setTpm(e.currentTarget.value)} /></label>
+          </div>
+        </Show>
+        <div class="dialog-actions" style={{ "margin-top": "14px" }}>
+          <button type="button" class="button outline" onClick={() => setOpen(false)}>Cancel</button>
+          <button class="button primary" disabled={pending() || (seats().length <= 1 && !name()) || !value()}>
+            {pending() ? "Adding…" : seats().length > 1 ? `Add ${seats().length} seats` : "Add credential"}
+          </button>
+        </div>
+      </form>
+    </Show>
+  </div>;
+}
+/// Routing groups: the name a caller sends, and the ordered list of
+/// targets it resolves through.
+///
+/// This replaces a raw TOML editor. `[aliases]` and `[fallbacks]` are one
+/// idea split across two tables — the alias is the first target, the
+/// chain is the rest — and reading a routing decision meant assembling it
+/// from both. Here a group is one row, in order, first to last.
+function Routing(props: { refresh: () => number }) {
+  const [routes, { refetch }] = createResource(props.refresh, api.routes);
+  const [providers] = createResource(props.refresh, api.providers);
+  const [editing, setEditing] = createSignal<RouteGroup | null>(null);
+  const [search, setSearch] = createSignal("");
+  const [error, setError] = createSignal("");
+
+  const targetOptions = createMemo<Option[]>(() => {
+    const out: Option[] = [];
+    for (const provider of providers()?.data ?? []) {
+      const models = new Set<string>();
+      for (const key of provider.keys) for (const m of key.models ?? []) models.add(m);
+      for (const m of models) out.push({ value: `${provider.name}/${m}`, label: `${provider.name}/${m}`, hint: provider.kind });
+    }
+    return out;
+  });
+  const shown = createMemo(() => {
+    const needle = search().trim().toLowerCase();
+    const all = routes()?.data ?? [];
+    return needle ? all.filter((r) => `${r.name} ${r.targets.join(" ")}`.toLowerCase().includes(needle)) : all;
+  });
+
+  return <div class="stack-lg">
+    <FilterBar
+      search={search()}
+      onSearch={setSearch}
+      searchPlaceholder="Search groups (press /)"
+      filters={[]}
+      extra={<button class="button primary" onClick={() => setEditing({ name: "", targets: [] })}><Plus size={15} />New group</button>}
+    />
+    <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+    <section class="panel">
+      <SectionTitle title="Routing groups" subtitle="One model id for callers; the gateway tries each target in order" />
+      <Loading when={routes.loading && !routes()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No routing groups" action="A group lets callers ask for `fast` and fail over across providers." />}>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table>
+          <thead><tr><th>Group</th><th>Route order</th><th><span class="sr-only">Actions</span></th></tr></thead>
+          <tbody><For each={shown()}>{(group) => <tr class="clickable" onClick={() => setEditing({ ...group })}>
+            <td class="strong mono">{group.name}</td>
+            <td>
+              <div class="route-chain">
+                <For each={group.targets}>{(target, index) => <>
+                  <Show when={index()}><span class="route-arrow" aria-hidden="true">→</span></Show>
+                  <span class="pill" classList={{ accent: index() === 0 }}>{target}</span>
+                </>}</For>
+              </div>
+            </td>
+            <td class="actions">
+              <button class="icon-button danger" title={`Delete ${group.name}`} aria-label={`Delete ${group.name}`} onClick={async (e) => {
+                e.stopPropagation();
+                if (!confirm(`Delete routing group ${group.name}?`)) return;
+                setError("");
+                try { await api.deleteRoute(group.name); await refetch(); }
+                catch (err) { setError(err instanceof Error ? err.message : "Delete failed"); }
+              }}><Trash2 size={14} /></button>
+            </td>
+          </tr>}</For></tbody>
+        </table></div>
+      </Show>
+      </Loading>
+    </section>
+    <Show when={editing()} keyed>{(group) => (
+      <RouteDialog
+        group={group}
+        options={targetOptions()}
+        onClose={() => setEditing(null)}
+        onDone={async () => { setEditing(null); await refetch(); }}
+      />
+    )}</Show>
+  </div>;
 }
 
-function Routing(props: { refresh: () => number }) {
-  const [config, { refetch }] = createResource(props.refresh, api.config);
-  const [text, setText] = createSignal("");
-  const [message, setMessage] = createSignal("");
+function RouteDialog(props: { group: RouteGroup; options: Option[]; onClose: () => void; onDone: () => void }) {
+  escapeCloses(props.onClose);
+  const [name, setName] = createSignal(props.group.name);
+  const [targets, setTargets] = createSignal<string[]>(props.group.targets);
   const [error, setError] = createSignal("");
-  createEffect(() => { if (config()) setText(config()!.text); });
-  return <section class="editor-layout">
-    <div class="editor-toolbar"><div><h2>Routing configuration</h2><p>Validated and applied atomically across the local data plane.</p></div>
-      <button class="button primary" disabled={config()?.read_only} onClick={async () => {
-        setError(""); setMessage("");
-        try { await api.saveConfig(config()!.version, text()); setMessage("Configuration applied"); await refetch(); }
-        catch (err) { setError(err instanceof Error ? err.message : "Save failed"); }
-      }}><Save size={16} />Apply</button>
-    </div>
-    <Show when={config()?.read_only}><div class="notice">File mode is read-only. Edit the source file and reload the gateway.</div></Show>
-    <Show when={message()}><p class="success-message" role="status">{message()}</p></Show><Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
-    <label class="code-editor"><span>rapid-router.toml</span><textarea spellcheck={false} value={text()} onInput={(e) => setText(e.currentTarget.value)} readOnly={config()?.read_only} /></label>
-  </section>;
+  const [pending, setPending] = createSignal(false);
+  const move = (index: number, delta: number) => {
+    const next = [...targets()];
+    const to = index + delta;
+    if (to < 0 || to >= next.length) return;
+    [next[index], next[to]] = [next[to], next[index]];
+    setTargets(next);
+  };
+  return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
+    <form class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="route-title" onSubmit={async (e) => {
+      e.preventDefault(); setError(""); setPending(true);
+      try { await api.putRoute({ name: name(), targets: targets() }); props.onDone(); }
+      catch (err) { setError(err instanceof Error ? err.message : "Save failed"); }
+      finally { setPending(false); }
+    }}>
+      <header class="dialog-head">
+        <div><h2 id="route-title">{props.group.name ? `Edit ${props.group.name}` : "New routing group"}</h2><p class="muted">Callers send the group name as the model id.</p></div>
+        <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={props.onClose}><X size={16} /></button>
+      </header>
+      <label>Group name
+        <input required placeholder="fast" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
+      </label>
+      <div>
+        <p class="muted" style={{ "margin-bottom": "8px" }}>Targets, tried in order. The first is primary; the rest are fallbacks.</p>
+        <Show when={targets().length} fallback={<p class="muted">No targets yet.</p>}>
+          <ol class="route-editor">
+            <For each={targets()}>{(target, index) => (
+              <li>
+                <span class="route-rank">{index() === 0 ? "Primary" : `Fallback ${index()}`}</span>
+                <code class="mono">{target}</code>
+                <div class="route-controls">
+                  <button type="button" class="icon-button" aria-label="Move up" disabled={index() === 0} onClick={() => move(index(), -1)}>↑</button>
+                  <button type="button" class="icon-button" aria-label="Move down" disabled={index() === targets().length - 1} onClick={() => move(index(), 1)}>↓</button>
+                  <button type="button" class="icon-button danger" aria-label={`Remove ${target}`} onClick={() => setTargets(targets().filter((_, i) => i !== index()))}><X size={13} /></button>
+                </div>
+              </li>
+            )}</For>
+          </ol>
+        </Show>
+        <div class="route-add">
+          <Combobox
+            value=""
+            options={props.options.filter((o) => !targets().includes(o.value))}
+            onSelect={(value) => value && setTargets([...targets(), value])}
+            label="Add target"
+            placeholder={targets().length ? "Add a fallback…" : "Add the primary target…"}
+          />
+        </div>
+      </div>
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+      <div class="dialog-actions">
+        <button type="button" class="button outline" onClick={props.onClose}>Cancel</button>
+        <button class="button primary" disabled={pending() || !name() || !targets().length}>{pending() ? "Saving…" : "Save group"}</button>
+      </div>
+    </form>
+  </div>;
 }
 
 function Keys(props: { refresh: () => number; bump: () => void }) {
   const [keys, { refetch }] = createResource(props.refresh, api.keys);
+  const [providers] = createResource(props.refresh, api.providers);
   const [creating, setCreating] = createSignal(false);
   const [revealed, setRevealed] = createSignal("");
+  const [search, setSearch] = createSignal("");
   const [name, setName] = createSignal("");
-  const [models, setModels] = createSignal("");
+  const [models, setModels] = createSignal<string[]>([]);
+  const [budget, setBudget] = createSignal("");
+  const [period, setPeriod] = createSignal("monthly");
+  const [rpm, setRpm] = createSignal("");
+  const [tpm, setTpm] = createSignal("");
+  const [advanced, setAdvanced] = createSignal(false);
   const [error, setError] = createSignal("");
   const reload = async () => { await refetch(); props.bump(); };
+
+  const modelOptions = createMemo<Option[]>(() => {
+    const out: Option[] = [];
+    for (const provider of providers()?.data ?? []) {
+      const names = new Set<string>();
+      for (const k of provider.keys) for (const m of k.models ?? []) names.add(m);
+      for (const m of names) out.push({ value: `${provider.name}/${m}`, label: `${provider.name}/${m}`, hint: provider.kind });
+    }
+    return out;
+  });
+  const shown = createMemo(() => {
+    const needle = search().trim().toLowerCase();
+    const all = keys()?.data ?? [];
+    return needle ? all.filter((k) => `${k.name} ${k.id}`.toLowerCase().includes(needle)) : all;
+  });
+
+  const reset = () => { setName(""); setModels([]); setBudget(""); setRpm(""); setTpm(""); setError(""); };
+  createEffect(() => {
+    if (!creating()) return;
+    const onKey = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      if (document.querySelector(".combobox-popup")) return;
+      setCreating(false);
+    };
+    document.addEventListener("keydown", onKey);
+    onCleanup(() => document.removeEventListener("keydown", onKey));
+  });
+
   return <div class="stack-lg">
-    <section class="panel"><SectionTitle title="Virtual keys" subtitle="Scoped credentials with limits, budgets, and immediate revocation" action={<button class="button primary" onClick={() => setCreating(true)}><Plus size={16} />Create key</button>} />
-      <Show when={(keys()?.data.length ?? 0) > 0} fallback={<Empty title="No virtual keys" action="Create a key for an application or team." />}>
+    <FilterBar
+      search={search()}
+      onSearch={setSearch}
+      searchPlaceholder="Search keys (press /)"
+      filters={[]}
+      extra={<button class="button primary" onClick={() => setCreating(true)}><Plus size={15} />Create key</button>}
+    />
+    <section class="panel">
+      <SectionTitle title="Virtual keys" subtitle="Scoped credentials with limits, budgets, and immediate revocation" />
+      <Loading when={keys.loading && !keys()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No virtual keys" action="Create a key for an application or team." />}>
         <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table><thead><tr><th>Name</th><th>Scope</th><th>Rate</th><th>Budget</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>
-          <For each={keys()?.data ?? []}>{(key) => <KeyRow key={key} reload={reload} reveal={setRevealed} />}</For>
+          <For each={shown()}>{(key) => <KeyRow key={key} reload={reload} reveal={setRevealed} />}</For>
         </tbody></table></div>
       </Show>
+      </Loading>
     </section>
-    <Show when={creating()}><div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setCreating(false); }}><form class="dialog" role="dialog" aria-modal="true" aria-labelledby="create-key-title" onSubmit={async (e) => {
-      e.preventDefault(); setError("");
-      try { const result = await api.createKey({ name: name(), models: models().split(",").map((v) => v.trim()).filter(Boolean) }); setRevealed(result.key); setCreating(false); setName(""); setModels(""); await reload(); }
-      catch (err) { setError(err instanceof Error ? err.message : "Create failed"); }
-    }}><h2 id="create-key-title">Create virtual key</h2><p class="muted">The secret is shown once after creation.</p>
-      <label>Name<input required value={name()} onInput={(e) => setName(e.currentTarget.value)} /></label><label>Allowed models <span class="optional">Optional</span><input value={models()} placeholder="fast, openai/gpt-4.1-mini" onInput={(e) => setModels(e.currentTarget.value)} /></label>
-      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show><div class="dialog-actions"><button type="button" class="button" onClick={() => setCreating(false)}>Cancel</button><button class="button primary">Create key</button></div></form></div></Show>
-    <Show when={revealed()}><div class="secret-banner" role="status"><div><strong>Copy this key now</strong><code>{revealed()}</code></div><button class="icon-button" aria-label="Copy new virtual key" title="Copy key" onClick={() => navigator.clipboard.writeText(revealed())}><Copy size={17} /></button></div></Show>
+
+    <Show when={creating()}>
+      <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) setCreating(false); }}>
+        <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="create-key-title" onSubmit={async (e) => {
+          e.preventDefault(); setError("");
+          try {
+            const input: Record<string, unknown> = { name: name(), models: models() };
+            if (budget()) input.budget = { usd: Number(budget()), period: period() };
+            if (rpm() || tpm()) input.rate = { ...(rpm() ? { rpm: Number(rpm()) } : {}), ...(tpm() ? { tpm: Number(tpm()) } : {}) };
+            const result = await api.createKey(input);
+            setRevealed(result.key); setCreating(false); reset(); await reload();
+          } catch (err) { setError(err instanceof Error ? err.message : "Create failed"); }
+        }}>
+          <header class="dialog-head">
+            <div><h2 id="create-key-title">Create virtual key</h2><p class="muted">The secret is shown once after creation.</p></div>
+            <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={() => { setCreating(false); reset(); }}><X size={16} /></button>
+          </header>
+          <label>Name<input required value={name()} onInput={(e) => setName(e.currentTarget.value)} /></label>
+          <label>Allowed models <span class="optional">Leave empty for all</span>
+            <MultiCombobox
+              values={models()}
+              options={modelOptions()}
+              onChange={setModels}
+              label="Allowed models"
+              emptyMeans="Every model"
+            />
+          </label>
+          <div class="disclosure" classList={{ open: advanced() }}>
+            <button type="button" class="disclosure-toggle" aria-expanded={advanced()} onClick={() => setAdvanced((v) => !v)}>
+              <ChevronRight size={13} class="disclosure-chevron" aria-hidden="true" />
+              <span>Budget and rate limits</span>
+              <Show when={!advanced()}>
+                <span class="disclosure-preview">
+                  {budget() || rpm() || tpm()
+                    ? [budget() && `$${budget()}/${period()}`, rpm() && `${rpm()} rpm`, tpm() && `${tpm()} tpm`].filter(Boolean).join(" · ")
+                    : "None — unlimited"}
+                </span>
+              </Show>
+            </button>
+            <Show when={advanced()}>
+              <div class="disclosure-body">
+                <div class="field-row">
+                  <label>Budget (USD) <span class="optional">Optional</span>
+                    <input type="number" min="0" step="0.01" value={budget()} onInput={(e) => setBudget(e.currentTarget.value)} />
+                  </label>
+                  <label>Period
+                    <select value={period()} onChange={(e) => setPeriod(e.currentTarget.value)}>
+                      <option value="daily">Daily</option><option value="weekly">Weekly</option><option value="monthly">Monthly</option>
+                    </select>
+                  </label>
+                </div>
+                <div class="field-row">
+                  <label>Requests / min <span class="optional">Optional</span>
+                    <input type="number" min="1" value={rpm()} onInput={(e) => setRpm(e.currentTarget.value)} />
+                  </label>
+                  <label>Tokens / min <span class="optional">Optional</span>
+                    <input type="number" min="1" value={tpm()} onInput={(e) => setTpm(e.currentTarget.value)} />
+                  </label>
+                </div>
+              </div>
+            </Show>
+          </div>
+          <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+          <div class="dialog-actions">
+            <button type="button" class="button outline" onClick={() => { setCreating(false); reset(); }}>Cancel</button>
+            <button class="button primary">Create key</button>
+          </div>
+        </form>
+      </div>
+    </Show>
+
+    <Show when={revealed()}>
+      <div class="secret-banner" role="status">
+        <div><strong>Copy this key now</strong><code>{revealed()}</code></div>
+        <button class="icon-button" aria-label="Copy new virtual key" title="Copy key" onClick={() => navigator.clipboard.writeText(revealed())}><Copy size={16} /></button>
+      </div>
+    </Show>
   </div>;
 }
 
@@ -423,117 +1416,454 @@ function KeyRow(props: { key: VirtualKey; reload: () => Promise<void>; reveal: (
   return <tr><td><strong>{props.key.name}</strong><small class="mono">{props.key.id}</small></td><td>{props.key.models.length ? props.key.models.join(", ") : "All models"}</td><td>{props.key.rate?.rpm ? `${props.key.rate.rpm} RPM` : "Unlimited"}</td><td>{props.key.budget ? `${formatUsd(props.key.budget.usd)} / ${props.key.budget.period}` : "None"}</td><td><Status text={props.key.enabled ? "Active" : "Revoked"} tone={props.key.enabled ? "success" : "muted"} /></td><td class="actions"><button class="icon-button" title={`Rotate ${props.key.name}`} aria-label={`Rotate ${props.key.name}`} onClick={async () => { const result = await api.rotateKey(props.key.id); props.reveal(result.key); await props.reload(); }}><RefreshCw size={16} /></button><button class="icon-button danger" title={`Delete ${props.key.name}`} aria-label={`Delete ${props.key.name}`} onClick={async () => { if (confirm(`Delete ${props.key.name}?`)) { await api.deleteKey(props.key.id); await props.reload(); } }}><Trash2 size={16} /></button></td></tr>;
 }
 
-const RAMPS = [
-  { label: "1h", seconds: 3600, days: 1 },
-  { label: "24h", seconds: 86400, days: 1 },
-  { label: "7d", seconds: 86400, days: 7 },
-  { label: "30d", seconds: 86400, days: 30 },
-] as const;
+type DimFilters = { provider: string; model: string; key: string };
+type TrendPoint = [number, number];
+type Slice = {
+  name: string;
+  requests: number;
+  failed: number;
+  input: number;
+  output: number;
+  cost: number;
+};
 
-function Usage(props: { refresh: () => number }) {
-  const [ramp, setRamp] = createSignal(1);
-  const selected = () => RAMPS[ramp()];
-  // Anything past 24h has to come from the flushed files: the in-memory
-  // aggregate only spans a day.
-  const long = () => selected().days > 1;
-  const [live] = createResource(
-    () => [props.refresh(), ramp()] as const,
-    () => api.usage(selected().seconds, "model"),
-  );
-  const [history] = createResource(
-    () => [props.refresh(), ramp()] as const,
-    () => api.history(selected().days, "model"),
-  );
-  const [spendBy, setSpendBy] = createSignal<"model" | "provider" | "key">("model");
-  const [breakdown] = createResource(
-    () => [props.refresh(), ramp(), spendBy()] as const,
-    () => api.history(selected().days, spendBy()),
-  );
+/// One loader for both observability pages.
+///
+/// Sub-day ranges read the recent-request tail and filter client-side —
+/// full cross-filtering at minute resolution, bounded by the tail's
+/// depth, and the bound is *reported*, not hidden. Day ranges read the
+/// flushed history with the same filters applied server-side against raw
+/// records, so any filter composes with any grouping.
+function useTelemetry(
+  refresh: () => number,
+  range: () => TimeRange,
+  filters: () => DimFilters,
+) {
+  const resolved = createMemo(() => resolveRange(range()));
+  const dep = () => [refresh(), range(), filters()] as const;
+  const [tail] = createResource(dep, () =>
+    resolveRange(range()).live ? api.requests(false, 1000) : undefined);
+  const historyFor = (by: string) => {
+    const [res] = createResource(dep, () => {
+      const r = resolveRange(range());
+      const f = filters();
+      return r.live ? undefined : api.history(r.days, by, {
+        provider: f.provider || undefined,
+        model: f.model || undefined,
+        key: f.key || undefined,
+      });
+    });
+    return res;
+  };
+  const byModelRes = historyFor("model");
+  const byKeyRes = historyFor("key");
+  const byProviderRes = historyFor("provider");
 
-  const rows = createMemo<ModelRow[]>(() =>
-    long() ? rowsFromHistory(history()?.data ?? {}) : rowsFromGroups(live()?.groups ?? []));
-  const totals = createMemo(() => rows().reduce((acc, row) => ({
-    requests: acc.requests + row.requests,
-    failed: acc.failed + row.failed,
-    tokens: acc.tokens + row.tokens,
-    cost: acc.cost + row.cost,
-  }), { requests: 0, failed: 0, tokens: 0, cost: 0 }));
+  const liveRecords = createMemo(() => {
+    const r = resolved();
+    if (!r.live) return [];
+    const f = filters();
+    return (tail()?.data ?? []).filter((rec) =>
+      rec.ts >= r.startMs && rec.ts <= r.endMs
+      && (!f.provider || rec.provider === f.provider)
+      && (!f.model || rec.model === f.model)
+      && (!f.key || rec.vkey === f.key));
+  });
 
-  return <div class="stack-lg">
-    <div class="view-toolbar">
-      <p class="muted">Volume, failures and spend per model.</p>
-      <div class="segmented" role="group" aria-label="Time range">
-        <For each={RAMPS}>{(item, index) => (
-          <button aria-pressed={ramp() === index()} onClick={() => setRamp(index())}>{item.label}</button>
+  const sliceDays = (series: Record<string, DayBucket[]> | undefined) => {
+    if (!series) return {};
+    const r = resolved();
+    const from = new Date(r.startMs).toISOString().slice(0, 10);
+    const to = new Date(r.endMs).toISOString().slice(0, 10);
+    const out: Record<string, DayBucket[]> = {};
+    for (const [name, buckets] of Object.entries(series)) {
+      const kept = buckets.filter((b) => b.day >= from && b.day <= to);
+      if (kept.length) out[name] = kept;
+    }
+    return out;
+  };
+
+  const slicesOf = (series: Record<string, DayBucket[]>): Slice[] =>
+    Object.entries(series).map(([name, buckets]) => ({
+      name,
+      requests: buckets.reduce((n, b) => n + b.requests, 0),
+      failed: buckets.reduce((n, b) => n + b.failed, 0),
+      input: buckets.reduce((n, b) => n + b.input_tokens, 0),
+      output: buckets.reduce((n, b) => n + b.output_tokens, 0),
+      cost: buckets.reduce((n, b) => n + b.cost_micro_usd, 0) / 1e6,
+    }));
+
+  const liveSlices = (pick: (r: UsageRecord) => string) => {
+    const map = new Map<string, Slice>();
+    for (const rec of liveRecords()) {
+      const name = pick(rec) || "(none)";
+      const slice = map.get(name) ?? { name, requests: 0, failed: 0, input: 0, output: 0, cost: 0 };
+      slice.requests += 1;
+      if (rec.status >= 400) slice.failed += 1;
+      slice.input += rec.input_tokens;
+      slice.output += rec.output_tokens;
+      slice.cost += rec.cost_micro_usd / 1e6;
+      map.set(name, slice);
+    }
+    return [...map.values()];
+  };
+
+  const byModel = createMemo<Slice[]>(() => resolved().live
+    ? liveSlices((r) => r.model)
+    : slicesOf(sliceDays(byModelRes()?.data)));
+  const byKey = createMemo<Slice[]>(() => resolved().live
+    ? liveSlices((r) => r.vkey ?? "")
+    : slicesOf(sliceDays(byKeyRes()?.data)));
+  const byProvider = createMemo<Slice[]>(() => resolved().live
+    ? liveSlices((r) => r.provider)
+    : slicesOf(sliceDays(byProviderRes()?.data)));
+
+  /// Time series for the charts: minute buckets from the tail, or day
+  /// buckets from history, projected by `value`.
+  const trend = (value: (b: { requests: number; failed: number; input: number; output: number; cost: number }) => number) =>
+    createMemo<TrendPoint[]>(() => {
+      const r = resolved();
+      if (r.live) {
+        const buckets = new Map<number, { requests: number; failed: number; input: number; output: number; cost: number }>();
+        for (const rec of liveRecords()) {
+          const minute = Math.floor(rec.ts / 60000) * 60;
+          const b = buckets.get(minute) ?? { requests: 0, failed: 0, input: 0, output: 0, cost: 0 };
+          b.requests += 1;
+          if (rec.status >= 400) b.failed += 1;
+          b.input += rec.input_tokens;
+          b.output += rec.output_tokens;
+          b.cost += rec.cost_micro_usd / 1e6;
+          buckets.set(minute, b);
+        }
+        return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([ts, b]) => [ts, value(b)]);
+      }
+      const perDay = new Map<string, { requests: number; failed: number; input: number; output: number; cost: number }>();
+      for (const buckets of Object.values(sliceDays(byModelRes()?.data))) {
+        for (const bucket of buckets) {
+          const b = perDay.get(bucket.day) ?? { requests: 0, failed: 0, input: 0, output: 0, cost: 0 };
+          b.requests += bucket.requests;
+          b.failed += bucket.failed;
+          b.input += bucket.input_tokens;
+          b.output += bucket.output_tokens;
+          b.cost += bucket.cost_micro_usd / 1e6;
+          perDay.set(bucket.day, b);
+        }
+      }
+      return [...perDay.entries()]
+        .sort((a, b) => (a[0] < b[0] ? -1 : 1))
+        .map(([day, b]) => [Date.parse(`${day}T00:00:00`) / 1000, value(b)]);
+    });
+
+  const truncated = createMemo(() => resolved().live && (tail()?.data.length ?? 0) >= 1000);
+  // "Still fetching" and "nothing to show" are different answers, and an
+  // empty state shown during the first read is the wrong one.
+  const loading = createMemo(() => resolved().live
+    ? tail.loading && !tail()
+    : byModelRes.loading && !byModelRes());
+  return { resolved, byModel, byKey, byProvider, trend, truncated, loading };
+}
+
+/// Shared filter row for the observability pages.
+function TelemetryFilters(props: {
+  filters: DimFilters;
+  onChange: (next: DimFilters) => void;
+  range: TimeRange;
+  onRange: (value: TimeRange) => void;
+  refresh: () => number;
+}) {
+  const [providers] = createResource(props.refresh, api.providers);
+  const [keys] = createResource(props.refresh, api.keys);
+  const modelOptions = createMemo<Option[]>(() => {
+    const out = new Set<string>();
+    for (const provider of providers()?.data ?? []) {
+      for (const key of provider.keys) for (const m of key.models ?? []) out.add(m);
+    }
+    return [...out].sort().map((m) => ({ value: m, label: m }));
+  });
+  return <FilterBar
+    search=""
+    onSearch={() => {}}
+    searchPlaceholder=""
+    filters={[
+      {
+        id: "provider",
+        label: "Provider",
+        value: props.filters.provider,
+        onChange: (v) => props.onChange({ ...props.filters, provider: v }),
+        options: (providers()?.data ?? []).map((p) => ({ value: p.name, label: p.name })),
+      },
+      {
+        id: "model",
+        label: "Model",
+        value: props.filters.model,
+        onChange: (v) => props.onChange({ ...props.filters, model: v }),
+        options: modelOptions(),
+      },
+      {
+        id: "key",
+        label: "Virtual key",
+        value: props.filters.key,
+        onChange: (v) => props.onChange({ ...props.filters, key: v }),
+        options: (keys()?.data ?? []).map((k) => ({ value: k.id, label: k.name, hint: k.id })),
+      },
+    ]}
+    extra={<RangePicker value={props.range} onChange={props.onRange} />}
+  />;
+}
+
+/// Multi-series line chart over explicit [seconds, value] points, minute
+/// or day resolution alike, axis pinned to the selected range.
+function TrendChart(props: {
+  series: Array<{ name: string; points: TrendPoint[] }>;
+  span: { startMs: number; endMs: number };
+  money?: boolean;
+  loading?: boolean;
+}) {
+  let element!: HTMLDivElement;
+  let plot: uPlot | undefined;
+  const palette = ["--series-1", "--series-2", "--series-3", "--series-4", "--series-5", "--series-6"];
+  const hasData = createMemo(() => props.series.some((s) => s.points.length));
+  createEffect(() => {
+    const series = props.series;
+    plot?.destroy();
+    plot = undefined;
+    if (!hasData() || !element) return;
+    const xs = [...new Set(series.flatMap((s) => s.points.map(([t]) => t)))].sort((a, b) => a - b);
+    const columns = series.map((s) => {
+      const map = new Map(s.points);
+      return xs.map((x) => map.get(x) ?? 0);
+    });
+    const ink = getComputedStyle(document.documentElement);
+    plot = new uPlot({
+      width: element.clientWidth || 720,
+      height: 220,
+      padding: [10, 8, 0, 4],
+      legend: { show: false },
+      cursor: { drag: { x: false, y: false } },
+      scales: { x: { time: true, range: [props.span.startMs / 1000, props.span.endMs / 1000] } },
+      axes: [
+        { stroke: ink.getPropertyValue("--muted"), grid: { stroke: ink.getPropertyValue("--grid") } },
+        {
+          stroke: ink.getPropertyValue("--muted"),
+          grid: { stroke: ink.getPropertyValue("--grid") },
+          // Wide enough for the longest label this axis can produce:
+          // uPlot reserves the gutter from a default, not from the
+          // formatter, so "$80.00" was being clipped at the left edge.
+          size: props.money ? 68 : 56,
+          values: (_u, splits) => splits.map((v) =>
+            props.money ? `$${Number(v).toFixed(v < 10 ? 2 : 0)}` : formatNumber(Number(v))),
+        },
+      ],
+      series: [
+        {},
+        ...series.map((s, i) => ({
+          label: s.name,
+          stroke: ink.getPropertyValue(palette[i % palette.length]),
+          width: 2,
+          points: { show: xs.length < 30 },
+          fill: series.length === 1
+            ? `color-mix(in srgb, ${ink.getPropertyValue(palette[0]).trim()} 12%, transparent)`
+            : undefined,
+        })),
+      ],
+    }, [xs, ...columns], element);
+    onCleanup(() => plot?.destroy());
+  });
+  return <Loading when={Boolean(props.loading)} skeleton="chart">
+    <Show when={hasData()} fallback={<Empty title="Nothing in this range" action="Widen the range or clear a filter." />}>
+    <div class="chart" ref={element} />
+    <Show when={props.series.length > 1}>
+      <div class="legend">
+        <For each={props.series}>{(s, i) => (
+          <div><i style={{ background: `var(${palette[i() % palette.length]})` }} />{s.name}</div>
         )}</For>
       </div>
+    </Show>
+  </Show>
+  </Loading>;
+}
+
+/// Usage: what the providers meter — volume and tokens.
+function Usage(props: { refresh: () => number }) {
+  const [range, setRange] = createSignal<TimeRange>({ kind: "relative", seconds: 86400, label: "Last 24 hours" });
+  const [filters, setFilters] = createSignal<DimFilters>({ provider: "", model: "", key: "" });
+  const t = useTelemetry(props.refresh, range, filters);
+  const totals = createMemo(() => t.byModel().reduce((acc, s) => ({
+    requests: acc.requests + s.requests, failed: acc.failed + s.failed,
+    input: acc.input + s.input, output: acc.output + s.output,
+  }), { requests: 0, failed: 0, input: 0, output: 0 }));
+  const inputTrend = t.trend((b) => b.input);
+  const outputTrend = t.trend((b) => b.output);
+  const requestTrend = t.trend((b) => b.requests);
+  const failedTrend = t.trend((b) => b.failed);
+
+  return <div class="stack-lg">
+    <TelemetryFilters filters={filters()} onChange={setFilters} range={range()} onRange={setRange} refresh={props.refresh} />
+    <Loading when={t.loading()} skeleton="stats" rows={6}>
+    <section class="stat-row" aria-label="Usage totals">
+      <div class="stat"><span>Requests</span><strong>{formatNumber(totals().requests)}</strong></div>
+      <div class="stat"><span>Success rate</span><strong>{totals().requests ? `${(((totals().requests - totals().failed) / totals().requests) * 100).toFixed(totals().failed ? 1 : 0)}%` : "—"}</strong></div>
+      <div class="stat"><span>Input tokens</span><strong>{formatNumber(totals().input)}</strong></div>
+      <div class="stat"><span>Output tokens</span><strong>{formatNumber(totals().output)}</strong></div>
+      <div class="stat"><span>Total tokens</span><strong>{formatNumber(totals().input + totals().output)}</strong></div>
+      <div class="stat"><span>Tokens / request</span><strong>{totals().requests ? formatNumber((totals().input + totals().output) / totals().requests) : "—"}</strong></div>
+    </section>
+    </Loading>
+    <Show when={t.truncated()}>
+      <p class="muted">Live view covers the most recent 1,000 requests; pick a day range for complete figures.</p>
+    </Show>
+    <section class="flat-section">
+      <header><h2>Tokens over time</h2><span class="muted">{t.resolved().label} · input vs output</span></header>
+      <TrendChart
+        series={[{ name: "Input", points: inputTrend() }, { name: "Output", points: outputTrend() }]}
+        span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }}
+        loading={t.loading()}
+      />
+    </section>
+    <div class="two-up">
+      <section class="flat-section">
+        <header><h2>Requests over time</h2></header>
+        <TrendChart series={[{ name: "Requests", points: requestTrend() }]} span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }} loading={t.loading()} />
+      </section>
+      <section class="flat-section">
+        <header><h2>Failures over time</h2></header>
+        <TrendChart series={[{ name: "Failed", points: failedTrend() }]} span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }} loading={t.loading()} />
+      </section>
     </div>
-
-    <section class="summary-strip six" aria-label="Totals">
-      <Metric label="Total requests" value={formatNumber(totals().requests)} />
-      <Metric label="Successful" value={formatNumber(totals().requests - totals().failed)} />
-      <Metric label="Failed" value={formatNumber(totals().failed)} tone={totals().failed > 0 ? "danger" : "default"} />
-      <Metric label="Total tokens" value={formatNumber(totals().tokens)} />
-      <Metric label="Total spend" value={formatUsd(totals().cost)} />
-      <Metric label="Avg per request"
-              value={formatUsd(totals().requests ? totals().cost / totals().requests : 0)} />
-    </section>
-
-    <section class="panel chart-panel">
-      <SectionTitle title="Spend over time" subtitle={long() ? "Daily totals from flushed usage" : "Requests per minute"} />
-      <Show when={long()} fallback={<UsageChart groups={live()?.groups ?? []} />}>
-        <DailySpendChart series={history()?.data ?? {}} />
-      </Show>
-    </section>
-
-    <section class="panel">
-      <SectionTitle title="Per model" subtitle="Every model this gateway served in the window" />
-      <Show when={rows().length} fallback={<Empty title="No traffic in this window" action="Send a request through the gateway to see it here." />}>
-        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table>
-          <thead><tr>
-            <th>Model</th><th class="num">Requests</th><th class="num">Successful</th><th class="num">Failed</th>
-            <th class="num">Tokens</th><th class="num">Total cost</th><th class="num">Avg / request</th>
-          </tr></thead>
-          <tbody><For each={rows()}>{(row) => <tr>
-            <td class="strong">{row.model}</td>
-            <td class="num">{formatNumber(row.requests)}</td>
-            <td class="num">{formatNumber(row.requests - row.failed)}</td>
-            <td class="num">{row.failed ? <span class="status danger"><span />{formatNumber(row.failed)}</span> : "0"}</td>
-            <td class="num">{formatNumber(row.tokens)}</td>
-            <td class="num">{formatUsd(row.cost)}</td>
-            <td class="num">{formatUsd(row.requests ? row.cost / row.requests : 0)}</td>
-          </tr>}</For></tbody>
-        </table></div>
-      </Show>
-    </section>
-
-    <section class="panel">
-      <SectionTitle title="Where the money goes"
-                    subtitle="Spend split by the dimension you pick"
-                    action={<div class="segmented" role="group" aria-label="Break spend down by">
-                      <For each={["model", "provider", "key"] as const}>{(dimension) => (
-                        <button aria-pressed={spendBy() === dimension} onClick={() => setSpendBy(dimension)}>
-                          {dimension === "key" ? "Virtual key" : dimension}
-                        </button>
-                      )}</For>
-                    </div>} />
-      <SpendBars series={breakdown()?.data ?? {}} />
-    </section>
+    <div class="two-up">
+      <section class="flat-section">
+        <header><h2>Per model</h2><span class="muted">by tokens</span></header>
+        <TokenTable slices={t.byModel()} label="Model" loading={t.loading()} />
+      </section>
+      <section class="flat-section">
+        <header><h2>Per virtual key</h2><span class="muted">by tokens</span></header>
+        <TokenTable slices={t.byKey()} label="Key" loading={t.loading()} />
+      </section>
+    </div>
   </div>;
+}
+
+/// Cost: what the pricing produces — spend, efficiency, and where the
+/// money concentrates.
+function Cost(props: { refresh: () => number }) {
+  const [range, setRange] = createSignal<TimeRange>({ kind: "relative", seconds: 7 * 86400, label: "Last 7 days" });
+  const [filters, setFilters] = createSignal<DimFilters>({ provider: "", model: "", key: "" });
+  const t = useTelemetry(props.refresh, range, filters);
+  const totals = createMemo(() => t.byModel().reduce((acc, s) => ({
+    requests: acc.requests + s.requests,
+    tokens: acc.tokens + s.input + s.output,
+    cost: acc.cost + s.cost,
+    failedCost: acc.failedCost + (s.requests ? (s.cost * s.failed) / s.requests : 0),
+  }), { requests: 0, tokens: 0, cost: 0, failedCost: 0 }));
+  const spendTrend = t.trend((b) => b.cost);
+  const cumulative = createMemo<TrendPoint[]>(() => {
+    let sum = 0;
+    return spendTrend().map(([ts, v]) => { sum += v; return [ts, sum] as TrendPoint; });
+  });
+
+  return <div class="stack-lg">
+    <TelemetryFilters filters={filters()} onChange={setFilters} range={range()} onRange={setRange} refresh={props.refresh} />
+    <Loading when={t.loading()} skeleton="stats" rows={4}>
+    <section class="stat-row" aria-label="Cost totals">
+      <div class="stat"><span>Total spend</span><strong>{formatUsd(totals().cost)}</strong></div>
+      <div class="stat"><span>Avg cost / request</span><strong>{formatUsd(totals().requests ? totals().cost / totals().requests : 0)}</strong></div>
+      <div class="stat"><span>Cost / 1M tokens</span><strong>{totals().tokens ? formatUsd((totals().cost / totals().tokens) * 1e6) : "—"}</strong></div>
+      <div class="stat"><span>Top model share</span><strong>{(() => {
+        const rows = [...t.byModel()].sort((a, b) => b.cost - a.cost);
+        return totals().cost && rows[0] ? `${Math.round((rows[0].cost / totals().cost) * 100)}%` : "—";
+      })()}</strong></div>
+    </section>
+    </Loading>
+    <Show when={t.truncated()}>
+      <p class="muted">Live view covers the most recent 1,000 requests; pick a day range for complete figures.</p>
+    </Show>
+    <div class="two-up">
+      <section class="flat-section">
+        <header><h2>Spend over time</h2><span class="muted">{t.resolved().label}</span></header>
+        <TrendChart series={[{ name: "Spend", points: spendTrend() }]} span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }} money loading={t.loading()} />
+      </section>
+      <section class="flat-section">
+        <header><h2>Cumulative spend</h2><span class="muted">running total</span></header>
+        <TrendChart series={[{ name: "Cumulative", points: cumulative() }]} span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }} money loading={t.loading()} />
+      </section>
+    </div>
+    <section class="flat-section">
+      <header><h2>Per model</h2><span class="muted">spend, and what a token costs there</span></header>
+      <CostTable slices={t.byModel()} label="Model" loading={t.loading()} />
+    </section>
+    <div class="two-up">
+      <section class="flat-section">
+        <header><h2>Per provider</h2></header>
+        <CostTable slices={t.byProvider()} label="Provider" loading={t.loading()} />
+      </section>
+      <section class="flat-section">
+        <header><h2>Per virtual key</h2></header>
+        <CostTable slices={t.byKey()} label="Key" loading={t.loading()} />
+      </section>
+    </div>
+  </div>;
+}
+
+function TokenTable(props: { slices: Slice[]; label: string; loading?: boolean }) {
+  const rows = createMemo(() => [...props.slices].sort((a, b) => (b.input + b.output) - (a.input + a.output)));
+  const max = createMemo(() => (rows()[0] ? rows()[0].input + rows()[0].output : 0));
+  return <Loading when={Boolean(props.loading)} skeleton="table"><Show when={rows().length} fallback={<Empty title="No traffic" action="Nothing served in this range." />}>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+      <table class="dense">
+        <thead><tr><th>{props.label}</th><th class="num">Requests</th><th class="num">Input</th><th class="num">Output</th><th class="num">Tok / req</th><th class="share-col"><span class="sr-only">Share</span></th></tr></thead>
+        <tbody><For each={rows().slice(0, 8)}>{(row) => <tr>
+          <td class="strong mono">{row.name}</td>
+          <td class="num">{formatNumber(row.requests)}</td>
+          <td class="num">{formatNumber(row.input)}</td>
+          <td class="num">{formatNumber(row.output)}</td>
+          <td class="num">{row.requests ? formatNumber((row.input + row.output) / row.requests) : "—"}</td>
+          <td class="share-col"><div class="meter"><i style={{ width: `${max() ? Math.round(((row.input + row.output) / max()) * 100) : 0}%` }} /></div></td>
+        </tr>}</For></tbody>
+      </table>
+    </div>
+  </Show>
+  </Loading>;
+}
+
+function CostTable(props: { slices: Slice[]; label: string; loading?: boolean }) {
+  const rows = createMemo(() => [...props.slices].sort((a, b) => b.cost - a.cost));
+  const max = createMemo(() => rows()[0]?.cost ?? 0);
+  return <Loading when={Boolean(props.loading)} skeleton="table"><Show when={rows().length} fallback={<Empty title="No spend" action="Costs appear once priced models serve traffic." />}>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+      <table class="dense">
+        <thead><tr><th>{props.label}</th><th class="num">Requests</th><th class="num">Spend</th><th class="num">$ / 1M tok</th><th class="share-col"><span class="sr-only">Share</span></th></tr></thead>
+        <tbody><For each={rows().slice(0, 8)}>{(row) => <tr>
+          <td class="strong mono">{row.name}</td>
+          <td class="num">{formatNumber(row.requests)}</td>
+          <td class="num">{formatUsd(row.cost)}</td>
+          <td class="num">{row.input + row.output ? formatUsd((row.cost / (row.input + row.output)) * 1e6) : "—"}</td>
+          <td class="share-col"><div class="meter"><i style={{ width: `${max() ? Math.round((row.cost / max()) * 100) : 0}%` }} /></div></td>
+        </tr>}</For></tbody>
+      </table>
+    </div>
+  </Show>
+  </Loading>;
 }
 
 type ModelRow = { model: string; requests: number; failed: number; tokens: number; cost: number };
 
-function rowsFromGroups(groups: any[]): ModelRow[] {
-  return groups
-    .map((group) => ({
-      model: group.group,
-      requests: group.totals.requests ?? 0,
-      failed: group.totals.errors ?? 0,
-      tokens: (group.totals.input_tokens ?? 0) + (group.totals.output_tokens ?? 0),
-      cost: group.totals.cost_usd ?? 0,
-    }))
-    .sort((a, b) => b.cost - a.cost || b.requests - a.requests);
+function ActivityTable(props: { rows: ModelRow[]; loading?: boolean }) {
+  const max = createMemo(() => props.rows[0]?.cost ?? 0);
+  return <Loading when={Boolean(props.loading)} skeleton="table"><Show when={props.rows.length} fallback={<Empty title="No traffic" action="Nothing served in this range." />}>
+    <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+      <table class="dense">
+        <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Tokens</th><th class="num">Spend</th><th class="share-col"><span class="sr-only">Share</span></th></tr></thead>
+        <tbody><For each={props.rows.slice(0, 10)}>{(row) => <tr>
+          <td class="strong mono">{row.model}</td>
+          <td class="num">{formatNumber(row.requests)}</td>
+          <td class="num">{formatNumber(row.tokens)}</td>
+          <td class="num">{formatUsd(row.cost)}</td>
+          <td class="share-col"><div class="meter"><i style={{ width: `${max() ? Math.round((row.cost / max()) * 100) : 0}%` }} /></div></td>
+        </tr>}</For></tbody>
+      </table>
+    </div>
+  </Show>
+  </Loading>;
 }
 
 function rowsFromHistory(series: Record<string, DayBucket[]>): ModelRow[] {
@@ -548,136 +1878,416 @@ function rowsFromHistory(series: Record<string, DayBucket[]>): ModelRow[] {
     .sort((a, b) => b.cost - a.cost || b.requests - a.requests);
 }
 
-/// Horizontal bars rather than a pie: shares are read by comparing
-/// lengths against a shared baseline, which a pie makes hard and a bar
-/// makes trivial. Sorted descending so the answer is the first row.
-function SpendBars(props: { series: Record<string, DayBucket[]> }) {
-  const rows = createMemo(() => {
-    const totals = Object.entries(props.series)
-      .map(([name, days]) => ({ name, cost: days.reduce((n, d) => n + d.cost_micro_usd, 0) / 1e6 }))
-      .filter((row) => row.cost > 0)
-      .sort((a, b) => b.cost - a.cost);
-    const max = totals[0]?.cost ?? 0;
-    return totals.map((row) => ({ ...row, share: max ? row.cost / max : 0 }));
-  });
-  return <Show when={rows().length} fallback={<Empty title="No spend recorded" action="Costs appear once priced models serve traffic." />}>
-    <dl class="facts">
-      <For each={rows()}>{(row) => <div>
-        <dt>{row.name}</dt>
-        <dd><div class="meter-row">
-          <div class="meter" style={{ "min-width": "160px" }}><i style={{ width: `${Math.round(row.share * 100)}%` }} /></div>
-          <span>{formatUsd(row.cost)}</span>
-        </div></dd>
-      </div>}</For>
-    </dl>
-  </Show>;
-}
-
-/// Requests per minute. Hardcoded greens replaced with theme tokens, so
-/// this follows light/dark like everything else, and the legend is off:
-/// a single unlabelled series does not need one, and uPlot's floats in
-/// the middle of an empty plot when there is nothing to draw.
-function UsageChart(props: { groups: any[] }) {
-  let element!: HTMLDivElement;
-  let plot: uPlot | undefined;
-  const points = createMemo(() => {
-    const map = new Map<number, number>();
-    for (const group of props.groups) {
-      for (const item of group.series ?? []) {
-        map.set(item.minute_ts / 1000, (map.get(item.minute_ts / 1000) ?? 0) + item.requests);
-      }
-    }
-    return map;
-  });
-  createEffect(() => {
-    const map = points();
-    plot?.destroy();
-    plot = undefined;
-    if (!map.size || !element) return;
-    const xs = [...map.keys()].sort((a, b) => a - b);
-    const ys = xs.map((x) => map.get(x) ?? 0);
-    const ink = getComputedStyle(document.documentElement);
-    const accent = ink.getPropertyValue("--series-1").trim();
-    plot = new uPlot({
-      width: Math.max(element.clientWidth, 300),
-      height: 240,
-      legend: { show: false },
-      cursor: { drag: { x: false, y: false } },
-      scales: { x: { time: true } },
-      series: [
-        {},
-        {
-          label: "Requests",
-          stroke: accent,
-          width: 2,
-          fill: `color-mix(in srgb, ${accent} 14%, transparent)`,
-        },
-      ],
-      axes: [
-        { stroke: ink.getPropertyValue("--muted"), grid: { stroke: ink.getPropertyValue("--grid") } },
-        { stroke: ink.getPropertyValue("--muted"), grid: { stroke: ink.getPropertyValue("--grid") } },
-      ],
-    }, [xs, ys], element);
-  });
-  onCleanup(() => plot?.destroy());
-  return <Show when={points().size}
-               fallback={<Empty title="No requests in this window" action="Traffic appears here within a minute of arriving." />}>
-    <div ref={element} class="chart" aria-label="Requests over time" />
-  </Show>;
-}
-
 function Requests(props: { refresh: () => number }) {
-  const [errorsOnly, setErrorsOnly] = createSignal(false);
-  const [filter, setFilter] = createSignal("");
-  const [records] = createResource(() => [props.refresh(), errorsOnly()] as const, ([, errors]) => api.requests(errors));
+  const [search, setSearch] = createSignal("");
+  const [range, setRange] = createSignal<TimeRange>({ kind: "relative", seconds: 3600, label: "Last hour" });
+  const [status, setStatus] = createSignal("");
+  const [provider, setProvider] = createSignal("");
+  const [model, setModel] = createSignal("");
+  const [vkey, setVkey] = createSignal("");
+  // Always fetch the unfiltered tail and narrow on the client: the
+  // filters are faceted off whatever actually arrived, so a provider with
+  // no traffic in the window never appears as a choice that returns
+  // nothing.
+  // The window is sent to the gateway rather than filtered here: the
+  // in-memory tail is ~90 seconds at a million requests a day, so
+  // anything older has to be read from the flushed partitions, and only
+  // the gateway can do that.
+  // Pages are addressed by cursor, not offset: new requests arrive at
+  // the head constantly, so an offset would shift under the reader and
+  // show the same row twice. `stack` keeps the cursors walked through so
+  // "previous" is a step back rather than a re-query from the start.
+  const [cursor, setCursor] = createSignal<string | null>(null);
+  const [stack, setStack] = createSignal<string[]>([]);
+  const [records] = createResource(
+    () => [props.refresh(), range(), cursor(), status(), provider(), model(), vkey()] as const,
+    () => {
+      const r = resolveRange(range());
+      return api.requests(status() === "errors", PAGE_SIZE, {
+        since_ms: Math.floor(r.startMs),
+        until_ms: Math.ceil(r.endMs),
+        after: cursor() ?? undefined,
+        provider: provider() || undefined,
+        model: model() || undefined,
+        key: vkey() || undefined,
+      });
+    },
+  );
+  const [selected, setSelected] = createSignal<UsageRecord | null>(null);
+  const [keys] = createResource(props.refresh, api.keys);
+
+  const all = () => records()?.data ?? [];
+  const facet = (pick: (r: UsageRecord) => string | undefined): Option[] =>
+    [...new Set(all().map(pick).filter(Boolean) as string[])]
+      .sort()
+      .map((v) => ({ value: v, label: v }));
+
   const shown = createMemo(() => {
-    const needle = filter().trim().toLowerCase();
-    const all = records()?.data ?? [];
-    if (!needle) return all;
-    return all.filter((record) =>
-      `${record.requested} ${record.provider}/${record.model} ${record.vkey ?? ""} ${record.status}`
+    const needle = search().trim().toLowerCase();
+    const r = resolveRange(range());
+    return all().filter((record) => {
+      if (record.ts < r.startMs || record.ts > r.endMs) return false;
+      if (status() === "errors" && record.status < 400) return false;
+      if (status() === "ok" && record.status >= 400) return false;
+      if (provider() && record.provider !== provider()) return false;
+      if (model() && record.model !== model()) return false;
+      if (vkey() && record.vkey !== vkey()) return false;
+      if (!needle) return true;
+      return `${record.requested} ${record.provider}/${record.model} ${record.vkey ?? ""} ${record.status} ${record.request_id}`
         .toLowerCase()
-        .includes(needle),
-    );
+        .includes(needle);
+    });
   });
-  return <section class="panel">
-    <SectionTitle
-      title="Request log"
-      subtitle="Metadata only; prompts and outputs are never stored"
-      action={<>
-        <label class="sr-only" for="request-filter">Filter requests</label>
-        <input id="request-filter" class="filter-input" data-filter placeholder="Filter (press /)" value={filter()} onInput={(e) => setFilter(e.currentTarget.value)} />
-        <label class="toggle"><input type="checkbox" checked={errorsOnly()} onChange={(e) => setErrorsOnly(e.currentTarget.checked)} /><span />Errors only</label>
-      </>}
+
+  return <div class="stack-lg">
+    <FilterBar
+      search={search()}
+      onSearch={setSearch}
+      searchPlaceholder="Search route, key, request id (press /)"
+      extra={<RangePicker value={range()} onChange={setRange} />}
+      filters={[
+        {
+          id: "status",
+          label: "Status",
+          value: status(),
+          onChange: setStatus,
+          // "Errors only" was a toggle floating outside the toolbar; it is
+          // one value of the status filter, and belongs with the others.
+          options: [
+            { value: "errors", label: "Errors only" },
+            { value: "ok", label: "Successful only" },
+          ],
+        },
+        { id: "provider", label: "Provider", value: provider(), onChange: setProvider, options: facet((r) => r.provider) },
+        { id: "model", label: "Model", value: model(), onChange: setModel, options: facet((r) => r.model) },
+        {
+          id: "vkey",
+          label: "Virtual key",
+          value: vkey(),
+          onChange: setVkey,
+          options: (keys()?.data ?? []).map((k) => ({ value: k.id, label: k.name, hint: k.id })),
+        },
+      ]}
     />
-    <RequestRows records={shown()} />
-  </section>;
+    <Loading when={records.loading && !records()} skeleton="stats" rows={5}>
+    <section class="stat-row" aria-label="Totals for the selected range">
+      <div class="stat"><span>Requests shown</span><strong>{formatNumber(shown().length)}</strong></div>
+      <div class="stat" classList={{ danger: shown().some((r) => r.status >= 400) }}>
+        <span>Errors</span><strong>{formatNumber(shown().filter((r) => r.status >= 400).length)}</strong>
+      </div>
+      <div class="stat"><span>Tokens</span><strong>{formatNumber(shown().reduce((n, r) => n + r.input_tokens + r.output_tokens, 0))}</strong></div>
+      <div class="stat"><span>Spend</span><strong>{formatUsd(shown().reduce((n, r) => n + r.cost_micro_usd, 0) / 1e6)}</strong></div>
+      <div class="stat"><span>Median latency</span><strong>{median(shown().map((r) => r.latency_ms))} ms</strong></div>
+    </section>
+    </Loading>
+    <section class="flat-section">
+      <header>
+        <h2>Requests</h2>
+        <span class="muted">click a row to open what was sent and returned</span>
+        <span class="pager">
+          <button
+            class="button outline"
+            disabled={!stack().length}
+            onClick={() => {
+              const previous = [...stack()];
+              const back = previous.pop() ?? null;
+              setStack(previous);
+              setCursor(back);
+            }}
+          >Previous</button>
+          <span class="muted">{stack().length + 1}</span>
+          <button
+            class="button outline"
+            disabled={!records()?.next}
+            onClick={() => {
+              const next = records()?.next;
+              if (!next) return;
+              setStack([...stack(), cursor() ?? ""]);
+              setCursor(next);
+            }}
+          >Next</button>
+        </span>
+      </header>
+      <RequestRows
+        records={shown()}
+        loading={records.loading && !records()}
+        onOpen={setSelected}
+      />
+    </section>
+    <RequestDrawer record={selected()} onClose={() => setSelected(null)} />
+  </div>;
 }
 
-function RequestRows(props: { records: UsageRecord[]; compact?: boolean }) {
-  return <Show when={props.records.length} fallback={<Empty title="No requests yet" action="Send a request through the gateway." />}><div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table><thead><tr><th>Time</th><th>Route</th><Show when={!props.compact}><th>Tokens</th><th>Cost</th></Show><th>Latency</th><th>Status</th></tr></thead><tbody><For each={props.records}>{(record) => <tr><td class="mono">{new Date(record.ts).toLocaleTimeString()}</td><td><strong>{record.requested}</strong><small>{record.provider}/{record.model}</small></td><Show when={!props.compact}><td>{formatNumber(record.input_tokens + record.output_tokens)}</td><td>{formatUsd(record.cost_micro_usd / 1e6)}</td></Show><td>{record.latency_ms} ms</td><td><Status text={String(record.status)} tone={record.status < 400 ? "success" : "danger"} /></td></tr>}</For></tbody></table></div></Show>;
+/// One request, opened: what was sent, what came back, and the metadata
+/// that describes the trip.
+///
+/// Bodies are fetched on open rather than listed: a page of a hundred
+/// requests would otherwise carry megabytes nobody reads.
+function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void }) {
+  const [bodies] = createResource(
+    () => props.record,
+    (record) => api.requestBodies(record.request_id, record.ts),
+  );
+  const [tab, setTab] = createSignal<"input" | "output">("input");
+  return <Drawer
+    open={Boolean(props.record)}
+    title={props.record?.requested ?? ""}
+    subtitle={props.record ? new Date(props.record.ts).toLocaleString() : ""}
+    onClose={props.onClose}
+  >
+    <Show when={props.record} keyed>{(record) => <>
+      <div class="drawer-section">
+        <SectionTitle title="Request" subtitle="How it was routed and what it cost" />
+        <dl class="facts">
+          <Fact label="Request id" value={record.request_id} />
+          <Fact label="Status" value={String(record.status)} />
+          <Fact label="Route" value={`${record.provider}/${record.model}`} />
+          <Fact label="Endpoint" value={record.endpoint} />
+          <Fact label="Virtual key" value={record.vkey ?? "—"} />
+          <Fact label="Streaming" value={record.stream ? "Yes" : "No"} />
+          <Fact label="Attempts" value={String(record.attempts)} />
+          <Fact label="Input tokens" value={formatNumber(record.input_tokens)} />
+          <Fact label="Output tokens" value={formatNumber(record.output_tokens)} />
+          <Fact label="Cached tokens" value={formatNumber(record.cached_tokens)} />
+          <Fact label="Cost" value={formatUsd(record.cost_micro_usd / 1e6)} />
+          <Fact label="Latency" value={`${formatNumber(record.latency_ms)} ms`} />
+          <Fact label="Gateway overhead" value={`${record.overhead_us} µs`} />
+        </dl>
+      </div>
+      <div class="drawer-section">
+        <SectionTitle
+          title="Bodies"
+          subtitle="Exactly what crossed the wire"
+          action={
+            <div class="segmented" role="group" aria-label="Body">
+              <button type="button" aria-pressed={tab() === "input"} onClick={() => setTab("input")}>Input</button>
+              <button type="button" aria-pressed={tab() === "output"} onClick={() => setTab("output")}>Output</button>
+            </div>
+          }
+        />
+        <Show when={!bodies.loading} fallback={<Skeleton variant="table" rows={4} />}>
+          <Show
+            when={tab() === "input" ? bodies()?.input : bodies()?.output}
+            fallback={<Empty title="Nothing stored" action={bodies()?.reason ?? "This request has no stored body."} />}
+          >
+            <pre class="body-view">{tab() === "input" ? bodies()!.input : bodies()!.output}</pre>
+          </Show>
+          <Show when={bodies()?.truncated}>
+            <p class="muted">Stored up to the configured size cap; the rest was not kept.</p>
+          </Show>
+        </Show>
+      </div>
+    </>}</Show>
+  </Drawer>;
 }
 
+function median(values: number[]): number {
+  if (!values.length) return 0;
+  const sorted = [...values].sort((a, b) => a - b);
+  return sorted[Math.floor(sorted.length / 2)];
+}
+
+function RequestRows(props: {
+  records: UsageRecord[];
+  compact?: boolean;
+  loading?: boolean;
+  onOpen?: (record: UsageRecord) => void;
+}) {
+  return <Loading when={Boolean(props.loading)} skeleton="table"><Show when={props.records.length} fallback={<Empty title="No requests yet" action="Send a request through the gateway." />}><div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table class="dense"><thead><tr><th>Time</th><th>Route</th><Show when={!props.compact}><th>Tokens</th><th>Cost</th></Show><th>Latency</th><th>Status</th></tr></thead><tbody><For each={props.records}>{(record) => <tr
+      classList={{ clickable: Boolean(props.onOpen) }}
+      onClick={() => props.onOpen?.(record)}
+    ><td class="mono">{new Date(record.ts).toLocaleTimeString()}</td><td><strong>{record.requested}</strong><small>{record.provider}/{record.model}</small></td><Show when={!props.compact}><td>{formatNumber(record.input_tokens + record.output_tokens)}</td><td>{formatUsd(record.cost_micro_usd / 1e6)}</td></Show><td>{record.latency_ms} ms</td><td><Status text={String(record.status)} tone={record.status < 400 ? "success" : "danger"} /></td></tr>}</For></tbody></table></div></Show></Loading>;
+}
+
+type ChatMessage = { role: "user" | "assistant"; content: string; meta?: string; error?: boolean };
+
+/// The playground is a conversation, not a one-shot form: system prompt
+/// pinned above the thread, messages in the middle, composer at the
+/// bottom, and everything tunable in a parameters rail on the right —
+/// the shape people already know from the OpenAI playground.
 function Playground() {
-  const [model, setModel] = createSignal("openai/gpt-4.1-mini"); const [key, setKey] = createSignal(""); const [prompt, setPrompt] = createSignal("Reply with one short sentence."); const [output, setOutput] = createSignal(""); const [meta, setMeta] = createSignal(""); const [pending, setPending] = createSignal(false);
-  return <div class="playground"><section class="playground-input"><h2>Test a route</h2><label>Model<input value={model()} onInput={(e) => setModel(e.currentTarget.value)} /></label><label>Virtual key<input type="password" value={key()} onInput={(e) => setKey(e.currentTarget.value)} /></label><label>Prompt<textarea value={prompt()} onInput={(e) => setPrompt(e.currentTarget.value)} /></label><button class="button primary" disabled={pending() || !key()} onClick={async () => {
-    setPending(true); setOutput(""); setMeta(""); const started = performance.now();
-    try { const response = await fetch("/v1/chat/completions", { method: "POST", headers: { "content-type": "application/json", authorization: `Bearer ${key()}` }, body: JSON.stringify({ model: model(), messages: [{ role: "user", content: prompt() }] }) }); const body = await response.json(); if (!response.ok) throw new Error(body?.error?.message ?? `HTTP ${response.status}`); setOutput(body.choices?.[0]?.message?.content ?? JSON.stringify(body, null, 2)); setMeta(`${Math.round(performance.now() - started)} ms · ${response.headers.get("x-rapid-provider") ?? "provider"} · ${response.headers.get("x-rapid-overhead-us") ?? "0"} µs gateway`); }
-    catch (err) { setOutput(err instanceof Error ? err.message : "Request failed"); }
-    finally { setPending(false); }
-  }}><Play size={16} />{pending() ? "Running…" : "Run"}</button></section><section class="playground-output" aria-live="polite"><div><p class="eyebrow">Response</p><span>{meta()}</span></div><pre>{output() || "The model response will appear here."}</pre></section></div>;
+  const [providers] = createResource(api.providers);
+  const [keys] = createResource(api.keys);
+  const [routes] = createResource(api.routes);
+  const [model, setModel] = createSignal("");
+  const [vkey, setVkey] = createSignal("");
+  const [system, setSystem] = createSignal("");
+  const [systemOpen, setSystemOpen] = createSignal(false);
+  const [temperature, setTemperature] = createSignal("");
+  const [maxTokens, setMaxTokens] = createSignal("");
+  const [draft, setDraft] = createSignal("");
+  const [messages, setMessages] = createSignal<ChatMessage[]>([]);
+  const [pending, setPending] = createSignal(false);
+  let thread!: HTMLDivElement;
+
+  // Everything callable: concrete provider/model pairs, plus routing
+  // groups — a group is exactly what an SDK would send, so the
+  // playground must accept it too.
+  const modelOptions = createMemo<Option[]>(() => {
+    const out: Option[] = [];
+    for (const group of routes()?.data ?? []) {
+      out.push({ value: group.name, label: group.name, hint: `group · ${group.targets[0] ?? ""}` });
+    }
+    for (const provider of providers()?.data ?? []) {
+      const models = new Set<string>();
+      for (const k of provider.keys) for (const m of k.models ?? []) models.add(m);
+      for (const m of models) out.push({ value: `${provider.name}/${m}`, label: `${provider.name}/${m}`, hint: provider.kind });
+    }
+    return out;
+  });
+  const keyOptions = createMemo<Option[]>(() =>
+    (keys()?.data ?? []).filter((k) => k.enabled).map((k) => ({ value: k.id, label: k.name, hint: k.id })),
+  );
+
+  const run = async () => {
+    const content = draft().trim();
+    if (!content || !model() || pending()) return;
+    const history: ChatMessage[] = [...messages(), { role: "user", content }];
+    setMessages(history);
+    setDraft("");
+    setPending(true);
+    queueMicrotask(() => thread?.scrollTo({ top: thread.scrollHeight }));
+    const started = performance.now();
+    try {
+      const response = await fetch("/v1/chat/completions", {
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          authorization: `Bearer ${sessionToken()}`,
+          ...(vkey() ? { "x-rapid-vkey": vkey() } : {}),
+        },
+        body: JSON.stringify({
+          model: model(),
+          messages: [
+            ...(system().trim() ? [{ role: "system", content: system().trim() }] : []),
+            ...history.map((m) => ({ role: m.role, content: m.content })),
+          ],
+          ...(temperature() !== "" ? { temperature: Number(temperature()) } : {}),
+          ...(maxTokens() !== "" ? { max_tokens: Number(maxTokens()) } : {}),
+        }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data?.error?.message ?? `HTTP ${response.status}`);
+      const tokens = (data.usage?.prompt_tokens ?? 0) + (data.usage?.completion_tokens ?? 0);
+      setMessages([...history, {
+        role: "assistant",
+        content: data.choices?.[0]?.message?.content ?? JSON.stringify(data, null, 2),
+        meta: `${Math.round(performance.now() - started)} ms · ${response.headers.get("x-rapid-provider") ?? "?"} · ${formatNumber(tokens)} tokens · ${response.headers.get("x-rapid-overhead-us") ?? "0"} µs gateway`,
+      }]);
+    } catch (err) {
+      setMessages([...history, {
+        role: "assistant",
+        content: err instanceof Error ? err.message : "Request failed",
+        error: true,
+      }]);
+    } finally {
+      setPending(false);
+      queueMicrotask(() => thread?.scrollTo({ top: thread.scrollHeight, behavior: "smooth" }));
+    }
+  };
+
+  return <div class="playground">
+    <section class="pg-thread" aria-label="Conversation">
+      <div class="pg-system" classList={{ open: systemOpen() }}>
+        <button
+          type="button"
+          class="pg-system-toggle"
+          aria-expanded={systemOpen()}
+          onClick={() => setSystemOpen((v) => !v)}
+        >
+          <ChevronRight size={13} class="pg-system-chevron" aria-hidden="true" />
+          <span class="pg-system-label">System prompt</span>
+          <Show when={!systemOpen()}>
+            <span class="pg-system-preview">{system().trim() || "None — add one to steer every turn"}</span>
+          </Show>
+        </button>
+        <Show when={systemOpen()}>
+          <textarea
+            rows={3}
+            autofocus
+            placeholder="You are a helpful assistant…"
+            value={system()}
+            onInput={(e) => setSystem(e.currentTarget.value)}
+          />
+        </Show>
+      </div>
+      <div class="pg-messages" ref={thread} aria-live="polite" tabindex="0" role="region" aria-label="Conversation messages">
+        <Show when={messages().length} fallback={
+          <div class="pg-empty">
+            <strong>Test a route end to end</strong>
+            <p class="muted">Pick a model on the right and send a message. Responses arrive through the gateway exactly as an SDK would see them.</p>
+          </div>
+        }>
+          <For each={messages()}>{(message) => (
+            <div class="pg-msg" classList={{ user: message.role === "user", error: Boolean(message.error) }}>
+              <span class="pg-role">{message.role === "user" ? "You" : "Assistant"}</span>
+              <div class="pg-content">{message.content}</div>
+              <Show when={message.meta}><span class="pg-meta">{message.meta}</span></Show>
+            </div>
+          )}</For>
+          <Show when={pending()}>
+            <div class="pg-msg"><span class="pg-role">Assistant</span><div class="pg-content pg-waiting">…</div></div>
+          </Show>
+        </Show>
+      </div>
+      <div class="pg-composer">
+        <div class="pg-composer-inner">
+        <textarea
+          rows={2}
+          placeholder="Send a message  ·  ⌘↵ to run"
+          aria-label="Message"
+          value={draft()}
+          onInput={(e) => setDraft(e.currentTarget.value)}
+          onKeyDown={(e) => {
+            if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
+              e.preventDefault();
+              run();
+            }
+          }}
+        />
+        <button class="button primary" disabled={pending() || !model() || !draft().trim()} onClick={run}>
+          <Play size={14} />{pending() ? "Running…" : "Run"}
+        </button>
+        </div>
+      </div>
+    </section>
+
+    <aside class="pg-params" aria-label="Parameters">
+      <label>Model
+        <Combobox value={model()} options={modelOptions()} onSelect={setModel} label="Model" placeholder="Select a model…" />
+      </label>
+      <label>Virtual key <span class="optional">Optional</span>
+        <Combobox value={vkey()} options={keyOptions()} onSelect={setVkey} label="Virtual key" placeholder="Console session" allowEmpty />
+      </label>
+      <div class="field-row">
+        <label>Temperature
+          <input type="number" min="0" max="2" step="0.1" placeholder="default" value={temperature()} onInput={(e) => setTemperature(e.currentTarget.value)} />
+        </label>
+        <label>Max tokens
+          <input type="number" min="1" placeholder="default" value={maxTokens()} onInput={(e) => setMaxTokens(e.currentTarget.value)} />
+        </label>
+      </div>
+      <Show when={vkey()}>
+        <p class="muted">Runs spend this key's budget and count against its limits.</p>
+      </Show>
+      <button class="button outline" disabled={!messages().length} onClick={() => setMessages([])}>
+        Clear conversation
+      </button>
+      <span class="pg-params-spacer" />
+      <p class="muted">Requests leave through the same path an SDK uses — retries, fallbacks and limits included.</p>
+    </aside>
+  </div>;
 }
 
 function Fleet(props: { refresh: () => number }) {
   const [fleet] = createResource(props.refresh, api.fleet);
   const nodes = createMemo(() => fleet()?.nodes ?? []);
-  const shared = createMemo(() => nodes().length > 0);
-  const age = (ms: number) => ms < 1000 ? "just now" : Math.round(ms / 1000) + "s ago";
+  const age = (ms: number) => (ms < 1000 ? "just now" : `${Math.round(ms / 1000)}s ago`);
   return <div class="stack-lg">
-    <section class="summary-strip" aria-label="Fleet summary">
+    <section class="summary-strip" aria-label="Cluster summary">
       <Metric label="Live nodes" value={String(fleet()?.live ?? 1)} />
-      <Metric label="Rate-limit shares" value={String(fleet()?.shares ?? 1)} />
-      <Metric label="Store version" value={String(fleet()?.version ?? 0)} />
+      <Metric label="Store backend" value={fleet()?.backend ?? "local"} />
+      <Metric label="Config version" value={String(fleet()?.version ?? 0)} />
       <Metric
         label="Store"
         value={fleet()?.reachable === false ? "Unreachable" : "Reachable"}
@@ -688,49 +2298,311 @@ function Fleet(props: { refresh: () => number }) {
     <Show when={fleet() && fleet()!.reachable === false}>
       <div class="notice" role="status">
         This node cannot reach the control-plane store. It keeps serving traffic from the
-        configuration it last loaded, and refuses configuration changes until the store
-        is back. Nothing needs to be done to the node itself.
+        configuration it last loaded, and refuses configuration changes until the store is
+        back. Nothing needs to be done to the node itself.
       </div>
     </Show>
 
+    <div class="two-column">
+      <section class="panel">
+        <SectionTitle title="This node" subtitle="Identical to every other; the view is the same from any of them" />
+        <dl class="facts">
+          <Fact label="Node id" value={String(fleet()?.node ?? "local").slice(0, 18) + "…"} />
+          <Fact label="Mode" value={fleet()?.mode === "file" ? "File (read-only)" : "Managed"} />
+          <Fact label="Rate-limit shares" value={String(fleet()?.shares ?? 1)} />
+        </dl>
+        <p class="muted">
+          Point several nodes at the same S3 bucket, DynamoDB table or shared file and they
+          form a fleet — no leader, no quorum, no join step.
+        </p>
+      </section>
+      <section class="panel">
+        <SectionTitle title="Nodes" subtitle="Everyone who has heartbeated against this store recently" />
+        <Show
+          when={nodes().length}
+          fallback={fleet.loading && !fleet() ? <Skeleton variant="table" rows={3} /> : <Empty title="Running alone" action="This node keeps its state locally. Shared-store nodes appear here as they heartbeat." />}
+        >
+          <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+            <table>
+              <thead><tr><th>Node</th><th>Address</th><th class="num">Last heartbeat</th></tr></thead>
+              <tbody>
+                <For each={nodes()}>{(node: any) => <tr>
+                  <td>
+                    <span style={{ display: "flex", "align-items": "center", gap: "7px" }}>
+                      <strong class="mono">{String(node.id).slice(0, 13)}…</strong>
+                      <Show when={node.self}><span class="pill accent">this node</span></Show>
+                    </span>
+                  </td>
+                  <td class="mono" style={{ color: "var(--muted)" }}>{node.address ?? "—"}</td>
+                  <td class="num">{age(node.age_ms ?? 0)}</td>
+                </tr>}</For>
+              </tbody>
+            </table>
+          </div>
+        </Show>
+      </section>
+    </div>
+  </div>;
+}
+
+function UsersPage(props: { refresh: () => number }) {
+  const [users, { refetch }] = createResource(props.refresh, api.users);
+  const [search, setSearch] = createSignal("");
+  const [creating, setCreating] = createSignal(false);
+  const [resetting, setResetting] = createSignal<InternalUser | null>(null);
+  const [error, setError] = createSignal("");
+  const shown = createMemo(() => {
+    const needle = search().trim().toLowerCase();
+    const all = users()?.data ?? [];
+    return needle ? all.filter((u) => u.email.toLowerCase().includes(needle)) : all;
+  });
+  return <div class="stack-lg">
+    <FilterBar
+      search={search()}
+      onSearch={setSearch}
+      searchPlaceholder="Search users (press /)"
+      filters={[]}
+      extra={<button class="button primary" onClick={() => setCreating(true)}><Plus size={15} />Add user</button>}
+    />
+    <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
     <section class="panel">
-      <SectionTitle
-        title="Nodes"
-        subtitle="Every node is identical and serves this page; the view is the same from any of them"
-      />
-      <dl class="facts">
-        <Fact label="Backend" value={fleet()?.backend ?? "—"} />
-        <Fact label="This node" value={fleet()?.node ?? "local"} />
-      </dl>
-      <Show
-        when={shared()}
-        fallback={<Empty
-          title="No shared store"
-          action="This node keeps its configuration locally. Point several nodes at the same S3 bucket or DynamoDB table to run a fleet."
-        />}
-      >
-        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
-          <table>
-            <thead><tr><th>Node</th><th>Address</th><th>Last heartbeat</th></tr></thead>
-            <tbody>
-              <For each={nodes()}>{(node: any) => <tr>
-                <td>
-                  <strong>{String(node.id).slice(0, 13)}…</strong>
-                  <Show when={node.self}><small>this node</small></Show>
-                </td>
-                <td class="mono">{node.addr || "—"}</td>
-                <td>{age(node.age_ms ?? 0)}</td>
-              </tr>}</For>
-            </tbody>
-          </table>
-        </div>
+      <SectionTitle title="Internal users" subtitle="Who may sign in to this console, and with what role" />
+      <Loading when={users.loading && !users()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No users yet" action="Only the admin key can sign in. Add a user to give someone their own account." />}>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table>
+          <thead><tr><th>Email</th><th>Role</th><th>Teams</th><th>Added</th><th><span class="sr-only">Actions</span></th></tr></thead>
+          <tbody><For each={shown()}>{(user) => <tr>
+            <td class="strong">{user.email}</td>
+            <td><span class="pill" classList={{ accent: user.role === "admin" }}>{user.role}</span></td>
+            <td>
+              <Show when={user.teams.length} fallback={<span class="muted">—</span>}>
+                <For each={user.teams}>{(team) => <span class="pill" style={{ "margin-right": "4px" }}>{team.name}</span>}</For>
+              </Show>
+            </td>
+            <td class="muted">{new Date(user.created_ms).toLocaleDateString()}</td>
+            <td class="actions">
+              <button class="icon-button" title={`Reset password for ${user.email}`} aria-label={`Reset password for ${user.email}`} onClick={() => setResetting(user)}><KeyRound size={14} /></button>
+              <button class="icon-button danger" title={`Delete ${user.email}`} aria-label={`Delete ${user.email}`} onClick={async () => {
+                if (!confirm(`Delete ${user.email}? Their sessions end immediately.`)) return;
+                setError("");
+                try { await api.deleteUser(user.id); await refetch(); }
+                catch (err) { setError(err instanceof Error ? err.message : "Delete failed"); }
+              }}><Trash2 size={14} /></button>
+            </td>
+          </tr>}</For></tbody>
+        </table></div>
       </Show>
-      <p class="hint">
-        Nodes appear here by writing a heartbeat to the store and disappear when they stop.
-        There is nothing to join and nothing to remove — scale the service and the fleet
-        follows. Rate limits are divided by the number of live nodes.
-      </p>
+      </Loading>
     </section>
+    <Show when={creating()}>
+      <UserDialog onClose={() => setCreating(false)} onDone={async () => { setCreating(false); await refetch(); }} />
+    </Show>
+    <Show when={resetting()} keyed>{(user) => (
+      <ResetPasswordDialog user={user} onClose={() => setResetting(null)} onDone={async () => { setResetting(null); await refetch(); }} />
+    )}</Show>
+  </div>;
+}
+
+function UserDialog(props: { onClose: () => void; onDone: () => void }) {
+  escapeCloses(props.onClose);
+  const [email, setEmail] = createSignal("");
+  const [password, setPassword] = createSignal("");
+  const [role, setRole] = createSignal("member");
+  const [error, setError] = createSignal("");
+  const [pending, setPending] = createSignal(false);
+  return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
+    <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="add-user-title" onSubmit={async (e) => {
+      e.preventDefault(); setError(""); setPending(true);
+      try { await api.createUser({ email: email(), password: password(), role: role() }); props.onDone(); }
+      catch (err) { setError(err instanceof Error ? err.message : "Could not add user"); }
+      finally { setPending(false); }
+    }}>
+      <header class="dialog-head">
+        <div><h2 id="add-user-title">Add user</h2><p class="muted">They sign in with these credentials; put them on a team to grant access.</p></div>
+        <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={props.onClose}><X size={16} /></button>
+      </header>
+      <label>Email<input required type="email" value={email()} onInput={(e) => setEmail(e.currentTarget.value)} /></label>
+      <label>Password <span class="optional">Minimum 8 characters</span>
+        <input required type="password" minLength={8} autocomplete="new-password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} />
+      </label>
+      <label>Role
+        <select value={role()} onChange={(e) => setRole(e.currentTarget.value)}>
+          <option value="member">Member — whatever their teams grant</option>
+          <option value="admin">Admin — everything, including users and teams</option>
+        </select>
+      </label>
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+      <div class="dialog-actions">
+        <button type="button" class="button outline" onClick={props.onClose}>Cancel</button>
+        <button class="button primary" disabled={pending()}>{pending() ? "Adding…" : "Add user"}</button>
+      </div>
+    </form>
+  </div>;
+}
+
+function ResetPasswordDialog(props: { user: InternalUser; onClose: () => void; onDone: () => void }) {
+  escapeCloses(props.onClose);
+  const [password, setPassword] = createSignal("");
+  const [error, setError] = createSignal("");
+  const [pending, setPending] = createSignal(false);
+  return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
+    <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="reset-pw-title" onSubmit={async (e) => {
+      e.preventDefault(); setError(""); setPending(true);
+      try { await api.updateUser(props.user.id, { password: password() }); props.onDone(); }
+      catch (err) { setError(err instanceof Error ? err.message : "Reset failed"); }
+      finally { setPending(false); }
+    }}>
+      <header class="dialog-head">
+        <div><h2 id="reset-pw-title">Reset password</h2><p class="muted">{props.user.email} keeps their sessions; the old password stops working.</p></div>
+        <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={props.onClose}><X size={16} /></button>
+      </header>
+      <label>New password <span class="optional">Minimum 8 characters</span>
+        <input required autofocus type="password" minLength={8} autocomplete="new-password" value={password()} onInput={(e) => setPassword(e.currentTarget.value)} />
+      </label>
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+      <div class="dialog-actions">
+        <button type="button" class="button outline" onClick={props.onClose}>Cancel</button>
+        <button class="button primary" disabled={pending()}>{pending() ? "Saving…" : "Set password"}</button>
+      </div>
+    </form>
+  </div>;
+}
+
+const ACCESS_LABELS: Record<string, string> = {
+  full: "Full access",
+  keys: "Manage keys",
+  read_only: "Read only",
+};
+
+function TeamsPage(props: { refresh: () => number }) {
+  const [teams, { refetch }] = createResource(props.refresh, api.teams);
+  const [users] = createResource(props.refresh, api.users);
+  const [providers] = createResource(props.refresh, api.providers);
+  const [routes] = createResource(props.refresh, api.routes);
+  const [search, setSearch] = createSignal("");
+  const [editing, setEditing] = createSignal<Team | null>(null);
+  const [error, setError] = createSignal("");
+
+  const modelOptions = createMemo<Option[]>(() => {
+    const out: Option[] = [];
+    for (const group of routes()?.data ?? []) out.push({ value: group.name, label: group.name, hint: "routing group" });
+    for (const provider of providers()?.data ?? []) {
+      const models = new Set<string>();
+      for (const k of provider.keys) for (const m of k.models ?? []) models.add(m);
+      for (const m of models) out.push({ value: `${provider.name}/${m}`, label: `${provider.name}/${m}`, hint: provider.kind });
+    }
+    return out;
+  });
+  const userOptions = createMemo<Option[]>(() =>
+    (users()?.data ?? []).map((u) => ({ value: u.id, label: u.email, hint: u.role })));
+  const shown = createMemo(() => {
+    const needle = search().trim().toLowerCase();
+    const all = teams()?.data ?? [];
+    return needle ? all.filter((t) => t.name.toLowerCase().includes(needle)) : all;
+  });
+  return <div class="stack-lg">
+    <FilterBar
+      search={search()}
+      onSearch={setSearch}
+      searchPlaceholder="Search teams (press /)"
+      filters={[]}
+      extra={<button class="button primary" onClick={() => setEditing({ id: "", name: "", members: [], models: [], access: "keys", created_ms: 0 })}><Plus size={15} />Create team</button>}
+    />
+    <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+    <section class="panel">
+      <SectionTitle title="Teams" subtitle="Members get the models a team lists and the access level it grants" />
+      <Loading when={teams.loading && !teams()} skeleton="table"><Show when={teams.loading || shown().length} fallback={<Empty title="No teams yet" action="A team scopes its members to specific models and decides what they may manage." />}>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table>
+          <thead><tr><th>Team</th><th>Access</th><th>Members</th><th>Models</th><th><span class="sr-only">Actions</span></th></tr></thead>
+          <tbody><For each={shown()}>{(team) => <tr class="clickable" onClick={() => setEditing({ ...team })}>
+            <td class="strong">{team.name}</td>
+            <td><span class="pill" classList={{ accent: team.access === "full", warning: team.access === "read_only" }}>{ACCESS_LABELS[team.access]}</span></td>
+            <td>{team.members.length ? `${team.members.length} member${team.members.length > 1 ? "s" : ""}` : <span class="muted">Empty</span>}</td>
+            <td>
+              <Show when={team.models.length} fallback={<span class="pill">every model</span>}>
+                <For each={team.models.slice(0, 3)}>{(m) => <span class="pill" style={{ "margin-right": "4px" }}>{m}</span>}</For>
+                <Show when={team.models.length > 3}><span class="muted">+{team.models.length - 3} more</span></Show>
+              </Show>
+            </td>
+            <td class="actions">
+              <button class="icon-button danger" title={`Delete ${team.name}`} aria-label={`Delete ${team.name}`} onClick={async (e) => {
+                e.stopPropagation();
+                if (!confirm(`Delete team ${team.name}? Its members drop to read-only unless another team covers them.`)) return;
+                setError("");
+                try { await api.deleteTeam(team.id); await refetch(); }
+                catch (err) { setError(err instanceof Error ? err.message : "Delete failed"); }
+              }}><Trash2 size={14} /></button>
+            </td>
+          </tr>}</For></tbody>
+        </table></div>
+      </Show>
+      </Loading>
+    </section>
+    <Show when={editing()} keyed>{(team) => (
+      <TeamDialog
+        team={team}
+        userOptions={userOptions()}
+        modelOptions={modelOptions()}
+        onClose={() => setEditing(null)}
+        onDone={async () => { setEditing(null); await refetch(); }}
+      />
+    )}</Show>
+    <p class="muted">
+      Access levels: <strong>Full</strong> operates the whole console, <strong>Manage keys</strong> creates
+      virtual keys within the team's models, <strong>Read only</strong> observes. A member of several teams
+      gets the strongest access and the union of models.
+    </p>
+  </div>;
+}
+
+function TeamDialog(props: {
+  team: Team;
+  userOptions: Option[];
+  modelOptions: Option[];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  escapeCloses(props.onClose);
+  const [name, setName] = createSignal(props.team.name);
+  const [members, setMembers] = createSignal<string[]>(props.team.members);
+  const [models, setModels] = createSignal<string[]>(props.team.models);
+  const [access, setAccess] = createSignal(props.team.access);
+  const [error, setError] = createSignal("");
+  const [pending, setPending] = createSignal(false);
+  return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
+    <form class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="team-title" onSubmit={async (e) => {
+      e.preventDefault(); setError(""); setPending(true);
+      const body = { name: name(), members: members(), models: models(), access: access() };
+      try {
+        if (props.team.id) await api.updateTeam(props.team.id, body);
+        else await api.createTeam(body);
+        props.onDone();
+      } catch (err) { setError(err instanceof Error ? err.message : "Save failed"); }
+      finally { setPending(false); }
+    }}>
+      <header class="dialog-head">
+        <div><h2 id="team-title">{props.team.id ? `Edit ${props.team.name}` : "Create team"}</h2><p class="muted">Members inherit the team's models and access level.</p></div>
+        <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={props.onClose}><X size={16} /></button>
+      </header>
+      <label>Name<input required value={name()} onInput={(e) => setName(e.currentTarget.value)} /></label>
+      <label>Members
+        <MultiCombobox values={members()} options={props.userOptions} onChange={setMembers} label="Members" emptyMeans="No members yet" />
+      </label>
+      <label>Models <span class="optional">Leave empty for every model</span>
+        <MultiCombobox values={models()} options={props.modelOptions} onChange={setModels} label="Models" emptyMeans="Every model" />
+      </label>
+      <label>Access level
+        <select value={access()} onChange={(e) => setAccess(e.currentTarget.value as Team["access"])}>
+          <option value="read_only">Read only — observe usage, logs and configuration</option>
+          <option value="keys">Manage keys — create virtual keys within the team's models</option>
+          <option value="full">Full — operate the whole console except users and teams</option>
+        </select>
+      </label>
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+      <div class="dialog-actions">
+        <button type="button" class="button outline" onClick={props.onClose}>Cancel</button>
+        <button class="button primary" disabled={pending() || !name()}>{pending() ? "Saving…" : props.team.id ? "Save team" : "Create team"}</button>
+      </div>
+    </form>
   </div>;
 }
 
@@ -756,7 +2628,8 @@ function Settings(props: { refresh: () => number }) {
     anchor.click();
     URL.revokeObjectURL(url);
   };
-  return <div class="stack-lg">
+  return <div class="stack-lg settings-layout">
+    <div class="settings-grid">
     <section class="panel">
       <SectionTitle
         title="Configuration"
@@ -809,6 +2682,11 @@ function Settings(props: { refresh: () => number }) {
       </label>
       <p class="muted">Shortcuts: <kbd>g</kbd> then <kbd>o</kbd>, <kbd>k</kbd>, <kbd>u</kbd>… jumps between pages; <kbd>/</kbd> focuses a filter.</p>
     </section>
+    </div>
+  <section aria-label="Cluster">
+      <SectionTitle title="Cluster" subtitle="Store, nodes and fleet state for this gateway" />
+      <Fleet refresh={props.refresh} />
+    </section>
   </div>;
 }
 
@@ -849,13 +2727,16 @@ function DailySpendChart(props: { series: Record<string, DayBucket[]> }) {
     plot = new uPlot({
       width: element.clientWidth || 720,
       height: 240,
-      padding: [12, 8, 0, 0],
+      padding: [12, 8, 0, 4],
       legend: { show: false },
       axes: [
         { stroke: ink.getPropertyValue("--muted"), grid: { stroke: ink.getPropertyValue("--grid") } },
         {
           stroke: ink.getPropertyValue("--muted"),
           grid: { stroke: ink.getPropertyValue("--grid") },
+          // Same reason as the trend chart: the gutter has to fit the
+          // widest label the formatter can emit, not uPlot's default.
+          size: 68,
           values: (_u, splits) => splits.map((v) => `$${v.toFixed(2)}`),
         },
       ],
@@ -885,20 +2766,34 @@ function DailySpendChart(props: { series: Record<string, DayBucket[]> }) {
 /// questions the Usage page answers in aggregate, split per model so a
 /// single model's change is visible rather than averaged away.
 function ModelActivity(props: { refresh: () => number }) {
-  const [days, setDays] = createSignal(7);
+  const [range, setRange] = createSignal<TimeRange>({ kind: "relative", seconds: 7 * 86400, label: "Last 7 days" });
+  const resolved = createMemo(() => resolveRange(range()));
   const [history] = createResource(
-    () => [props.refresh(), days()] as const,
-    () => api.history(days(), "model"),
+    () => [props.refresh(), range()] as const,
+    () => api.history(resolveRange(range()).days, "model"),
   );
   const [measure, setMeasure] = createSignal<"cost" | "requests" | "tokens">("cost");
-  const shaped = createMemo(() => {
+  const [search, setSearch] = createSignal("");
+
+  const sliced = createMemo(() => {
     const source = history()?.data ?? {};
+    const r = resolved();
+    const from = new Date(r.startMs).toISOString().slice(0, 10);
+    const to = new Date(r.endMs).toISOString().slice(0, 10);
+    const needle = search().trim().toLowerCase();
     const out: Record<string, DayBucket[]> = {};
     for (const [model, buckets] of Object.entries(source)) {
+      if (needle && !model.toLowerCase().includes(needle)) continue;
+      const kept = buckets.filter((b) => b.day >= from && b.day <= to);
+      if (kept.length) out[model] = kept;
+    }
+    return out;
+  });
+  const shaped = createMemo(() => {
+    const out: Record<string, DayBucket[]> = {};
+    for (const [model, buckets] of Object.entries(sliced())) {
       out[model] = buckets.map((bucket) => ({
         ...bucket,
-        // The chart plots cost, so the selected measure is projected onto
-        // that field rather than duplicating the whole chart component.
         cost_micro_usd:
           measure() === "cost" ? bucket.cost_micro_usd
           : measure() === "requests" ? bucket.requests * 1e6
@@ -907,106 +2802,190 @@ function ModelActivity(props: { refresh: () => number }) {
     }
     return out;
   });
+  const rows = createMemo(() => rowsFromHistory(sliced()));
+  const totals = createMemo(() => rows().reduce((acc, r) => ({
+    requests: acc.requests + r.requests, tokens: acc.tokens + r.tokens, cost: acc.cost + r.cost,
+  }), { requests: 0, tokens: 0, cost: 0 }));
+
   return <div class="stack-lg">
-    <div class="view-toolbar">
-      <p class="muted">Per-model trend over time.</p>
-      <div class="toolbar-controls">
-        <div class="segmented" role="group" aria-label="Measure">
-          <For each={["cost", "requests", "tokens"] as const}>{(item) => (
-            <button aria-pressed={measure() === item} onClick={() => setMeasure(item)}>{item}</button>
-          )}</For>
-        </div>
-        <div class="segmented" role="group" aria-label="Days">
-          <For each={[7, 30, 90]}>{(item) => (
-            <button aria-pressed={days() === item} onClick={() => setDays(item)}>{item}d</button>
-          )}</For>
-        </div>
-      </div>
-    </div>
-    <section class="panel chart-panel">
-      <SectionTitle title={measure() === "cost" ? "Cost per day" : `${measure()} per day`}
-                    subtitle="One line per model, highest six by volume" />
-      <Show when={Object.keys(shaped()).length}
-            fallback={<Empty title="No history yet" action="Usage is written to disk periodically; check back after some traffic." />}>
-        <DailySpendChart series={shaped()} />
-      </Show>
+    <FilterBar
+      search={search()}
+      onSearch={setSearch}
+      searchPlaceholder="Search models (press /)"
+      filters={[{
+        id: "measure",
+        label: "Measure",
+        value: measure(),
+        onChange: (value) => setMeasure((value || "cost") as "cost" | "requests" | "tokens"),
+        options: [
+          { value: "cost", label: "Cost" },
+          { value: "requests", label: "Requests" },
+          { value: "tokens", label: "Tokens" },
+        ],
+      }]}
+      extra={<RangePicker value={range()} onChange={setRange} />}
+    />
+    <Loading when={history.loading && !history()} skeleton="stats" rows={4}>
+    <section class="stat-row" aria-label="Totals">
+      <div class="stat"><span>Models active</span><strong>{rows().length}</strong></div>
+      <div class="stat"><span>Requests</span><strong>{formatNumber(totals().requests)}</strong></div>
+      <div class="stat"><span>Tokens</span><strong>{formatNumber(totals().tokens)}</strong></div>
+      <div class="stat"><span>Spend</span><strong>{formatUsd(totals().cost)}</strong></div>
     </section>
-    <section class="panel">
-      <SectionTitle title="Totals over the window" subtitle="Sorted by spend" />
-      <div class="table-wrap"><table>
-        <thead><tr><th>Model</th><th class="num">Requests</th><th class="num">Tokens</th><th class="num">Cost</th></tr></thead>
-        <tbody><For each={rowsFromHistory(history()?.data ?? {})}>{(row) => <tr>
-          <td class="strong">{row.model}</td>
-          <td class="num">{formatNumber(row.requests)}</td>
-          <td class="num">{formatNumber(row.tokens)}</td>
-          <td class="num">{formatUsd(row.cost)}</td>
-        </tr>}</For></tbody>
-      </table></div>
+    </Loading>
+    <section class="flat-section">
+      <header><h2>{measure() === "cost" ? "Cost per day" : `${measure()} per day`}</h2><span class="muted">{resolved().label} · top six by volume</span></header>
+      <Loading when={history.loading && !history()} skeleton="chart"><Show when={Object.keys(shaped()).length} fallback={<Empty title="No history in this range" action="Usage is written to disk periodically; widen the range or send traffic." />}>
+        <DailySpendChart series={shaped()} />
+      </Show></Loading>
+    </section>
+    <section class="flat-section">
+      <header><h2>Per model</h2><span class="muted">sorted by spend</span></header>
+      <ActivityTable rows={rows()} loading={history.loading && !history()} />
     </section>
   </div>;
 }
 
-/// Every model the gateway will route, grouped by the provider that
-/// serves it. This is the resolved catalog — what `/v1/models` returns to
-/// an SDK — rather than a wish list, so what is shown here is exactly
-/// what a caller can ask for.
 function Models(props: { refresh: () => number }) {
-  const [providers] = createResource(props.refresh, api.providers);
-  const [config] = createResource(props.refresh, api.config);
-  const [filter, setFilter] = createSignal("");
-  const aliases = createMemo(() => parseAliases(config()?.text ?? ""));
+  const [providers, { refetch }] = createResource(props.refresh, api.providers);
+  const [catalog] = createResource(props.refresh, api.catalog);
+  const [routes] = createResource(props.refresh, api.routes);
+  const [search, setSearch] = createSignal("");
+  const [providerFilter, setProviderFilter] = createSignal("");
+  const [adding, setAdding] = createSignal(false);
+  const [error, setError] = createSignal("");
+
+  // The format a model is called with. Not a config field — it follows
+  // the provider's adapter — so the catalog is the only place that knows
+  // a model is Responses-only, and it is shown rather than chosen.
+  const formatOf = (provider: string, kind: string, model: string): string => {
+    const preset = [...(catalog()?.presets ?? []), ...(catalog()?.subscriptions ?? [])]
+      .find((p) => p.name === provider || p.name === kind.toLowerCase());
+    return preset?.models.find((m) => m.id === model)?.format.replace("_", " ") ?? "chat completions";
+  };
+
   const rows = createMemo(() => {
-    const out: Array<{ model: string; provider: string; kind: string; alias?: string }> = [];
+    const out: Array<{ model: string; provider: string; kind: string; format: string; groups: string[] }> = [];
     for (const provider of providers()?.data ?? []) {
+      if (providerFilter() && provider.name !== providerFilter()) continue;
       const models = new Set<string>();
       for (const key of provider.keys) for (const model of key.models ?? []) models.add(model);
-      if (!models.size) out.push({ model: "(any model this provider serves)", provider: provider.name, kind: provider.kind });
       for (const model of models) {
-        const alias = aliases().find((a) => a.target === `${provider.name}/${model}`)?.name;
-        out.push({ model, provider: provider.name, kind: provider.kind, alias });
+        const target = `${provider.name}/${model}`;
+        out.push({
+          model,
+          provider: provider.name,
+          kind: provider.kind,
+          format: formatOf(provider.name, provider.kind, model),
+          groups: (routes()?.data ?? []).filter((r) => r.targets.includes(target)).map((r) => r.name),
+        });
       }
     }
-    const needle = filter().toLowerCase();
-    return out.filter((row) => !needle || row.model.toLowerCase().includes(needle) || row.provider.includes(needle));
+    const needle = search().trim().toLowerCase();
+    return needle ? out.filter((r) => `${r.model} ${r.provider}`.toLowerCase().includes(needle)) : out;
   });
+
   return <div class="stack-lg">
-    <div class="view-toolbar">
-      <p class="muted">What callers can ask for, and which provider answers.</p>
-      <input class="filter-input" data-filter placeholder="Filter models" value={filter()}
-             onInput={(e) => setFilter(e.currentTarget.value)} aria-label="Filter models" />
-    </div>
+    <FilterBar
+      search={search()}
+      onSearch={setSearch}
+      searchPlaceholder="Search models (press /)"
+      filters={[{
+        id: "provider",
+        label: "Provider",
+        value: providerFilter(),
+        onChange: setProviderFilter,
+        options: (providers()?.data ?? []).map((p) => ({ value: p.name, label: p.name })),
+      }]}
+      extra={<button class="button primary" disabled={!providers()?.data.length} onClick={() => setAdding(true)}><Plus size={15} />Add model</button>}
+    />
+    <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
     <section class="panel">
-      <Show when={rows().length} fallback={<Empty title="No models resolved" action="A key with no `models` list serves everything its provider offers." />}>
-        <div class="table-wrap"><table>
-          <thead><tr><th>Model</th><th>Provider</th><th>Kind</th><th>Alias</th></tr></thead>
+      <SectionTitle title="Models" subtitle="What callers can ask for, and which provider answers" />
+      <Loading when={providers.loading && !providers()} skeleton="table"><Show when={rows().length} fallback={<Empty title="No models yet" action="Models are declared here by hand — nothing is assumed. Add the ids you want callers to use." />}>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table>
+          <thead><tr><th>Model</th><th>Provider</th><th>Format</th><th>Routing groups</th><th><span class="sr-only">Actions</span></th></tr></thead>
           <tbody><For each={rows()}>{(row) => <tr>
             <td class="strong mono">{row.model}</td>
             <td>{row.provider}</td>
-            <td><span class="pill">{row.kind}</span></td>
-            <td>{row.alias ? <span class="pill accent">{row.alias}</span> : <span class="muted">—</span>}</td>
+            <td><span class="pill">{row.format}</span></td>
+            <td>{row.groups.length ? <For each={row.groups}>{(g) => <span class="pill accent" style={{ "margin-right": "4px" }}>{g}</span>}</For> : <span class="muted">—</span>}</td>
+            <td class="actions">
+              <button class="icon-button danger" title={`Remove ${row.model}`} aria-label={`Remove ${row.model}`} onClick={async () => {
+                if (!confirm(`Remove ${row.provider}/${row.model}?`)) return;
+                setError("");
+                try { await api.deleteModel(row.provider, row.model); await refetch(); }
+                catch (err) { setError(err instanceof Error ? err.message : "Remove failed"); }
+              }}><Trash2 size={14} /></button>
+            </td>
           </tr>}</For></tbody>
         </table></div>
       </Show>
+      </Loading>
     </section>
-    <p class="muted">
-      A model appears here when a provider key lists it, or when an alias points at it. Add either in Routing.
-    </p>
+    <Show when={adding()}>
+      <AddModelDialog
+        providers={providers()?.data ?? []}
+        catalog={catalog()}
+        onClose={() => setAdding(false)}
+        onDone={async () => { setAdding(false); await refetch(); }}
+      />
+    </Show>
   </div>;
 }
 
-/// `name = "provider/model"` pairs out of the `[aliases]` table.
-function parseAliases(text: string): Array<{ name: string; target: string }> {
-  const out: Array<{ name: string; target: string }> = [];
-  let inside = false;
-  for (const raw of text.split("\n")) {
-    const line = raw.trim();
-    if (line.startsWith("[")) { inside = line === "[aliases]"; continue; }
-    if (!inside || !line || line.startsWith("#")) continue;
-    const match = line.match(/^"?([^"=]+?)"?\s*=\s*"([^"]+)"/);
-    if (match) out.push({ name: match[1].trim(), target: match[2] });
-  }
-  return out;
+function AddModelDialog(props: {
+  providers: Provider[];
+  catalog: { presets: CatalogPreset[]; subscriptions: CatalogPreset[] } | undefined;
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  escapeCloses(props.onClose);
+  const [provider, setProvider] = createSignal(props.providers[0]?.name ?? "");
+  const [model, setModel] = createSignal("");
+  const [error, setError] = createSignal("");
+  const [pending, setPending] = createSignal(false);
+  return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
+    <form class="dialog" role="dialog" aria-modal="true" aria-labelledby="add-model-title" onSubmit={async (e) => {
+      e.preventDefault(); setError(""); setPending(true);
+      try { await api.addModel(provider(), model()); props.onDone(); }
+      catch (err) { setError(err instanceof Error ? err.message : "Could not add model"); }
+      finally { setPending(false); }
+    }}>
+      <header class="dialog-head">
+        <div><h2 id="add-model-title">Add model</h2><p class="muted">Anything the provider serves can be added, listed or not.</p></div>
+        <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={props.onClose}><X size={16} /></button>
+      </header>
+      <label>Provider
+        <Combobox
+          value={provider()}
+          options={props.providers.map((p) => ({ value: p.name, label: p.name, hint: p.kind }))}
+          onSelect={setProvider}
+          label="Provider"
+        />
+      </label>
+      <label>Model id
+        <input required placeholder="gpt-4.1-mini" value={model()} onInput={(e) => setModel(e.currentTarget.value)} />
+      </label>
+      <p class="muted">
+        The API shape follows the provider's adapter — {" "}
+        {props.providers.find((p) => p.name === provider())?.subscription ? "responses/messages" : "chat completions"} for this one.
+        A per-model override is not a config field yet.
+      </p>
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+      <div class="dialog-actions">
+        <button type="button" class="button outline" onClick={props.onClose}>Cancel</button>
+        <button class="button primary" disabled={pending() || !model() || !provider()}>{pending() ? "Adding…" : "Add model"}</button>
+      </div>
+    </form>
+  </div>;
 }
 
-function formatNumber(value: number | undefined) { return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(value ?? 0); }
-function formatUsd(value: number | undefined) { return new Intl.NumberFormat(undefined, { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 4 }).format(value ?? 0); }
+// Pinned to en-US, not the viewer's locale: an operator reading an
+// en-IN browser was shown "1.2L" for 120,000 tokens, which is correct
+// for that locale and useless for a dollar-denominated API where every
+// price is quoted per million. Thousands/millions/billions it is.
+const NUMBER = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+const USD = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 4 });
+function formatNumber(value: number | undefined) { return NUMBER.format(value ?? 0); }
+function formatUsd(value: number | undefined) { return USD.format(value ?? 0); }

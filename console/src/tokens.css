@@ -9,9 +9,9 @@
    grey UI with a cool accent reads as generic tooling, and every surface
    this gateway shows — provider names, token counts, spend — is warm.
 
-   Dark only, as Caret is. `color-scheme: dark` is declared rather than
-   implied: undeclared, CSS `light-dark()` and native form controls,
-   scrollbars and caret colour all take the light branch. */
+   Dark-first, with a light palette that reads the same stone ramp from
+   the other end. `color-scheme` is declared per theme rather than
+   implied, so native form controls, scrollbars and caret colour follow. */
 :root {
   color-scheme: dark;
 
@@ -89,15 +89,145 @@
   --sidebar-muted: #a6a09b;
   --sidebar-border: #ffffff1a;
 
+  /* Interaction washes. Hover fills, input fields and quiet wells are
+     alpha glazes over whatever surface they sit on, so they need to flip
+     polarity with the theme — a white glaze is invisible on white. */
+  --hover: #ffffff10;
+  --hover-strong: #ffffff18;
+  --field: #ffffff08;
+  --wash: #ffffff06;
+  /* The logo's red, tuned per theme for 13px text: #fc371d itself is
+     5.4:1 on stone-950 but only 3.1:1 on the light field. */
+  --brand: #fc371d;
+
   --font-sans: -apple-system, BlinkMacSystemFont, "SF Pro Text", system-ui, sans-serif;
   --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, "SF Mono", Menlo, monospace;
 }
 
-/* Both theme hooks resolve to the same palette: the desktop app has no
-   light mode, and a console that flipped to white beside it would break
-   the pairing this file exists to keep. Kept as selectors so a light
-   variant is one block away if it is ever wanted. */
-:root[data-theme="dark"],
+/* Light: the same stone ramp read from the other end. Values are chosen
+   against the AA floors that bit us in dark mode — `--muted` is
+   stone-600, not stone-500, because pills put 10.5px muted text on
+   `--surface-2` and stone-500 lands at 4.0:1 there. */
+@media (prefers-color-scheme: light) {
+  :root:not([data-theme="dark"]) {
+    color-scheme: light;
+    --bg: #eceae7;
+    --surface: #ffffff;
+    --surface-2: #e2ded8;
+    --panel: #fbfaf9;
+
+    --border: #00000021;
+    --border-soft: #00000012;
+    --border-strong: #00000030;
+
+    --text: #1c1917;
+    --title: #44403c;
+    --muted: #57534e;
+    --faint: #79716b;
+
+    --accent: #c2410c;
+    --accent-hover: #9a3412;
+    --accent-fill: #ff6900;
+    --accent-fill-hover: #e85e00;
+    --accent-ink: #ffffff;
+    --btn-bg: #c2410c;
+    --btn-bg-hover: #9a3412;
+    --btn-ink: #ffffff;
+    --accent-soft: #fdeee1;
+    --accent-line: #f0c39e;
+
+    --danger: #b91c1c;
+    --danger-soft: #fdeaea;
+    --warning: #8a5a08;
+    --warning-soft: #faf0d9;
+    --success: #1f6b45;
+    --success-soft: #e4f3ea;
+    --focus: #0b6bcb;
+
+    --series-1: #e2570b;
+    --series-2: #1f6b45;
+    --series-3: #0b6bcb;
+    --series-4: #8a5a08;
+    --series-5: #7c3aed;
+    --series-6: #b91c5c;
+    --grid: #00000010;
+
+    --shadow-panel: 0 1px 2px rgb(28 25 23 / 5%);
+    --shadow-pop: 0 12px 32px rgb(28 25 23 / 16%), 0 2px 8px rgb(28 25 23 / 8%);
+
+    --sidebar: transparent;
+    --sidebar-2: #00000010;
+    --sidebar-text: #1c1917;
+    --sidebar-muted: #57534e;
+    --sidebar-border: #00000012;
+
+    --hover: #0000000d;
+    --hover-strong: #00000015;
+    --field: #00000005;
+    --wash: #00000004;
+  --brand: #c4280e;
+  }
+}
+
 :root[data-theme="light"] {
+  color-scheme: light;
+  --bg: #eceae7;
+  --surface: #ffffff;
+  --surface-2: #e2ded8;
+  --panel: #fbfaf9;
+
+  --border: #00000021;
+  --border-soft: #00000012;
+  --border-strong: #00000030;
+
+  --text: #1c1917;
+  --title: #44403c;
+  --muted: #57534e;
+  --faint: #79716b;
+
+  --accent: #c2410c;
+  --accent-hover: #9a3412;
+  --accent-fill: #ff6900;
+  --accent-fill-hover: #e85e00;
+  --accent-ink: #ffffff;
+  --btn-bg: #c2410c;
+  --btn-bg-hover: #9a3412;
+  --btn-ink: #ffffff;
+  --accent-soft: #fdeee1;
+  --accent-line: #f0c39e;
+
+  --danger: #b91c1c;
+  --danger-soft: #fdeaea;
+  --warning: #8a5a08;
+  --warning-soft: #faf0d9;
+  --success: #1f6b45;
+  --success-soft: #e4f3ea;
+  --focus: #0b6bcb;
+
+  --series-1: #e2570b;
+  --series-2: #1f6b45;
+  --series-3: #0b6bcb;
+  --series-4: #8a5a08;
+  --series-5: #7c3aed;
+  --series-6: #b91c5c;
+  --grid: #00000010;
+
+  --shadow-panel: 0 1px 2px rgb(28 25 23 / 5%);
+  --shadow-pop: 0 12px 32px rgb(28 25 23 / 16%), 0 2px 8px rgb(28 25 23 / 8%);
+
+  --sidebar: transparent;
+  --sidebar-2: #00000010;
+  --sidebar-text: #1c1917;
+  --sidebar-muted: #57534e;
+  --sidebar-border: #00000012;
+
+  --hover: #0000000d;
+  --hover-strong: #00000015;
+  --field: #00000005;
+  --wash: #00000004;
+  --brand: #c4280e;
+}
+
+:root[data-theme="dark"] {
   color-scheme: dark;
 }

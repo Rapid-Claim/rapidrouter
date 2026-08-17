@@ -345,6 +345,11 @@ impl RoutingTable {
         &self.aliases
     }
 
+    /// The chain a target falls back through, if one is configured.
+    pub fn fallbacks_for(&self, target: &TargetModel) -> Option<&Vec<TargetModel>> {
+        self.fallbacks.get(target)
+    }
+
     pub fn catalog(&self) -> &BTreeMap<String, String> {
         &self.catalog
     }

@@ -114,6 +114,26 @@ impl Store {
             .expect("the memory backend cannot fail to open")
     }
 
+    /// Whether this store can hold usage objects.
+    pub fn holds_blobs(&self) -> bool {
+        self.plane.holds_blobs()
+    }
+
+    /// Store one usage object. Keys are relative to the store's prefix.
+    pub async fn put_blob(&self, key: &str, body: Vec<u8>) -> Result<(), StoreError> {
+        self.plane.put_blob(key, body).await.map_err(Into::into)
+    }
+
+    /// List usage objects under `prefix`.
+    pub async fn list_blobs(&self, prefix: &str) -> Result<Vec<String>, StoreError> {
+        self.plane.list_blobs(prefix).await.map_err(Into::into)
+    }
+
+    /// Read one usage object.
+    pub async fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>, StoreError> {
+        self.plane.get_blob(key).await.map_err(Into::into)
+    }
+
     pub fn node_id(&self) -> &str {
         &self.node_id
     }

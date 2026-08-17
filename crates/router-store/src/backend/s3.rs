@@ -231,6 +231,84 @@ impl ControlPlane for S3Store {
         }
         Ok(())
     }
+    fn holds_blobs(&self) -> bool {
+        true
+    }
+
+    async fn put_blob(&self, key: &str, body: Vec<u8>) -> Result<(), ControlPlaneError> {
+        self.client
+            .put_object()
+            .bucket(&self.bucket)
+            .key(format!("{}{key}", self.prefix))
+            .body(body.into())
+            .send()
+            .await
+            .map_err(|err| ControlPlaneError::unavailable("s3 put_object", err))?;
+        Ok(())
+    }
+
+    async fn list_blobs(&self, prefix: &str) -> Result<Vec<String>, ControlPlaneError> {
+        let full = format!("{}{prefix}", self.prefix);
+        let mut keys = Vec::new();
+        let mut token: Option<String> = None;
+        loop {
+            let mut request = self
+                .client
+                .list_objects_v2()
+                .bucket(&self.bucket)
+                .prefix(&full);
+            if let Some(token) = token.take() {
+                request = request.continuation_token(token);
+            }
+            let page = request
+                .send()
+                .await
+                .map_err(|err| ControlPlaneError::unavailable("s3 list_objects_v2", err))?;
+            for object in page.contents() {
+                if let Some(key) = object.key() {
+                    // Return keys relative to the store prefix, so callers
+                    // never have to know it.
+                    keys.push(key.trim_start_matches(&self.prefix).to_owned());
+                }
+            }
+            if page.is_truncated().unwrap_or(false) {
+                token = page.next_continuation_token().map(str::to_owned);
+                if token.is_none() {
+                    break;
+                }
+            } else {
+                break;
+            }
+        }
+        Ok(keys)
+    }
+
+    async fn get_blob(&self, key: &str) -> Result<Option<Vec<u8>>, ControlPlaneError> {
+        let result = self
+            .client
+            .get_object()
+            .bucket(&self.bucket)
+            .key(format!("{}{key}", self.prefix))
+            .send()
+            .await;
+        match result {
+            Ok(output) => {
+                let bytes = output
+                    .body
+                    .collect()
+                    .await
+                    .map_err(|err| ControlPlaneError::unavailable("s3 get_object body", err))?;
+                Ok(Some(bytes.to_vec()))
+            }
+            Err(err) => {
+                if err.as_service_error().is_some_and(|e| e.is_no_such_key()) {
+                    Ok(None)
+                } else {
+                    Err(ControlPlaneError::unavailable("s3 get_object", err))
+                }
+            }
+        }
+    }
 }
 
 /// `nodes/<id>.<base64url addr>` — one listing yields both fields.
