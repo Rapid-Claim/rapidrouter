@@ -2706,6 +2706,7 @@ dependencies = [
  "loom",
  "memchr",
  "proptest",
+ "rand_core 0.6.4",
  "serde",
  "serde_json",
  "subtle",

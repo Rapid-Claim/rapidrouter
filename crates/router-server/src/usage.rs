@@ -512,7 +512,7 @@ impl Aggregator {
                 "input_tokens": c.input_tokens,
                 "output_tokens": c.output_tokens,
                 "cost_usd": c.cost_micro_usd as f64 / 1e6,
-                "avg_latency_ms": if c.requests > 0 { c.latency_ms_sum / c.requests } else { 0 },
+                "avg_latency_ms": c.latency_ms_sum.checked_div(c.requests).unwrap_or(0),
             })
         };
         let groups_json: Vec<Value> = groups
@@ -1365,7 +1365,7 @@ impl UsagePipeline {
                         // twice; the ring and the files overlap by design.
                         .filter(|rec| rec.ts < oldest_in_memory && keep(rec))
                         .collect();
-                batch.sort_by(|a, b| b.ts.cmp(&a.ts));
+                batch.sort_by_key(|rec| std::cmp::Reverse(rec.ts));
                 for rec in batch {
                     out.push(rec);
                     if out.len() >= limit {

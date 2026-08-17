@@ -20,6 +20,13 @@ toml = { workspace = true }
 zeroize = { workspace = true }
 tokio = { version = "1", default-features = false, features = ["sync"] }
 argon2 = "0.5.3"
+# `OsRng` lives behind rand_core's `getrandom` feature. Argon2 pulls
+# rand_core in but not that feature, so in a workspace build it only
+# compiled because some other crate happened to enable it — and building
+# this crate alone (as the loom job does) failed. Depending on it here
+# makes the salt source a property of this crate rather than of whatever
+# else is being built alongside it.
+rand_core = { version = "0.6.4", features = ["getrandom"] }
 
 [dev-dependencies]
 criterion = { workspace = true }

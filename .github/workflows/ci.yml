@@ -23,6 +23,19 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      # The console bundle is embedded into the binary at compile time and
+      # is gitignored, so without this step the gateway under test serves
+      # an empty console and the test that checks it serves the real one
+      # fails — which it had been doing.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: console
+      - run: npm run build
+        working-directory: console
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets
       - run: cargo test --workspace
