@@ -1320,23 +1320,17 @@ pub(crate) async fn probe_key(
     };
 
     let empty = HeaderMap::new();
-    let request = match build_upstream_request(
-        &route,
-        dialect,
-        &built.path,
-        &empty,
-        key,
-        built.body,
-    ) {
-        Ok(request) => request,
-        Err(err) => {
-            return ProbeOutcome {
-                status: "unreachable".into(),
-                detail: err.to_string(),
-                http_status: None,
-            };
-        }
-    };
+    let request =
+        match build_upstream_request(&route, dialect, &built.path, &empty, key, built.body) {
+            Ok(request) => request,
+            Err(err) => {
+                return ProbeOutcome {
+                    status: "unreachable".into(),
+                    detail: err.to_string(),
+                    http_status: None,
+                };
+            }
+        };
 
     let result = state
         .upstream
