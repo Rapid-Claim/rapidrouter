@@ -68,6 +68,9 @@ type = "codex_subscription"
 base_url = "{base}"
 codex = {{ version = "0.199.0", reasoning_effort = "medium" }}
 keys = [{{ name = "seat-1", value = "file:{auth}" }}]
+
+[console]
+admin_keys = ["probe-test-key"]
 "#,
             base = mock.base_url(),
             auth = auth_path.display(),
@@ -495,4 +498,154 @@ async fn codex_relays_the_responses_surface_verbatim() {
     );
     assert_eq!(sent["stream"], true, "the backend speaks only SSE");
     assert_eq!(sent["store"], false, "the backend keeps no state for us");
+}
+
+// ---------------------------------------------------------------------------
+// The console's "Check" button
+// ---------------------------------------------------------------------------
+
+/// Probe one credential through the admin API, as the console does.
+/// `model` empty means "send no override", which is what the console
+/// itself sends.
+async fn probe(url: &str, provider: &str, model: &str) -> Value {
+    let client = reqwest::Client::new();
+    let token = client
+        .post(format!("{url}/admin/api/session"))
+        .json(&json!({"key": "probe-test-key"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["token"]
+        .as_str()
+        .expect("a session token")
+        .to_owned();
+    client
+        .post(format!(
+            "{url}/admin/api/providers/{provider}/probe"
+        ))
+        .bearer_auth(&token)
+        .json(&if model.is_empty() {
+            json!({})
+        } else {
+            json!({ "model": model })
+        })
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["results"][0]
+        .clone()
+}
+
+/// The check has to ask for what the backend actually serves.
+///
+/// A hand-rolled `/chat/completions` body is not a request the Codex
+/// backend answers — it serves its private Responses surface at its own
+/// path and nothing else — so a probe built that way is refused whatever
+/// the seat's real state, and every credential reads as broken.
+#[tokio::test]
+async fn a_codex_probe_asks_the_backend_for_what_it_serves() {
+    let (url, mock, _dir) = gateway().await;
+    let result = probe(&url, "codex", "gpt-5.5").await;
+    assert_eq!(result["status"], "ok", "{result}");
+
+    let request = mock.last_request();
+    assert_eq!(request.path, "/backend-api/codex/responses");
+    assert_eq!(request.body["model"], "gpt-5.5");
+    assert_eq!(request.body["stream"], true, "the backend speaks only SSE");
+    assert!(
+        request.body["input"].is_array(),
+        "the Responses shape, not a chat body: {}",
+        request.body,
+    );
+}
+
+/// The same for a Claude seat: its token is only authorized for the
+/// Claude Code identity, so a probe without it is refused by the model.
+#[tokio::test]
+async fn a_claude_probe_carries_the_identity_its_token_is_authorized_for() {
+    let (url, mock, _dir) = gateway().await;
+    let result = probe(&url, "claude-max", "claude-sonnet-4-5").await;
+    assert_eq!(result["status"], "ok", "{result}");
+
+    let request = mock.last_request();
+    assert_eq!(request.path, "/v1/messages");
+    assert_eq!(
+        request.body["system"][0]["text"],
+        "You are Claude Code, Anthropic's official CLI for Claude.",
+    );
+}
+
+/// A check is also how the plan windows first get reported, and the
+/// console labels each window from the length that arrives here. Codex
+/// sizes its windows per plan — this one is weekly — so a gateway that
+/// dropped the length would leave the console guessing, which is how a
+/// weekly window ends up drawn as a five-hour one.
+#[tokio::test]
+async fn a_codex_probe_reports_the_window_length_the_plan_actually_has() {
+    let (url, _mock, _dir) = gateway().await;
+    let result = probe(&url, "codex", "quota-codex").await;
+    assert_eq!(result["status"], "rate_limited", "{result}");
+
+    let client = reqwest::Client::new();
+    let token = client
+        .post(format!("{url}/admin/api/session"))
+        .json(&json!({"key": "probe-test-key"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["token"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let providers = client
+        .get(format!("{url}/admin/api/providers"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap();
+    let seat = providers["data"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|p| p["name"] == "codex")
+        .expect("the codex provider")["keys"][0]
+        .clone();
+
+    assert_eq!(
+        seat["quota"]["primary"]["length_s"], 604_800,
+        "the plan's window is a week, and the console names it from this: {seat}",
+    );
+    assert_eq!(seat["quota"]["primary"]["utilization"], 1.0);
+    assert!(
+        seat["quota"]["secondary"].is_null(),
+        "a plan with one window must not grow a second, empty one: {seat}",
+    );
+}
+
+/// A seat is checkable the moment it is added.
+///
+/// The console's button sends no model, and these seats declare none —
+/// what a subscription serves is decided by the plan, not configured. A
+/// probe that gave up here would report "no model declared" for every
+/// freshly added credential, which reads as a broken seat.
+#[tokio::test]
+async fn a_seat_can_be_checked_before_any_model_is_declared() {
+    let (url, mock, _dir) = gateway().await;
+    let result = probe(&url, "codex", "").await;
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(result["model"], "gpt-5.5", "the plan's own model: {result}");
+    assert_eq!(mock.last_request().path, "/backend-api/codex/responses");
+
+    let result = probe(&url, "claude-max", "").await;
+    assert_eq!(result["status"], "ok", "{result}");
+    assert_eq!(mock.last_request().path, "/v1/messages");
 }

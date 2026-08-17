@@ -876,9 +876,24 @@ function providerHealth(provider: Provider): { label: string; tone: "success" | 
   return { label: "Ready", tone: "success" };
 }
 
-/// One credential as a table row. Claude seats report 5-hour and 7-day
-/// windows; Codex seats a 5-hour and a weekly one — the labels say which,
-/// because "primary window" tells an operator nothing at 2am.
+/// Name a plan window by the length the provider reported for it.
+///
+/// "Primary window" tells an operator nothing at 2am, so these are
+/// labelled — but the label has to come from the data, not from the
+/// position. Anthropic's two windows are fixed at 5h and 7d and it
+/// reports both lengths. Codex reports `x-codex-<window>-window-minutes`
+/// per window and the lengths follow the plan: a seat whose primary
+/// window is the weekly one has no 5-hour limit at all, and drawing its
+/// weekly usage under a "5-hour limit" heading is how a seat with days
+/// of room reads as one about to come back.
+function planWindowLabel(length_s: number): string {
+  if (length_s < 3600) return `${Math.round(length_s / 60)}-minute limit`;
+  if (length_s < 86400) return `${Math.round(length_s / 3600)}-hour limit`;
+  const days = Math.round(length_s / 86400);
+  return days === 7 ? "Weekly limit" : `${days}-day limit`;
+}
+
+/// One credential as a table row.
 function CredentialRow(props: {
   providerKey: ProviderKey;
   kind: string;
@@ -909,20 +924,22 @@ function CredentialRow(props: {
         return "danger";
     }
   };
-  const isClaude = () => props.kind.toLowerCase().includes("claude");
-  const windowLabels = () => (isClaude() ? ["5-hour limit", "7-day limit"] : ["5-hour limit", "Weekly limit"]);
+  // Only the windows the provider sized. The Codex backend answers with
+  // an empty `secondary` set when a plan has one window — 0% used, no
+  // length, no reset — and a nameless meter reading 0% next to an
+  // exhausted one is worse than no row at all.
+  const planWindows = () => [key().quota?.primary, key().quota?.secondary]
+    .filter((w): w is QuotaWindow => Boolean(w?.length_s));
 
-  const windowCell = (label: string, w: QuotaWindow | null) => (
-    <Show when={w} keyed>{(win) => {
-      const pct = Math.round(Math.min(win.utilization, 1) * 100);
-      const meterTone = win.rejected || pct >= 100 ? "danger" : pct >= 80 ? "warning" : "";
-      return <div class="cred-window">
-        <span class="cred-window-label">{label}</span>
-        <div class={`meter ${meterTone}`}><i style={{ width: `${pct}%` }} /></div>
-        <span class="cred-window-pct">{pct}%{win.resets_in_s ? ` · resets ${formatDuration(win.resets_in_s)}` : ""}</span>
-      </div>;
-    }}</Show>
-  );
+  const windowCell = (win: QuotaWindow) => {
+    const pct = Math.round(Math.min(win.utilization, 1) * 100);
+    const meterTone = win.rejected || pct >= 100 ? "danger" : pct >= 80 ? "warning" : "";
+    return <div class="cred-window">
+      <span class="cred-window-label">{planWindowLabel(win.length_s!)}</span>
+      <div class={`meter ${meterTone}`}><i style={{ width: `${pct}%` }} /></div>
+      <span class="cred-window-pct">{pct}%{win.resets_in_s ? ` · resets ${formatDuration(win.resets_in_s)}` : ""}</span>
+    </div>;
+  };
 
   return <tr>
     <td>
@@ -942,9 +959,8 @@ function CredentialRow(props: {
           </small>
         </Show>
       }>
-        <Show when={key().quota} fallback={<span class="muted">Reports after the first request</span>}>
-          {windowCell(windowLabels()[0], key().quota!.primary)}
-          {windowCell(windowLabels()[1], key().quota!.secondary)}
+        <Show when={planWindows().length} fallback={<span class="muted">Reports after the first request</span>}>
+          <For each={planWindows()}>{(win) => windowCell(win)}</For>
         </Show>
         <Show when={key().health === "benched" && key().benched_until_ms}>
           <small class="muted">Out until {new Date(key().benched_until_ms!).toLocaleString()}</small>
@@ -1441,8 +1457,22 @@ function useTelemetry(
 ) {
   const resolved = createMemo(() => resolveRange(range()));
   const dep = () => [refresh(), range(), filters()] as const;
-  const [tail] = createResource(dep, () =>
-    resolveRange(range()).live ? api.requests(false, 1000) : undefined);
+  // The window and the filters go to the gateway, not just into the
+  // memo below: `/requests` with no `since_ms` defaults to the last
+  // hour, so an unbounded read made "Last 24 hours" mean "last hour",
+  // and filtering client-side only narrowed that hour further.
+  const [tail] = createResource(dep, () => {
+    const r = resolveRange(range());
+    if (!r.live) return undefined;
+    const f = filters();
+    return api.requests(false, 1000, {
+      since_ms: Math.floor(r.startMs),
+      until_ms: Math.ceil(r.endMs),
+      provider: f.provider || undefined,
+      model: f.model || undefined,
+      key: f.key || undefined,
+    });
+  });
   const historyFor = (by: string) => {
     const [res] = createResource(dep, () => {
       const r = resolveRange(range());
@@ -1459,6 +1489,9 @@ function useTelemetry(
   const byKeyRes = historyFor("key");
   const byProviderRes = historyFor("provider");
 
+  /// The gateway has already applied both, so this is not the filter —
+  /// it is what keeps the view honest while a refetch is in flight, when
+  /// `tail()` still holds the payload for the previous range.
   const liveRecords = createMemo(() => {
     const r = resolved();
     if (!r.live) return [];

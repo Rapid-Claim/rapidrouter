@@ -1287,37 +1287,46 @@ pub(crate) async fn probe_key(
             http_status: None,
         };
     };
-    let (path, body) = match dialect {
-        Dialect::Anthropic => (
-            "/v1/messages",
-            serde_json::json!({
-                "model": model,
-                "max_tokens": 1,
-                "messages": [{ "role": "user", "content": "hi" }],
-            }),
-        ),
-        Dialect::Gemini => (
-            "/v1beta/models:generateContent",
-            serde_json::json!({ "contents": [{ "parts": [{ "text": "hi" }] }] }),
-        ),
-        _ => (
-            "/chat/completions",
-            serde_json::json!({
-                "model": model,
-                "max_tokens": 1,
-                "messages": [{ "role": "user", "content": "hi" }],
-            }),
-        ),
+    // Built by the same function real traffic goes through, so what the
+    // probe exercises is what production exercises. Hand-rolling one
+    // body per dialect skipped everything the subscription transports
+    // add: a Claude OAuth token is only authorized for the Claude Code
+    // identity, and the Codex backend serves its private Responses shape
+    // at its own path and nothing else — so a probe asked both for
+    // something they never serve, and every seat came back 403 however
+    // valid and in-quota it was.
+    let probe: ChatRequest = serde_json::from_value(serde_json::json!({
+        "model": model,
+        "max_tokens": 1,
+        "messages": [{ "role": "user", "content": "hi" }],
+    }))
+    .expect("the probe request builds");
+    let built = match router_providers::build_outbound(
+        dialect,
+        &probe,
+        model,
+        false,
+        provider.codex.as_ref(),
+        provider.kind == ProviderKind::ClaudeSubscription,
+    ) {
+        Ok(built) => built,
+        Err(err) => {
+            return ProbeOutcome {
+                status: "unreachable".into(),
+                detail: err.to_string(),
+                http_status: None,
+            };
+        }
     };
 
     let empty = HeaderMap::new();
     let request = match build_upstream_request(
         &route,
         dialect,
-        path,
+        &built.path,
         &empty,
         key,
-        Bytes::from(body.to_string()),
+        built.body,
     ) {
         Ok(request) => request,
         Err(err) => {
