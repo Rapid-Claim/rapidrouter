@@ -55,6 +55,10 @@
   --accent-soft: #2a1206;
   --accent-line: #7a3a10;
 
+  /* JSON viewer syntax hues, tuned per theme like every other colour. */
+  --json-number: #7cc7ff;
+  --json-bool: #d2a8ff;
+
   --danger: #ff6467;
   --danger-soft: #2e1616;
   --warning: #ffb86a;
@@ -166,6 +170,8 @@
     --field: #00000005;
     --wash: #00000004;
   --brand: #c4280e;
+  --json-number: #0550ae;
+  --json-bool: #6639ba;
   }
 }
 
@@ -226,6 +232,8 @@
   --field: #00000005;
   --wash: #00000004;
   --brand: #c4280e;
+  --json-number: #0550ae;
+  --json-bool: #6639ba;
 }
 
 :root[data-theme="dark"] {

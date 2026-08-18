@@ -122,6 +122,26 @@ export type UsageRecord = {
   /** Time inside the gateway itself, as opposed to waiting on a provider. */
   overhead_us: number;
   tag?: string;
+  /** First user turn (or the system prompt when there is none), truncated.
+   * Extracted by the gateway at record time — absent on records written
+   * before that shipped. */
+  prompt?: string;
+};
+
+/** Totals for a whole window, not the page on screen. */
+export type RequestsSummary = {
+  requests: number;
+  errors: number;
+  /** Upstream calls made; exceeds `requests` when retries or failover ran. */
+  attempts: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  cost_micro_usd: number;
+  p50_latency_ms: number;
+  p95_latency_ms: number;
+  /** The scan hit its ceiling, so these are a floor rather than exact. */
+  capped: boolean;
 };
 
 const TOKEN_KEY = "rapid-admin-session";
@@ -199,6 +219,17 @@ export const api = {
       if (value !== undefined && value !== "") params.set(name, String(value));
     }
     return request<{ data: UsageRecord[]; next: string | null }>(`/requests?${params}`);
+  },
+  /** Totals for the selected range and filters, independent of paging. */
+  requestsSummary: (
+    errors = false,
+    window?: { since_ms?: number; until_ms?: number; provider?: string; model?: string; key?: string },
+  ) => {
+    const params = new URLSearchParams({ errors: String(errors) });
+    for (const [name, value] of Object.entries(window ?? {})) {
+      if (value !== undefined && value !== "") params.set(name, String(value));
+    }
+    return request<RequestsSummary>(`/requests/summary?${params}`);
   },
   /** What was sent and what came back, for one request. */
   requestBodies: (id: string, ts: number) =>

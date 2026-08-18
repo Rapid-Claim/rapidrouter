@@ -61,6 +61,7 @@ fn a_week_of_a_million_requests_a_day_reads_fast() {
                         overhead_us: 120,
                         attempts: 1,
                         tag: None,
+                        prompt: None,
                     }
                 })
                 .collect();

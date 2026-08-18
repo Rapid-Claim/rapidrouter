@@ -32,10 +32,12 @@ import {
   createMemo,
   createResource,
   createSignal,
+  on,
   onCleanup,
   onMount,
 } from "solid-js";
 import uPlot from "uplot";
+import { JsonView, Transcript, parseAnswer, parseConversation } from "./bodies";
 import logo from "./logo.svg";
 import {
   Combobox,
@@ -65,6 +67,7 @@ import {
   type Team,
   type UsageRecord,
   type VirtualKey,
+  RequestsSummary,
 } from "./api";
 
 type Page =
@@ -1940,10 +1943,6 @@ function Requests(props: { refresh: () => number }) {
   const [provider, setProvider] = createSignal("");
   const [model, setModel] = createSignal("");
   const [vkey, setVkey] = createSignal("");
-  // Always fetch the unfiltered tail and narrow on the client: the
-  // filters are faceted off whatever actually arrived, so a provider with
-  // no traffic in the window never appears as a choice that returns
-  // nothing.
   // The window is sent to the gateway rather than filtered here: the
   // in-memory tail is ~90 seconds at a million requests a day, so
   // anything older has to be read from the flushed partitions, and only
@@ -1954,51 +1953,77 @@ function Requests(props: { refresh: () => number }) {
   // "previous" is a step back rather than a re-query from the start.
   const [cursor, setCursor] = createSignal<string | null>(null);
   const [stack, setStack] = createSignal<string[]>([]);
+
+  // Every query derives from one place, so the range picker and the
+  // filters cannot move the table and the header out of step — which is
+  // exactly what happened when the header was computed from the page.
+  const query = createMemo(() => {
+    const r = resolveRange(range());
+    return {
+      errors: status() === "errors",
+      since_ms: Math.floor(r.startMs),
+      until_ms: Math.ceil(r.endMs),
+      provider: provider() || undefined,
+      model: model() || undefined,
+      key: vkey() || undefined,
+    };
+  });
+
+  // Changing a filter or the range invalidates the page walk: cursor N of
+  // the old query means nothing under the new one.
+  createEffect(
+    on(
+      () => [range(), status(), provider(), model(), vkey()] as const,
+      () => { setCursor(null); setStack([]); },
+      { defer: true },
+    ),
+  );
+
   const [records] = createResource(
-    () => [props.refresh(), range(), cursor(), status(), provider(), model(), vkey()] as const,
-    () => {
-      const r = resolveRange(range());
-      return api.requests(status() === "errors", PAGE_SIZE, {
-        since_ms: Math.floor(r.startMs),
-        until_ms: Math.ceil(r.endMs),
-        after: cursor() ?? undefined,
-        provider: provider() || undefined,
-        model: model() || undefined,
-        key: vkey() || undefined,
-      });
-    },
+    () => [props.refresh(), query(), cursor()] as const,
+    ([, q, after]) => api.requests(q.errors, PAGE_SIZE, { ...q, after: after ?? undefined }),
+  );
+  // Totals for the whole window, independent of which page is open.
+  const [summary] = createResource(
+    () => [props.refresh(), query()] as const,
+    ([, q]) => api.requestsSummary(q.errors, q),
   );
   const [selected, setSelected] = createSignal<UsageRecord | null>(null);
   const [keys] = createResource(props.refresh, api.keys);
 
   const all = () => records()?.data ?? [];
+  // Filters are faceted off whatever actually arrived, so a provider with
+  // no traffic in the window never appears as a choice that returns
+  // nothing.
   const facet = (pick: (r: UsageRecord) => string | undefined): Option[] =>
     [...new Set(all().map(pick).filter(Boolean) as string[])]
       .sort()
       .map((v) => ({ value: v, label: v }));
 
+  // Only the free-text search narrows client-side; everything else is
+  // already applied by the gateway, so re-applying it here would only
+  // risk the two disagreeing.
   const shown = createMemo(() => {
     const needle = search().trim().toLowerCase();
-    const r = resolveRange(range());
-    return all().filter((record) => {
-      if (record.ts < r.startMs || record.ts > r.endMs) return false;
-      if (status() === "errors" && record.status < 400) return false;
-      if (status() === "ok" && record.status >= 400) return false;
-      if (provider() && record.provider !== provider()) return false;
-      if (model() && record.model !== model()) return false;
-      if (vkey() && record.vkey !== vkey()) return false;
-      if (!needle) return true;
-      return `${record.requested} ${record.provider}/${record.model} ${record.vkey ?? ""} ${record.status} ${record.request_id}`
+    if (!needle) return all();
+    return all().filter((record) =>
+      `${record.requested} ${record.provider}/${record.model} ${record.vkey ?? ""} ${record.status} ${record.request_id} ${record.prompt ?? ""}`
         .toLowerCase()
-        .includes(needle);
-    });
+        .includes(needle),
+    );
   });
+
+  const totals = () => summary();
+  const pages = () => {
+    const total = totals()?.requests ?? 0;
+    return Math.max(1, Math.ceil(total / PAGE_SIZE));
+  };
 
   return <div class="stack-lg">
     <FilterBar
       search={search()}
       onSearch={setSearch}
-      searchPlaceholder="Search route, key, request id (press /)"
+      searchPlaceholder="Search route, key, prompt, request id (press /)"
       extra={<RangePicker value={range()} onChange={setRange} />}
       filters={[
         {
@@ -2006,8 +2031,6 @@ function Requests(props: { refresh: () => number }) {
           label: "Status",
           value: status(),
           onChange: setStatus,
-          // "Errors only" was a toggle floating outside the toolbar; it is
-          // one value of the status filter, and belongs with the others.
           options: [
             { value: "errors", label: "Errors only" },
             { value: "ok", label: "Successful only" },
@@ -2024,16 +2047,45 @@ function Requests(props: { refresh: () => number }) {
         },
       ]}
     />
-    <Loading when={records.loading && !records()} skeleton="stats" rows={5}>
-    <section class="stat-row" aria-label="Totals for the selected range">
-      <div class="stat"><span>Requests shown</span><strong>{formatNumber(shown().length)}</strong></div>
-      <div class="stat" classList={{ danger: shown().some((r) => r.status >= 400) }}>
-        <span>Errors</span><strong>{formatNumber(shown().filter((r) => r.status >= 400).length)}</strong>
+    <Loading when={summary.loading && !summary()} skeleton="stats" rows={5}>
+    <section class="stat-row wide" aria-label="Totals for the selected range">
+      <div class="stat">
+        <span>Requests</span>
+        <strong>{formatNumber(totals()?.requests ?? 0)}</strong>
+        <small>{formatNumber(shown().length)} on this page</small>
       </div>
-      <div class="stat"><span>Tokens</span><strong>{formatNumber(shown().reduce((n, r) => n + r.input_tokens + r.output_tokens, 0))}</strong></div>
-      <div class="stat"><span>Spend</span><strong>{formatUsd(shown().reduce((n, r) => n + r.cost_micro_usd, 0) / 1e6)}</strong></div>
-      <div class="stat"><span>Median latency</span><strong>{median(shown().map((r) => r.latency_ms))} ms</strong></div>
+      <div class="stat">
+        <span>Upstream calls</span>
+        <strong>{formatNumber(totals()?.attempts ?? 0)}</strong>
+        <small>{retryNote(totals())}</small>
+      </div>
+      <div class="stat" classList={{ danger: (totals()?.errors ?? 0) > 0 }}>
+        <span>Errors</span>
+        <strong>{formatNumber(totals()?.errors ?? 0)}</strong>
+        <small>{errorRate(totals())}</small>
+      </div>
+      <div class="stat">
+        <span>Tokens</span>
+        <strong>{formatNumber((totals()?.input_tokens ?? 0) + (totals()?.output_tokens ?? 0))}</strong>
+        <small>{formatNumber(totals()?.input_tokens ?? 0)} in · {formatNumber(totals()?.output_tokens ?? 0)} out</small>
+      </div>
+      <div class="stat">
+        <span>Spend</span>
+        <strong>{formatUsd((totals()?.cost_micro_usd ?? 0) / 1e6)}</strong>
+        <small>{formatNumber(totals()?.cached_tokens ?? 0)} cached tokens</small>
+      </div>
+      <div class="stat">
+        <span>Latency</span>
+        <strong>{formatNumber(totals()?.p50_latency_ms ?? 0)} ms</strong>
+        <small>p50 · p95 {formatNumber(totals()?.p95_latency_ms ?? 0)} ms</small>
+      </div>
     </section>
+    <Show when={totals()?.capped}>
+      <p class="muted">
+        This window holds more requests than one summary scan covers; the totals above are a floor,
+        not the whole range. Narrow the range or a filter for exact figures.
+      </p>
+    </Show>
     </Loading>
     <section class="flat-section">
       <header>
@@ -2050,7 +2102,7 @@ function Requests(props: { refresh: () => number }) {
               setCursor(back);
             }}
           >Previous</button>
-          <span class="muted">{stack().length + 1}</span>
+          <span class="muted">Page {stack().length + 1} of {formatNumber(pages())}</span>
           <button
             class="button outline"
             disabled={!records()?.next}
@@ -2073,6 +2125,20 @@ function Requests(props: { refresh: () => number }) {
   </div>;
 }
 
+/// The gap between client requests and upstream calls is the cost of
+/// unhealthy seats, so it is named rather than left to arithmetic.
+function retryNote(summary?: RequestsSummary): string {
+  if (!summary || !summary.requests) return "—";
+  const extra = summary.attempts - summary.requests;
+  if (extra <= 0) return "no retries";
+  return `${formatNumber(extra)} retried or failed over`;
+}
+
+function errorRate(summary?: RequestsSummary): string {
+  if (!summary || !summary.requests) return "—";
+  return `${((summary.errors / summary.requests) * 100).toFixed(1)}% of requests`;
+}
+
 /// One request, opened: what was sent, what came back, and the metadata
 /// that describes the trip.
 ///
@@ -2084,6 +2150,26 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
     (record) => api.requestBodies(record.request_id, record.ts),
   );
   const [tab, setTab] = createSignal<"input" | "output">("input");
+  // Rendered by default, because the parsed transcript is what the drawer
+  // is for; the raw bytes stay one click away, since the parse is an
+  // interpretation and the JSON is the truth.
+  const [view, setView] = createSignal<"rendered" | "json">("rendered");
+
+  const raw = () => (tab() === "input" ? bodies()?.input : bodies()?.output);
+  const conversation = createMemo(() => {
+    const text = bodies()?.input;
+    return text ? parseConversation(text) : null;
+  });
+  const answer = createMemo(() => {
+    const text = bodies()?.output;
+    return text ? parseAnswer(text) : [];
+  });
+  // Nothing to render means nothing was recognised; the JSON view is then
+  // the only honest thing to show, so the toggle is not offered.
+  const renderable = createMemo(() =>
+    tab() === "input" ? Boolean(conversation()?.turns.length) : answer().length > 0,
+  );
+
   return <Drawer
     open={Boolean(props.record)}
     title={props.record?.requested ?? ""}
@@ -2091,41 +2177,66 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
     onClose={props.onClose}
   >
     <Show when={props.record} keyed>{(record) => <>
-      <div class="drawer-section">
-        <SectionTitle title="Request" subtitle="How it was routed and what it cost" />
-        <dl class="facts">
-          <Fact label="Request id" value={record.request_id} />
-          <Fact label="Status" value={String(record.status)} />
-          <Fact label="Route" value={`${record.provider}/${record.model}`} />
-          <Fact label="Endpoint" value={record.endpoint} />
-          <Fact label="Virtual key" value={record.vkey ?? "—"} />
-          <Fact label="Streaming" value={record.stream ? "Yes" : "No"} />
-          <Fact label="Attempts" value={String(record.attempts)} />
-          <Fact label="Input tokens" value={formatNumber(record.input_tokens)} />
-          <Fact label="Output tokens" value={formatNumber(record.output_tokens)} />
-          <Fact label="Cached tokens" value={formatNumber(record.cached_tokens)} />
-          <Fact label="Cost" value={formatUsd(record.cost_micro_usd / 1e6)} />
-          <Fact label="Latency" value={`${formatNumber(record.latency_ms)} ms`} />
-          <Fact label="Gateway overhead" value={`${record.overhead_us} µs`} />
-        </dl>
+      <div class="drawer-cards">
+        <section class="drawer-card">
+          <h3>Routing</h3>
+          <dl>
+            <div><dt>Status</dt><dd><Status text={String(record.status)} tone={record.status < 400 ? "success" : "danger"} /></dd></div>
+            <div><dt>Route</dt><dd class="mono">{record.provider}/{record.model}</dd></div>
+            <div><dt>Requested</dt><dd class="mono">{record.requested}</dd></div>
+            <div><dt>Endpoint</dt><dd class="mono">{record.endpoint}</dd></div>
+            <div><dt>Virtual key</dt><dd class="mono">{record.vkey ?? "—"}</dd></div>
+            <div><dt>Attempts</dt><dd>{record.attempts}{record.attempts > 1 ? " (retried)" : ""}</dd></div>
+            <div><dt>Streaming</dt><dd>{record.stream ? "Yes" : "No"}</dd></div>
+            <div><dt>Request id</dt><dd class="mono wrap">{record.request_id}</dd></div>
+          </dl>
+        </section>
+        <section class="drawer-card">
+          <h3>Cost and timing</h3>
+          <dl>
+            <div><dt>Input tokens</dt><dd>{formatNumber(record.input_tokens)}</dd></div>
+            <div><dt>Output tokens</dt><dd>{formatNumber(record.output_tokens)}</dd></div>
+            <div><dt>Cached tokens</dt><dd>{formatNumber(record.cached_tokens)}</dd></div>
+            <div><dt>Total tokens</dt><dd>{formatNumber(record.input_tokens + record.output_tokens)}</dd></div>
+            <div><dt>Cost</dt><dd>{formatUsd(record.cost_micro_usd / 1e6)}</dd></div>
+            <div><dt>Latency</dt><dd>{formatNumber(record.latency_ms)} ms</dd></div>
+            <div><dt>Gateway overhead</dt><dd>{formatNumber(record.overhead_us)} µs</dd></div>
+            <div><dt>Time</dt><dd>{new Date(record.ts).toLocaleString()}</dd></div>
+          </dl>
+        </section>
       </div>
       <div class="drawer-section">
         <SectionTitle
-          title="Bodies"
-          subtitle="Exactly what crossed the wire"
+          title="Conversation"
+          subtitle="What crossed the wire, read as a transcript"
           action={
-            <div class="segmented" role="group" aria-label="Body">
-              <button type="button" aria-pressed={tab() === "input"} onClick={() => setTab("input")}>Input</button>
-              <button type="button" aria-pressed={tab() === "output"} onClick={() => setTab("output")}>Output</button>
+            <div class="body-controls">
+              <div class="segmented" role="group" aria-label="Body">
+                <button type="button" aria-pressed={tab() === "input"} onClick={() => setTab("input")}>Input</button>
+                <button type="button" aria-pressed={tab() === "output"} onClick={() => setTab("output")}>Output</button>
+              </div>
+              <Show when={renderable()}>
+                <div class="segmented" role="group" aria-label="View">
+                  <button type="button" aria-pressed={view() === "rendered"} onClick={() => setView("rendered")}>Rendered</button>
+                  <button type="button" aria-pressed={view() === "json"} onClick={() => setView("json")}>JSON</button>
+                </div>
+              </Show>
             </div>
           }
         />
         <Show when={!bodies.loading} fallback={<Skeleton variant="table" rows={4} />}>
           <Show
-            when={tab() === "input" ? bodies()?.input : bodies()?.output}
+            when={raw()}
             fallback={<Empty title="Nothing stored" action={bodies()?.reason ?? "This request has no stored body."} />}
           >
-            <pre class="body-view">{tab() === "input" ? bodies()!.input : bodies()!.output}</pre>
+            <Show when={renderable() && view() === "rendered"} fallback={<JsonView text={raw()!} label={tab() === "input" ? "Request" : "Response"} />}>
+              <Show
+                when={tab() === "input"}
+                fallback={<Transcript turns={answer()} />}
+              >
+                <Transcript turns={conversation()!.turns} tools={conversation()!.tools} />
+              </Show>
+            </Show>
           </Show>
           <Show when={bodies()?.truncated}>
             <p class="muted">Stored up to the configured size cap; the rest was not kept.</p>
@@ -2136,11 +2247,6 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
   </Drawer>;
 }
 
-function median(values: number[]): number {
-  if (!values.length) return 0;
-  const sorted = [...values].sort((a, b) => a - b);
-  return sorted[Math.floor(sorted.length / 2)];
-}
 
 function RequestRows(props: {
   records: UsageRecord[];
@@ -2148,10 +2254,45 @@ function RequestRows(props: {
   loading?: boolean;
   onOpen?: (record: UsageRecord) => void;
 }) {
-  return <Loading when={Boolean(props.loading)} skeleton="table"><Show when={props.records.length} fallback={<Empty title="No requests yet" action="Send a request through the gateway." />}><div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table class="dense"><thead><tr><th>Time</th><th>Route</th><Show when={!props.compact}><th>Tokens</th><th>Cost</th></Show><th>Latency</th><th>Status</th></tr></thead><tbody><For each={props.records}>{(record) => <tr
-      classList={{ clickable: Boolean(props.onOpen) }}
-      onClick={() => props.onOpen?.(record)}
-    ><td class="mono">{new Date(record.ts).toLocaleTimeString()}</td><td><strong>{record.requested}</strong><small>{record.provider}/{record.model}</small></td><Show when={!props.compact}><td>{formatNumber(record.input_tokens + record.output_tokens)}</td><td>{formatUsd(record.cost_micro_usd / 1e6)}</td></Show><td>{record.latency_ms} ms</td><td><Status text={String(record.status)} tone={record.status < 400 ? "success" : "danger"} /></td></tr>}</For></tbody></table></div></Show></Loading>;
+  return <Loading when={Boolean(props.loading)} skeleton="table">
+    <Show when={props.records.length} fallback={<Empty title="No requests yet" action="Send a request through the gateway." />}>
+      <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+        <table class="dense logs">
+          <thead><tr>
+            <th>Time</th>
+            <th>Route</th>
+            <Show when={!props.compact}><th>Prompt</th></Show>
+            <Show when={!props.compact}><th>Tokens</th><th>Cost</th></Show>
+            <th>Latency</th>
+            <th>Status</th>
+          </tr></thead>
+          <tbody><For each={props.records}>{(record) => <tr
+            classList={{ clickable: Boolean(props.onOpen) }}
+            onClick={() => props.onOpen?.(record)}
+          >
+            <td class="mono nowrap">{new Date(record.ts).toLocaleTimeString()}</td>
+            {/* One line, not two: the alias and the resolved route were
+                stacked, which doubled every row's height to show a string
+                that is usually the same one twice. */}
+            <td class="mono route-cell" title={`${record.requested} → ${record.provider}/${record.model}`}>
+              {record.provider}/{record.model}
+            </td>
+            <Show when={!props.compact}>
+              <td class="prompt-cell" title={record.prompt ?? ""}>
+                <Show when={record.prompt} fallback={<span class="muted">—</span>}>{record.prompt}</Show>
+              </td>
+            </Show>
+            <Show when={!props.compact}>
+              <td class="nowrap">{formatNumber(record.input_tokens + record.output_tokens)}</td>
+              <td class="nowrap">{formatUsd(record.cost_micro_usd / 1e6)}</td>
+            </Show>
+            <td class="nowrap">{record.latency_ms} ms</td>
+            <td><Status text={String(record.status)} tone={record.status < 400 ? "success" : "danger"} /></td>
+          </tr>}</For></tbody>
+        </table>
+      </div>
+    </Show>
+  </Loading>;
 }
 
 type ChatMessage = { role: "user" | "assistant"; content: string; meta?: string; error?: boolean };

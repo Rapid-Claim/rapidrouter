@@ -384,6 +384,136 @@ pub struct UsageRecord {
     pub attempts: u32,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tag: Option<String>,
+    /// A short, human-readable excerpt of what was asked — the first user
+    /// turn, or the system prompt when there is no user turn.
+    ///
+    /// Extracted once, here, rather than by the console: the request list
+    /// carries no bodies (a page of a hundred would be megabytes nobody
+    /// reads), so a log table can only show the prompt if the record
+    /// itself carries one. Absent on records written before this shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+}
+
+/// How much of the prompt the record keeps. Enough for a table cell to be
+/// useful and a tooltip to be worth reading; short enough that a million
+/// records a day does not become a second body store.
+const PROMPT_PREVIEW_CHARS: usize = 240;
+
+/// Pull a readable excerpt out of a request body, whatever dialect it is.
+///
+/// The three inbound shapes disagree about where the prompt lives:
+/// Chat Completions puts everything in `messages`, the Responses API in
+/// `input` (with the system prompt hoisted to `instructions`), and
+/// Anthropic keeps `system` separate from `messages`. All three are read
+/// here so the console does not have to guess per row.
+///
+/// Prefers the first *user* turn, because that is what the request is
+/// about; falls back to the system prompt, which is better than nothing
+/// for an embeddings or tool-only call.
+pub fn prompt_preview(body: &str) -> Option<String> {
+    let value: Value = serde_json::from_str(body).ok()?;
+    let user = first_turn_text(&value, "user");
+    let text = user.or_else(|| {
+        // No user turn: fall back to whatever framing the caller set.
+        value
+            .get("instructions")
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| system_text(&value))
+            .or_else(|| first_turn_text(&value, "system"))
+    })?;
+    let text = collapse_whitespace(&text);
+    if text.is_empty() {
+        return None;
+    }
+    Some(truncate_chars(&text, PROMPT_PREVIEW_CHARS))
+}
+
+/// Anthropic keeps the system prompt out of `messages`, as either a bare
+/// string or an array of blocks.
+fn system_text(value: &Value) -> Option<String> {
+    match value.get("system")? {
+        Value::String(text) => Some(text.clone()),
+        Value::Array(blocks) => {
+            let joined = blocks
+                .iter()
+                .filter_map(|b| b.get("text").and_then(Value::as_str))
+                .collect::<Vec<_>>()
+                .join(" ");
+            (!joined.is_empty()).then_some(joined)
+        }
+        _ => None,
+    }
+}
+
+/// The text of the first turn with the given role, across `messages`
+/// (Chat Completions, Anthropic) and `input` (Responses).
+fn first_turn_text(value: &Value, role: &str) -> Option<String> {
+    let turns = value
+        .get("messages")
+        .or_else(|| value.get("input"))
+        .and_then(Value::as_array)?;
+    for turn in turns {
+        // A Responses `input` array also carries non-message items
+        // (function_call, reasoning); those have no role and are skipped.
+        if turn.get("role").and_then(Value::as_str) != Some(role) {
+            continue;
+        }
+        let text = match turn.get("content") {
+            Some(Value::String(text)) => text.clone(),
+            Some(Value::Array(parts)) => content_text(parts),
+            _ => continue,
+        };
+        if !text.trim().is_empty() {
+            return Some(text);
+        }
+    }
+    None
+}
+
+/// Text out of a content-part array, naming the attachments it passes.
+///
+/// An attachment is described rather than skipped: a row reading
+/// "[image] what is wrong with this chart?" tells you far more about the
+/// request than the text alone, and a prompt that is *only* an image
+/// would otherwise look empty.
+fn content_text(parts: &[Value]) -> String {
+    let mut out: Vec<String> = Vec::new();
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("text") | Some("input_text") | Some("output_text") => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    out.push(text.to_owned());
+                }
+            }
+            Some("image") | Some("image_url") | Some("input_image") => {
+                out.push("[image]".to_owned())
+            }
+            Some("document") | Some("file") | Some("input_file") => {
+                out.push("[document]".to_owned())
+            }
+            _ => {}
+        }
+    }
+    out.join(" ")
+}
+
+/// Newlines and runs of spaces become single spaces: the preview lands in
+/// a table cell, where a multi-line prompt would break the row height.
+fn collapse_whitespace(text: &str) -> String {
+    text.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Truncate on a character boundary, not a byte one — a prompt is as
+/// likely to be Japanese or to contain an emoji as not.
+fn truncate_chars(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_owned();
+    }
+    let mut out: String = text.chars().take(limit).collect();
+    out.push('…');
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -829,6 +959,11 @@ impl UsageHook {
             overhead_us: self.overhead_us,
             attempts: self.attempts,
             tag: self.tag,
+            // Read from the body we already hold, before it is handed to
+            // the capture queue — and independently of whether capture is
+            // on at all, so the log table shows a prompt even on a
+            // gateway that stores no bodies.
+            prompt: self.input_body.as_deref().and_then(prompt_preview),
         };
         if let Some(events) = &self.events {
             let _ = events.send(serde_json::json!({
@@ -1576,12 +1711,100 @@ impl UsagePipeline {
     }
 }
 
+/// Totals for every request matching a range and filter, not just the
+/// page being displayed.
+///
+/// The console's header used to be computed from the rows it had in hand,
+/// which meant "Requests shown: 200" on a window holding forty thousand —
+/// a number that looked authoritative and answered a question nobody had
+/// asked. These are the real totals for the window.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct RequestsSummary {
+    /// Client requests matching the range and filters.
+    pub requests: u64,
+    /// Of those, the ones that failed (HTTP >= 400).
+    pub errors: u64,
+    /// Upstream calls made to serve them. Higher than `requests` when
+    /// retries or failover were involved, and the gap is the interesting
+    /// part: it is the cost of unhealthy seats.
+    pub attempts: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost_micro_usd: u64,
+    pub p50_latency_ms: u64,
+    pub p95_latency_ms: u64,
+    /// True when the scan hit its ceiling, so the totals are a floor
+    /// rather than the whole window. Never silently exact-looking.
+    pub capped: bool,
+}
+
+/// The most records a summary will scan. A month-wide window on a busy
+/// gateway is millions of rows, and an admin endpoint is not allowed to
+/// spend a minute of CPU on one page load.
+const SUMMARY_SCAN_CAP: usize = 200_000;
+
+impl UsagePipeline {
+    /// Aggregate every matching record in the window.
+    pub fn summary(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+        filter: &HistoryFilter,
+        errors_only: bool,
+    ) -> RequestsSummary {
+        let records = self.collect_page(
+            SUMMARY_SCAN_CAP + 1,
+            since_ms,
+            until_ms,
+            filter,
+            errors_only,
+            None,
+        );
+        let capped = records.len() > SUMMARY_SCAN_CAP;
+        let mut out = RequestsSummary {
+            capped,
+            ..Default::default()
+        };
+        // Latency percentiles need the values, not a running sum. Bounded
+        // by the scan cap above, so this allocation is bounded too.
+        let mut latencies: Vec<u64> = Vec::with_capacity(records.len().min(SUMMARY_SCAN_CAP));
+        for rec in records.iter().take(SUMMARY_SCAN_CAP) {
+            out.requests += 1;
+            if rec.status >= 400 {
+                out.errors += 1;
+            }
+            out.attempts += u64::from(rec.attempts);
+            out.input_tokens += rec.input_tokens;
+            out.output_tokens += rec.output_tokens;
+            out.cached_tokens += rec.cached_tokens;
+            out.cost_micro_usd += rec.cost_micro_usd;
+            latencies.push(rec.latency_ms);
+        }
+        latencies.sort_unstable();
+        out.p50_latency_ms = percentile(&latencies, 50);
+        out.p95_latency_ms = percentile(&latencies, 95);
+        out
+    }
+}
+
+/// Nearest-rank percentile over a sorted slice. Zero for an empty set,
+/// which reads as "no data" rather than a confident zero-millisecond p95.
+fn percentile(sorted: &[u64], p: u64) -> u64 {
+    if sorted.is_empty() {
+        return 0;
+    }
+    let rank = (p as f64 / 100.0 * sorted.len() as f64).ceil() as usize;
+    sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
+}
+
+/// for data only the drawer ever opens.
 /// A request's bodies, stored apart from its metadata.
 ///
 /// Its own stream, keyed by request id: a log listing reads metadata for
 /// hundreds of requests and needs none of this, and bodies are two
 /// orders of magnitude larger. Mixing them would make every listing pay
-/// for data only the drawer ever opens.
+/// for a payload it does not read.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestBodies {
     pub request_id: String,
@@ -1978,6 +2201,115 @@ pub fn write_rollups_for_test(dir: &std::path::Path, node: &str, seq: u64, batch
 }
 
 #[cfg(test)]
+mod prompt_tests {
+    use super::{RequestsSummary, percentile, prompt_preview};
+    use serde_json::json;
+
+    #[test]
+    fn chat_completions_prefers_the_first_user_turn() {
+        let body = json!({
+            "messages": [
+                {"role": "system", "content": "Be terse."},
+                {"role": "user", "content": "what is the capital of France?"},
+                {"role": "user", "content": "and of Spain?"},
+            ]
+        })
+        .to_string();
+        assert_eq!(
+            prompt_preview(&body).as_deref(),
+            Some("what is the capital of France?")
+        );
+    }
+
+    #[test]
+    fn anthropic_system_is_outside_messages() {
+        // No user turn at all, so the system prompt is the only thing to
+        // show — and Anthropic keeps it in its own field.
+        let body = json!({"system": "You are a linter.", "messages": []}).to_string();
+        assert_eq!(prompt_preview(&body).as_deref(), Some("You are a linter."));
+    }
+
+    #[test]
+    fn responses_instructions_are_the_fallback() {
+        let body = json!({"instructions": "You are Codex.", "input": []}).to_string();
+        assert_eq!(prompt_preview(&body).as_deref(), Some("You are Codex."));
+    }
+
+    #[test]
+    fn attachments_are_named_rather_than_dropped() {
+        // A prompt that is only an attachment would otherwise read as
+        // empty, which is exactly the request worth spotting in a log.
+        let body = json!({
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is wrong here?"},
+                {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAA"}},
+                {"type": "file", "file": {"filename": "chart.pdf"}},
+            ]}]
+        })
+        .to_string();
+        assert_eq!(
+            prompt_preview(&body).as_deref(),
+            Some("what is wrong here? [image] [document]")
+        );
+    }
+
+    #[test]
+    fn responses_skips_non_message_items() {
+        // A Responses `input` array carries function_call items with no
+        // role; walking them as turns would read `arguments` as a prompt.
+        let body = json!({"input": [
+            {"type": "function_call", "name": "shell", "arguments": "{}"},
+            {"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hello"}]},
+        ]})
+        .to_string();
+        assert_eq!(prompt_preview(&body).as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn newlines_collapse_so_a_row_stays_one_line() {
+        let body = json!({"messages": [{"role": "user", "content": "a\n\n   b\tc"}]}).to_string();
+        assert_eq!(prompt_preview(&body).as_deref(), Some("a b c"));
+    }
+
+    #[test]
+    fn truncation_lands_on_a_character_not_a_byte() {
+        let long = "\u{1f600}".repeat(400);
+        let body = json!({"messages": [{"role": "user", "content": long}]}).to_string();
+        let preview = prompt_preview(&body).expect("a preview");
+        assert_eq!(preview.chars().count(), 241, "240 chars plus the ellipsis");
+        assert!(preview.ends_with('\u{2026}'));
+    }
+
+    #[test]
+    fn a_body_that_is_not_json_yields_nothing() {
+        assert!(prompt_preview("not json at all").is_none());
+        assert!(prompt_preview("{}").is_none());
+    }
+
+    #[test]
+    fn an_empty_prompt_is_none_not_an_empty_string() {
+        let body = json!({"messages": [{"role": "user", "content": "   "}]}).to_string();
+        assert!(prompt_preview(&body).is_none());
+    }
+
+    #[test]
+    fn percentiles_are_nearest_rank_and_safe_when_empty() {
+        let values: Vec<u64> = (1..=100).collect();
+        assert_eq!(percentile(&values, 50), 50);
+        assert_eq!(percentile(&values, 95), 95);
+        assert_eq!(percentile(&[], 95), 0, "no data is 0, not a panic");
+        assert_eq!(percentile(&[7], 95), 7);
+    }
+
+    #[test]
+    fn a_default_summary_is_all_zero() {
+        let s = RequestsSummary::default();
+        assert_eq!(s.requests, 0);
+        assert!(!s.capped);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -2006,6 +2338,7 @@ mod tests {
             overhead_us: 10,
             attempts: 1,
             tag: None,
+            prompt: None,
         }
     }
 
@@ -2263,6 +2596,7 @@ mod tests {
             overhead_us: 8,
             attempts: 1,
             tag: None,
+            prompt: None,
         };
         let now: u64 = 200 * 60_000;
         agg.record(&rec(now, "openai", Some("k1"), 500));
@@ -2306,6 +2640,7 @@ mod tests {
             overhead_us: 1,
             attempts: 1,
             tag: None,
+            prompt: None,
         };
         let old = now.saturating_sub(90 * 86_400_000);
         write_batch(

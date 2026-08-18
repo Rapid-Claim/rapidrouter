@@ -26,6 +26,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/keys/{id}/rotate", post(rotate_key))
         .route("/usage", get(usage))
         .route("/requests", get(requests))
+        .route("/requests/summary", get(requests_summary))
         .route("/requests/{id}/bodies", get(request_bodies))
         .route("/providers", get(providers).post(create_provider))
         .route(
@@ -684,6 +685,30 @@ async fn requests(
         "next": next.map(|(ts, id)| format!("{ts}:{id}")),
     }))
     .into_response()
+}
+
+/// Totals for the whole window, so the console header describes the
+/// selected range rather than the page it happens to be showing.
+///
+/// Takes exactly the same filters as `/requests`, so the two can never
+/// disagree about what is being counted.
+async fn requests_summary(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RequestsQuery>,
+) -> Response {
+    let now = crate::vkey::unix_now_ms();
+    let since = query
+        .since_ms
+        .unwrap_or_else(|| now.saturating_sub(3_600_000));
+    let filter = crate::usage::HistoryFilter {
+        provider: query.provider.clone().filter(|v| !v.is_empty()),
+        model: query.model.clone().filter(|v| !v.is_empty()),
+        vkey: query.key.clone().filter(|v| !v.is_empty()),
+    };
+    let summary = state
+        .usage
+        .summary(since, query.until_ms.unwrap_or(now), &filter, query.errors);
+    Json(summary).into_response()
 }
 
 #[derive(Deserialize)]
