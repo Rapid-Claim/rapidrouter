@@ -635,7 +635,7 @@ mod tests {
         assert_eq!(built.body["instructions"], "You are helpful.");
         assert_eq!(built.body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(built.body["input"][0]["content"][0]["text"], "hello");
-        assert_eq!(built.body["reasoning"]["effort"], "low");
+        assert_eq!(built.body["reasoning"]["effort"], "xhigh");
         assert_eq!(built.body["text"]["verbosity"], "low");
         assert!(
             built.body.get("max_output_tokens").is_none(),
@@ -656,10 +656,10 @@ mod tests {
     #[test]
     fn a_caller_can_raise_the_reasoning_floor() {
         let mut req = request(vec![message("user", "hi")]);
-        req.extra.insert("reasoning_effort".into(), json!("high"));
+        req.extra.insert("reasoning_effort".into(), json!("max"));
         req.extra.insert("verbosity".into(), json!("high"));
         let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
-        assert_eq!(built.body["reasoning"]["effort"], "high");
+        assert_eq!(built.body["reasoning"]["effort"], "max");
         assert_eq!(built.body["text"]["verbosity"], "high");
         assert!(
             !built.dropped_params.iter().any(|p| p == "reasoning_effort"),

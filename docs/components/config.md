@@ -44,11 +44,19 @@ api_version = "2024-10-21"
 [providers.azure.deployments]
 "gpt-4o" = "my-gpt4o-deployment"
 
-[aliases]
-fast  = "groq/llama-3.3-70b-versatile"
+[groups.fast]                   # a routing group: one model id, two pools
+primary = [                     # live traffic, split by weight (75 / 25)
+  { target = "groq/llama-3.3-70b-versatile", weight = 3 },
+  { target = "openai/gpt-4o-mini",           weight = 1 },
+]
+fallback = [                    # reserve; reached only when primary is out
+  { target = "anthropic/claude-sonnet-4-5" },
+]
+
+[aliases]                       # legacy: one name, one target
 smart = "anthropic/claude-sonnet-4-5"
 
-[fallbacks]
+[fallbacks]                     # legacy: an unweighted chain per target
 "openai/gpt-4o" = ["azure/gpt-4o", "anthropic/claude-sonnet-4-5"]
 
 [reliability.breaker]
@@ -98,14 +106,16 @@ enabled     = true
   cerebras, openrouter, ollama, vllm, …) pre-fill base URL, auth style, and
   parameter quirks; everything is overridable.
 - **Validation is total at load**: unknown fields, non-positive weights,
-  empty key lists, alias cycles, fallback targets that don't exist,
+  empty key lists, alias cycles, fallback and routing-group targets that
+  don't exist, a group name that collides with a provider or alias, a group
+  with no primary pool,
   deployment maps missing models — all rejected before the port binds, with
   pathed messages (`providers.groq.keys[0].weight: must be > 0`).
   `rapid-router check <file>` runs the same validation standalone for CI.
 - **Virtual keys carry hashes, never secrets.** A `[[virtual_keys]]` entry
   is validated like everything else: the id must be six hex characters, the
   hash must be `blake3:` plus 64 hex characters, and every scope entry must
-  name a configured provider or alias. Managed-mode keys live in the store
+  name a configured provider, routing group, or alias. Managed-mode keys live in the store
   instead and win over a file entry with the same id, because rotation
   state lives there. See
   [virtual-keys.md](virtual-keys.md).

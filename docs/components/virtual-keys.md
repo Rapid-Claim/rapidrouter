@@ -32,7 +32,7 @@ ck-9f3a2c-Vv8kJq0R2mX7pT4wN6bY1sD5
 name        = "checkout-service"
 id          = "9f3a2c"
 secret_hash = "blake3:…"
-models      = ["openai/gpt-4o-mini", "smart", "fast"]   # models and/or aliases
+models      = ["openai/gpt-4o-mini", "smart", "fast"]   # models, groups, or aliases
 budget      = { usd = 250, period = "monthly" }
 rate_limit  = { rpm = 600, tpm = 400_000 }
 expires     = "2027-01-01T00:00:00Z"                     # optional
@@ -40,8 +40,9 @@ tags        = { team = "payments" }
 enabled     = true
 ```
 
-- **Scope** is an allowlist of models and/or aliases (aliases keep scopes
-  stable while you repoint targets). No scope = all configured models.
+- **Scope** is an allowlist of models, routing groups, and/or aliases (a
+  group or alias keeps the scope stable while you repoint what is behind
+  it). No scope = all configured models.
 - **Budget** is spend per period, priced from provider-reported usage.
 - **Rate limits** are requests/min and tokens/min (input + output;
   provider-cached tokens excluded).

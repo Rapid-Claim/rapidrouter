@@ -22,7 +22,7 @@ has a versioned, precise answer.
 | `POST /v1/responses` | relay to OpenAI/Azure; translate (stateless) elsewhere | See below |
 | `POST /v1/embeddings` | translate/relay | |
 | `POST /v1/completions` | translate/relay | Legacy text completions |
-| `GET  /v1/models` | local | Catalog assembled from config: models, aliases, capabilities |
+| `GET  /v1/models` | local | Catalog assembled from config: models, routing groups, aliases, capabilities |
 | `ANY  /passthrough/{provider}/{path…}` | passthrough | The escape hatch — new provider features work the day they ship |
 | `GET  /health`, `GET /metrics` | local | Liveness · Prometheus |
 | `/console`, `/admin/api/*` | local | Embedded web console + admin API — present only when admin keys are configured ([../components/console.md](../components/console.md)) |

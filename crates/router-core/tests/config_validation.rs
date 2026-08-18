@@ -511,7 +511,7 @@ fn virtual_key_scope_must_name_known_provider_or_alias() {
         &vk_block("models = [\"bare-model\"]\n"),
         &[],
         "virtual_keys[0].models[0]",
-        "not a configured alias",
+        "not a configured routing group or alias",
     );
 }
 
@@ -616,4 +616,195 @@ fn store_refs_resolve_through_the_source() {
         "providers.openai.keys[0].value",
         "store secret `missing` is not set",
     );
+}
+
+// --------------------------------------------------------- routing groups
+
+const TWO_PROVIDERS: &str = r#"
+[providers.openai]
+keys = [{ name = "a", value = "k", models = ["gpt-4o-mini"] }]
+
+[providers.groq]
+keys = [{ name = "a", value = "k", models = ["llama-3.3-70b"] }]
+"#;
+
+#[test]
+fn routing_group_resolves_both_pools() {
+    let config = load(
+        &format!(
+            r#"{TWO_PROVIDERS}
+[groups.fast]
+primary = [
+  {{ target = "openai/gpt-4o-mini", weight = 3 }},
+  {{ target = "groq/llama-3.3-70b", weight = 1 }},
+]
+fallback = [{{ target = "groq/llama-3.3-70b" }}]
+"#
+        ),
+        &[],
+    )
+    .expect("valid group config");
+
+    let group = &config.groups["fast"];
+    assert_eq!(group.primary.len(), 2);
+    assert_eq!(group.primary[0].target.to_string(), "openai/gpt-4o-mini");
+    assert_eq!(group.primary[0].weight, 3.0);
+    // An omitted weight is an equal share, not zero.
+    assert_eq!(group.fallback[0].weight, 1.0);
+}
+
+#[test]
+fn routing_group_resolves_alias_targets() {
+    let config = load(
+        &format!(
+            r#"{TWO_PROVIDERS}
+[aliases]
+cheap = "groq/llama-3.3-70b"
+
+[groups.fast]
+primary = [{{ target = "cheap" }}]
+"#
+        ),
+        &[],
+    )
+    .expect("alias target is a valid group member");
+    assert_eq!(
+        config.groups["fast"].primary[0].target.to_string(),
+        "groq/llama-3.3-70b"
+    );
+}
+
+#[test]
+fn routing_group_without_primary_rejected() {
+    assert_invalid(
+        &format!("{TWO_PROVIDERS}\n[groups.fast]\nfallback = [{{ target = \"openai/gpt-4o-mini\" }}]\n"),
+        &[],
+        "groups.fast.primary",
+        "at least one primary model",
+    );
+}
+
+#[test]
+fn routing_group_zero_weight_rejected() {
+    assert_invalid(
+        &format!(
+            "{TWO_PROVIDERS}\n[groups.fast]\nprimary = [{{ target = \"openai/gpt-4o-mini\", weight = 0 }}]\n"
+        ),
+        &[],
+        "groups.fast.primary[0].weight",
+        "> 0",
+    );
+}
+
+#[test]
+fn routing_group_unknown_target_rejected() {
+    assert_invalid(
+        &format!("{TWO_PROVIDERS}\n[groups.fast]\nprimary = [{{ target = \"nope/model\" }}]\n"),
+        &[],
+        "groups.fast.primary[0].target",
+        "unknown provider",
+    );
+}
+
+#[test]
+fn routing_group_duplicate_target_in_pool_rejected() {
+    assert_invalid(
+        &format!(
+            r#"{TWO_PROVIDERS}
+[groups.fast]
+primary = [
+  {{ target = "openai/gpt-4o-mini" }},
+  {{ target = "openai/gpt-4o-mini", weight = 2 }},
+]
+"#
+        ),
+        &[],
+        "groups.fast.primary[1].target",
+        "already in this group's primary pool",
+    );
+}
+
+#[test]
+fn routing_group_may_repeat_a_primary_model_as_fallback() {
+    // The pools are separate questions: a model can carry live traffic
+    // and also be the thing another provider's failure falls back to.
+    let config = load(
+        &format!(
+            r#"{TWO_PROVIDERS}
+[groups.fast]
+primary = [{{ target = "openai/gpt-4o-mini" }}]
+fallback = [{{ target = "openai/gpt-4o-mini" }}]
+"#
+        ),
+        &[],
+    )
+    .expect("same target in both pools is allowed");
+    assert_eq!(config.groups["fast"].fallback.len(), 1);
+}
+
+#[test]
+fn routing_group_naming_a_group_rejected() {
+    assert_invalid(
+        &format!(
+            r#"{TWO_PROVIDERS}
+[groups.fast]
+primary = [{{ target = "openai/gpt-4o-mini" }}]
+
+[groups.nested]
+primary = [{{ target = "fast" }}]
+"#
+        ),
+        &[],
+        "groups.nested.primary[0].target",
+        "is a routing group",
+    );
+}
+
+#[test]
+fn routing_group_colliding_with_alias_rejected() {
+    assert_invalid(
+        &format!(
+            r#"{TWO_PROVIDERS}
+[aliases]
+fast = "groq/llama-3.3-70b"
+
+[groups.fast]
+primary = [{{ target = "openai/gpt-4o-mini" }}]
+"#
+        ),
+        &[],
+        "groups.fast",
+        "collides with an alias",
+    );
+}
+
+#[test]
+fn routing_group_colliding_with_provider_rejected() {
+    assert_invalid(
+        &format!("{TWO_PROVIDERS}\n[groups.openai]\nprimary = [{{ target = \"openai/gpt-4o-mini\" }}]\n"),
+        &[],
+        "groups.openai",
+        "collides with a provider name",
+    );
+}
+
+#[test]
+fn virtual_key_may_scope_to_a_routing_group() {
+    load(
+        &format!(
+            r#"{TWO_PROVIDERS}
+[groups.fast]
+primary = [{{ target = "openai/gpt-4o-mini" }}]
+
+[[virtual_keys]]
+name = "team"
+id = "a1b2c3"
+secret_hash = "blake3:{}"
+models = ["fast"]
+"#,
+            "0".repeat(64)
+        ),
+        &[],
+    )
+    .expect("a group is a scopable model id");
 }

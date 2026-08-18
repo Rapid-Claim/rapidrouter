@@ -63,6 +63,8 @@ pub struct Config {
     pub aliases: BTreeMap<String, TargetModel>,
     /// Fully resolved fallback chains.
     pub fallbacks: BTreeMap<TargetModel, Vec<TargetModel>>,
+    /// Routing groups by name, each a weighted primary and fallback pool.
+    pub groups: BTreeMap<String, RoutingGroup>,
     pub reliability: Reliability,
     /// File-declared virtual keys; managed mode appends store-held keys.
     pub virtual_keys: Vec<crate::vkey::VirtualKeyDef>,
@@ -287,7 +289,7 @@ impl Default for CodexSettings {
     fn default() -> Self {
         Self {
             version: "0.146.0".into(),
-            reasoning_effort: Some("low".into()),
+            reasoning_effort: Some("xhigh".into()),
             verbosity: Some("low".into()),
             pdf_dpi: 150,
             pdf_max_pages: 50,
@@ -383,6 +385,35 @@ impl fmt::Display for TargetModel {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.provider, self.model)
     }
+}
+
+/// A named pool of models callers reach by sending the group's name as
+/// the model id.
+///
+/// The two pools answer different questions. `primary` is a *split*: the
+/// gateway picks one of its members per request, in proportion to weight,
+/// so weights are how traffic is apportioned across providers. `fallback`
+/// is a *reserve*: nothing in it serves traffic while any primary member
+/// can, and its weights only decide the order in which the reserve is
+/// drawn on.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct RoutingGroup {
+    pub primary: Vec<WeightedTarget>,
+    pub fallback: Vec<WeightedTarget>,
+}
+
+impl RoutingGroup {
+    /// Every target in the group, primary first — for the surfaces that
+    /// only need to know which models a group can reach.
+    pub fn targets(&self) -> impl Iterator<Item = &TargetModel> {
+        self.primary.iter().chain(&self.fallback).map(|w| &w.target)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct WeightedTarget {
+    pub target: TargetModel,
+    pub weight: f64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

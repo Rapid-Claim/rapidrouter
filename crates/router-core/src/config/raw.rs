@@ -13,6 +13,9 @@ pub struct RawConfig {
     pub providers: BTreeMap<String, RawProvider>,
     pub aliases: BTreeMap<String, String>,
     pub fallbacks: BTreeMap<String, Vec<String>>,
+    /// Routing groups: a name callers send as the model id, backed by a
+    /// weighted primary pool and a weighted fallback pool.
+    pub groups: BTreeMap<String, RawGroup>,
     pub reliability: RawReliability,
     /// File-mode virtual keys (hash form) — GitOps shops declare them
     /// here; managed mode keeps them in the store instead.
@@ -48,6 +51,29 @@ impl Default for RawServer {
             drain_timeout_secs: 30,
         }
     }
+}
+
+/// One routing group as written.
+///
+/// Two pools, not one ordered chain: everything in `primary` serves live
+/// traffic in proportion to its weight, and `fallback` is only reached
+/// once the primary pool has nothing left to try.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RawGroup {
+    pub primary: Vec<RawGroupTarget>,
+    pub fallback: Vec<RawGroupTarget>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawGroupTarget {
+    /// `provider/model`, or an alias that resolves to one.
+    pub target: String,
+    /// Share of the pool's traffic, relative to its siblings. Weights are
+    /// ratios, not percentages — `3` next to `1` is 75/25.
+    #[serde(default = "default_weight")]
+    pub weight: f64,
 }
 
 #[derive(Debug, Deserialize)]

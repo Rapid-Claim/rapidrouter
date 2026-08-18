@@ -8,8 +8,8 @@ use super::presets::preset;
 use super::raw::{RawConfig, RawProvider};
 use super::{
     ApiKey, AuthMode, AzureSettings, BedrockSettings, Breaker, CodexSettings, Config, ConfigError,
-    Provider, ProviderKind, Reliability, Retries, RetryOn, ServerConfig, TargetModel,
-    VertexSettings,
+    Provider, ProviderKind, Reliability, Retries, RetryOn, RoutingGroup, ServerConfig, TargetModel,
+    VertexSettings, WeightedTarget,
 };
 use crate::secret::SecretString;
 
@@ -32,8 +32,9 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
     let providers = validate_providers(&raw, env, &mut errors);
     let aliases = validate_aliases(&raw, &providers, &mut errors);
     let fallbacks = validate_fallbacks(&raw, &providers, &aliases, &mut errors);
+    let groups = validate_groups(&raw, &providers, &aliases, &mut errors);
     let reliability = validate_reliability(&raw, &mut errors);
-    let virtual_keys = validate_virtual_keys(&raw, &providers, &aliases, &mut errors);
+    let virtual_keys = validate_virtual_keys(&raw, &providers, &aliases, &groups, &mut errors);
     let console = validate_console(&raw, env, &mut errors);
     let store = validate_store(&raw, &mut errors);
     let usage = validate_usage(&raw, &mut errors);
@@ -45,6 +46,7 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
             providers,
             aliases,
             fallbacks,
+            groups,
             reliability,
             virtual_keys,
             console,
@@ -90,6 +92,7 @@ fn validate_virtual_keys(
     raw: &RawConfig,
     providers: &BTreeMap<String, Provider>,
     aliases: &BTreeMap<String, TargetModel>,
+    groups: &BTreeMap<String, RoutingGroup>,
     errors: &mut Vec<ConfigError>,
 ) -> Vec<crate::vkey::VirtualKeyDef> {
     use crate::vkey;
@@ -136,10 +139,10 @@ fn validate_virtual_keys(
                         format!("unknown provider `{provider}`"),
                     ));
                 }
-            } else if !aliases.contains_key(scope) {
+            } else if !aliases.contains_key(scope) && !groups.contains_key(scope) {
                 errors.push(ConfigError::new(
                     scope_path,
-                    format!("`{scope}` is not a configured alias (use `provider/model` to scope to a model)"),
+                    format!("`{scope}` is not a configured routing group or alias (use `provider/model` to scope to a model)"),
                 ));
             }
         }
@@ -906,31 +909,7 @@ fn validate_fallbacks(
 ) -> BTreeMap<TargetModel, Vec<TargetModel>> {
     let mut resolved = BTreeMap::new();
     let resolve = |s: &str, path: String, errors: &mut Vec<ConfigError>| -> Option<TargetModel> {
-        if let Some(target) = aliases.get(s) {
-            return Some(target.clone());
-        }
-        match TargetModel::parse(s) {
-            Some(t)
-                if providers.contains_key(&t.provider)
-                    || raw.providers.contains_key(&t.provider) =>
-            {
-                Some(t)
-            }
-            Some(t) => {
-                errors.push(ConfigError::new(
-                    path,
-                    format!("unknown provider `{}`", t.provider),
-                ));
-                None
-            }
-            None => {
-                errors.push(ConfigError::new(
-                    path,
-                    format!("`{s}` is not `provider/model` or a defined alias"),
-                ));
-                None
-            }
-        }
+        resolve_target_ref(s, raw, providers, aliases, &path, errors)
     };
 
     for (from, chain) in &raw.fallbacks {
@@ -958,6 +937,143 @@ fn validate_fallbacks(
             }
         }
         resolved.insert(from_target, targets);
+    }
+    resolved
+}
+
+/// Resolve one `provider/model` (or alias) reference written in a routing
+/// section, reporting under `path` when it names nothing real.
+fn resolve_target_ref(
+    s: &str,
+    raw: &RawConfig,
+    providers: &BTreeMap<String, Provider>,
+    aliases: &BTreeMap<String, TargetModel>,
+    path: &str,
+    errors: &mut Vec<ConfigError>,
+) -> Option<TargetModel> {
+    if let Some(target) = aliases.get(s) {
+        return Some(target.clone());
+    }
+    match TargetModel::parse(s) {
+        Some(t)
+            if providers.contains_key(&t.provider) || raw.providers.contains_key(&t.provider) =>
+        {
+            Some(t)
+        }
+        Some(t) => {
+            errors.push(ConfigError::new(
+                path,
+                format!("unknown provider `{}`", t.provider),
+            ));
+            None
+        }
+        None => {
+            errors.push(ConfigError::new(
+                path,
+                format!("`{s}` is not `provider/model` or a defined alias"),
+            ));
+            None
+        }
+    }
+}
+
+/// Routing groups: a caller-facing name over two weighted pools.
+///
+/// Deliberately flat — a group's targets are models, never other groups.
+/// Nesting would buy nothing that a longer pool does not already express,
+/// and would put a cycle check on the hot resolution path.
+fn validate_groups(
+    raw: &RawConfig,
+    providers: &BTreeMap<String, Provider>,
+    aliases: &BTreeMap<String, TargetModel>,
+    errors: &mut Vec<ConfigError>,
+) -> BTreeMap<String, RoutingGroup> {
+    let mut resolved = BTreeMap::new();
+    for (name, group) in &raw.groups {
+        let path = format!("groups.{name}");
+        if name.is_empty() {
+            errors.push(ConfigError::new(path, "group name must not be empty"));
+            continue;
+        }
+        // A group name is a model id callers send. Anything else that
+        // answers to the same string would make routing depend on which
+        // table wins, so the collision is the error.
+        if raw.providers.contains_key(name) {
+            errors.push(ConfigError::new(
+                path,
+                "group name collides with a provider name",
+            ));
+            continue;
+        }
+        if aliases.contains_key(name) {
+            errors.push(ConfigError::new(
+                path,
+                "group name collides with an alias; delete the alias or rename the group",
+            ));
+            continue;
+        }
+        if group.primary.is_empty() {
+            errors.push(ConfigError::new(
+                format!("{path}.primary"),
+                "a group needs at least one primary model",
+            ));
+            continue;
+        }
+
+        let mut pools = Vec::new();
+        for (label, raw_pool) in [("primary", &group.primary), ("fallback", &group.fallback)] {
+            let mut pool: Vec<WeightedTarget> = Vec::new();
+            for (i, entry) in raw_pool.iter().enumerate() {
+                let entry_path = format!("{path}.{label}[{i}]");
+                if !(entry.weight.is_finite() && entry.weight > 0.0) {
+                    errors.push(ConfigError::new(
+                        format!("{entry_path}.weight"),
+                        "must be a finite number > 0",
+                    ));
+                    continue;
+                }
+                if raw.groups.contains_key(&entry.target) {
+                    errors.push(ConfigError::new(
+                        format!("{entry_path}.target"),
+                        format!(
+                            "`{}` is a routing group; a group's targets must be models",
+                            entry.target
+                        ),
+                    ));
+                    continue;
+                }
+                let Some(target) = resolve_target_ref(
+                    &entry.target,
+                    raw,
+                    providers,
+                    aliases,
+                    &format!("{entry_path}.target"),
+                    errors,
+                ) else {
+                    continue;
+                };
+                if pool.iter().any(|w| w.target == target) {
+                    errors.push(ConfigError::new(
+                        format!("{entry_path}.target"),
+                        format!("`{target}` is already in this group's {label} pool"),
+                    ));
+                    continue;
+                }
+                pool.push(WeightedTarget {
+                    target,
+                    weight: entry.weight,
+                });
+            }
+            pools.push(pool);
+        }
+        let fallback = pools.pop().expect("two pools pushed");
+        let primary = pools.pop().expect("two pools pushed");
+        // Everything in `primary` was rejected: the group would resolve
+        // to its reserve on every request, which is not what was written.
+        if primary.is_empty() {
+            continue;
+        }
+        resolved.insert(name.clone(), RoutingGroup { primary, fallback });
     }
     resolved
 }
