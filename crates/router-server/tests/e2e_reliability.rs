@@ -346,3 +346,99 @@ keys = [{{ name = "k{i}", value = "sk-{i}" }}]
         worker.await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn routing_group_splits_primary_traffic_by_weight() {
+    let gw = gateway_with(|mock| {
+        format!(
+            r#"
+[providers.openai]
+base_url = "{base}"
+keys = [{{ name = "k", value = "sk" }}]
+
+[groups.fast]
+primary = [
+  {{ target = "openai/heavy", weight = 9 }},
+  {{ target = "openai/light", weight = 1 }},
+]
+"#,
+            base = mock.base_url()
+        )
+    })
+    .await;
+
+    for _ in 0..200 {
+        let res = chat(&gw, json!({"model": "fast", "messages": []})).await;
+        assert_eq!(res.status(), 200);
+    }
+    let heavy = gw
+        .mock
+        .requests()
+        .iter()
+        .filter(|r| r.body["model"] == "heavy")
+        .count();
+    // 9:1 over 200 draws. A wide band — this is asserting the split
+    // exists and points the right way, not the RNG's exact quality.
+    assert!(
+        (140..200).contains(&heavy),
+        "expected ~180 of 200 on the weight-9 model, got {heavy}"
+    );
+}
+
+#[tokio::test]
+async fn routing_group_exhausts_primary_pool_before_fallback() {
+    // Two providers over one mock, told apart by the credential each
+    // presents: both primaries fail, so the reserve must serve, and it
+    // must not be reached until neither primary has anything left.
+    let gw = gateway_with(|mock| {
+        format!(
+            r#"
+[providers.openai]
+base_url = "{base}"
+keys = [{{ name = "k", value = "sk-one" }}]
+
+[providers.alt]
+type = "openai_compat"
+base_url = "{base}"
+keys = [{{ name = "k", value = "sk-two" }}]
+
+[groups.fast]
+primary = [
+  {{ target = "openai/err-500", weight = 5 }},
+  {{ target = "alt/err-500", weight = 5 }},
+]
+fallback = [{{ target = "openai/gpt-4o" }}]
+
+[reliability.retries]
+max_attempts = 1
+"#,
+            base = mock.base_url()
+        )
+    })
+    .await;
+
+    let res = chat(&gw, json!({"model": "fast", "messages": []})).await;
+    assert_eq!(res.status(), 200);
+    assert_eq!(res.headers()["x-rapid-model"], "gpt-4o");
+
+    let requests = gw.mock.requests();
+    let models: Vec<&str> = requests
+        .iter()
+        .map(|r| r.body["model"].as_str().unwrap())
+        .collect();
+    assert_eq!(
+        models,
+        vec!["err-500", "err-500", "gpt-4o"],
+        "both primaries, then the reserve"
+    );
+    let mut credentials: Vec<String> = requests[..2]
+        .iter()
+        .map(|r| r.authorization.clone().unwrap())
+        .collect();
+    credentials.sort();
+    assert_eq!(
+        credentials,
+        vec!["Bearer sk-one", "Bearer sk-two"],
+        "each primary was tried once, not one of them twice"
+    );
+}

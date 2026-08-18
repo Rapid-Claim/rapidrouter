@@ -2113,6 +2113,22 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
             "owned_by": target.provider,
         }));
     }
+    // A group is a model id a caller can send, so it belongs in the
+    // catalog. It is owned by whichever providers back it, which is not
+    // one name — the primary pool's providers, deduped and in order.
+    for (name, group) in table.groups() {
+        let mut owners: Vec<&str> = Vec::new();
+        for target in group.primary.iter().map(|w| &w.target) {
+            if !owners.contains(&target.provider.as_str()) {
+                owners.push(&target.provider);
+            }
+        }
+        data.push(serde_json::json!({
+            "id": name,
+            "object": "model",
+            "owned_by": owners.join(","),
+        }));
+    }
     axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
 }
 

@@ -360,7 +360,10 @@ main {
   border-radius: var(--radius-small);
   transition: color 120ms ease, background-color 120ms ease;
 }
-.segmented button:hover { background: var(--hover); color: var(--title); }
+.segmented button:hover:not(:disabled) { background: var(--hover); color: var(--title); }
+/* Kept in the layout rather than removed, so the row does not reflow
+   when the other tab has nothing to render. */
+.segmented button:disabled { opacity: 0.4; cursor: not-allowed; }
 .segmented button[aria-pressed="true"] { background: var(--surface); color: var(--text); font-weight: 600; box-shadow: 0 1px 2px rgb(0 0 0 / 25%), inset 0 0 0 1px var(--border); }
 
 /* A label is a caption line, then the control. As a flex column, the
@@ -1009,7 +1012,11 @@ kbd {
 }
 .drawer-title p { color: var(--muted); font-size: 11.5px; margin-top: 3px; }
 .drawer-actions { display: flex; align-items: center; gap: 6px; }
-.drawer-body { padding: 18px; overflow-y: auto; flex: 1; }
+/* The gutter is reserved whether or not it is needed: a long input
+   transcript scrolls and a short output does not, so without this the
+   scrollbar appears and disappears as the tabs are switched and every
+   right-aligned control jumps sideways by its width. */
+.drawer-body { padding: 18px; overflow-y: auto; scrollbar-gutter: stable; flex: 1; }
 .drawer-section { margin-bottom: 22px; }
 .drawer-section:last-child { margin-bottom: 0; }
 
@@ -1039,6 +1046,30 @@ kbd {
 .route-editor code { overflow: hidden; text-overflow: ellipsis; }
 .route-controls { display: flex; gap: 2px; }
 .route-controls .icon-button { width: 24px; height: 24px; }
+
+/* A weighted pool: model, the weight you type, and the share it works
+   out to. The share is the point of the row, so it is given a fixed
+   column of its own rather than left to wrap after the input. */
+.route-editor.weighted li { grid-template-columns: minmax(0, 1fr) 72px 52px auto; }
+.weight-field { display: flex; }
+.weight-field input {
+  width: 100%;
+  padding: 3px 6px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.weight-field input[aria-invalid="true"] { border-color: var(--danger); }
+.route-share {
+  color: var(--muted);
+  font-size: 11px;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.pill .route-share { margin-left: 5px; opacity: 0.75; }
+
+.pool-head { margin: 14px 0 8px; }
+.pool-head h3 { margin: 0; font-size: 12px; letter-spacing: 0.02em; }
+.pool-head p { margin: 3px 0 0; font-size: 11px; }
 
 .suggestions { display: flex; flex-wrap: wrap; gap: 5px; margin-top: 6px; }
 .suggestions .pill { border: 1px solid var(--border-soft); cursor: pointer; }
@@ -1458,7 +1489,7 @@ table.dense small.danger { color: var(--danger); }
 .body-controls { display: flex; gap: 8px; flex-wrap: wrap; }
 
 /* --- transcript --- */
-.transcript { display: flex; flex-direction: column; gap: 10px; }
+.transcript { display: flex; flex-direction: column; gap: 12px; }
 .tool-declarations {
   display: flex;
   align-items: baseline;
@@ -1475,19 +1506,20 @@ table.dense small.danger { color: var(--danger); }
   color: var(--muted);
 }
 
+/* A transcript reads as prose, not as a stack of cards. Boxing every
+   turn and colour-coding its left edge made a long conversation look
+   like a form; the role label already says who is speaking, and one
+   hairline between turns is enough to separate them. */
 .turn {
-  border: 1px solid var(--border-soft);
-  border-left: 2px solid var(--border-soft);
-  border-radius: 8px;
-  padding: 10px 12px;
-  background: var(--surface);
+  border: 0;
+  border-radius: 0;
+  padding: 0;
+  background: none;
 }
-/* The left edge carries the role, so a long transcript is scannable
-   without reading a single label. */
-.turn-system, .turn-developer { border-left-color: var(--muted); }
-.turn-user { border-left-color: var(--accent); }
-.turn-assistant { border-left-color: var(--success); }
-.turn-tool { border-left-color: var(--accent-line); background: var(--surface-2); }
+.turn + .turn {
+  border-top: 1px solid var(--border-soft);
+  padding-top: 12px;
+}
 .turn > header {
   display: flex;
   justify-content: space-between;

@@ -77,3 +77,100 @@ proptest! {
         }
     }
 }
+
+/// A routing group over `n` single-model providers, weighted as given.
+fn group_table(primary: &[f64], fallback: &[f64]) -> RoutingTable {
+    let mut toml = String::new();
+    for i in 0..primary.len() + fallback.len() {
+        toml.push_str(&format!(
+            "[providers.p{i}]\ntype = \"openai_compat\"\nbase_url = \"http://127.0.0.1:1/v1\"\n\
+             keys = [{{ name = \"k\", value = \"sk\", models = [\"m\"] }}]\n"
+        ));
+    }
+    let pool = |offset: usize, weights: &[f64]| {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(i, w)| format!("{{ target = \"p{}/m\", weight = {w} }}", i + offset))
+            .collect::<Vec<_>>()
+            .join(", ")
+    };
+    toml.push_str(&format!(
+        "[groups.fast]\nprimary = [{}]\n",
+        pool(0, primary)
+    ));
+    if !fallback.is_empty() {
+        toml.push_str(&format!(
+            "fallback = [{}]\n",
+            pool(primary.len(), fallback)
+        ));
+    }
+    let config = Config::from_str_with_env(&toml, Format::Toml, &|_: &str| None).unwrap();
+    RoutingTable::from_config(&config)
+}
+
+/// The provider index of the nth target in a plan.
+fn nth_provider(table: &RoutingTable, n: usize) -> usize {
+    let plan = table.plan("fast").unwrap();
+    plan.targets[n].provider.name[1..].parse().unwrap()
+}
+
+proptest! {
+    /// The target a request actually goes to — the head of the plan — is
+    /// drawn in proportion to its primary weight. This is the traffic
+    /// split an operator configures a group for.
+    #[test]
+    fn group_traffic_follows_primary_weights(
+        weights in prop::collection::vec(0.05f64..10.0, 2..5),
+        seed in any::<u64>(),
+    ) {
+        fastrand::seed(seed);
+        let table = group_table(&weights, &[]);
+
+        let draws = 4000usize;
+        let mut counts = vec![0usize; weights.len()];
+        for _ in 0..draws {
+            counts[nth_provider(&table, 0)] += 1;
+        }
+
+        let total: f64 = weights.iter().sum();
+        for (i, w) in weights.iter().enumerate() {
+            let expected = w / total;
+            let got = counts[i] as f64 / draws as f64;
+            prop_assert!(
+                (got - expected).abs() < 0.08,
+                "target {i}: expected ~{expected:.3}, got {got:.3} (weights {weights:?})"
+            );
+        }
+    }
+
+    /// The plan covers the whole group once, primary pool first: a
+    /// request may exhaust every primary model before the reserve is
+    /// touched, and no target is offered twice.
+    #[test]
+    fn group_plan_exhausts_primary_before_fallback(
+        primary in prop::collection::vec(0.05f64..10.0, 1..4),
+        fallback in prop::collection::vec(0.05f64..10.0, 1..4),
+        seed in any::<u64>(),
+    ) {
+        fastrand::seed(seed);
+        let table = group_table(&primary, &fallback);
+        let plan = table.plan("fast").unwrap();
+
+        prop_assert_eq!(plan.targets.len(), primary.len() + fallback.len());
+        let order: Vec<usize> = plan
+            .targets
+            .iter()
+            .map(|t| t.provider.name[1..].parse().unwrap())
+            .collect();
+        let mut seen = order.clone();
+        seen.sort_unstable();
+        seen.dedup();
+        prop_assert_eq!(seen.len(), order.len(), "a target was planned twice");
+        prop_assert!(
+            order[..primary.len()].iter().all(|&i| i < primary.len()),
+            "fallback reached before the primary pool was exhausted: {:?}",
+            order
+        );
+    }
+}

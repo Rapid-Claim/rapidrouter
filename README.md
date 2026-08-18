@@ -131,8 +131,8 @@ credential ownership) are all stated there.
 
 ## Configure
 
-Everything beyond zero-config — weights, fallbacks, aliases, keys, budgets —
-is editable in the embedded console (set an admin key, open
+Everything beyond zero-config — weights, routing groups, keys, budgets — is
+editable in the embedded console (set an admin key, open
 `http://localhost:8080/console`) or in one file:
 
 ```toml
@@ -142,12 +142,21 @@ keys = [
   { name = "backup",  value = "env.OPENAI_API_KEY_2" },
 ]
 
-[aliases]
-fast = "groq/llama-3.3-70b-versatile"
-
-[fallbacks]
-"openai/gpt-4o" = ["anthropic/claude-sonnet-4-5"]
+[groups.fast]                             # callers send `fast` as the model
+primary = [                               # weights are ratios: 75 / 25
+  { target = "groq/llama-3.3-70b-versatile", weight = 3 },
+  { target = "openai/gpt-4o-mini",           weight = 1 },
+]
+fallback = [                              # only once the primary pool is out
+  { target = "anthropic/claude-haiku-4-5" },
+]
 ```
+
+A **routing group** is one model id over two weighted pools. Every model in
+`primary` serves live traffic in proportion to its weight, so a group is how
+you send 75% of a workload to one provider and 25% to another. `fallback` is
+a reserve: nothing in it is used while any primary model can still be tried,
+and its weights only order the reserve among itself.
 
 Config is validated in full before it is swapped in; an invalid reload keeps
 the running table and in-flight requests keep the snapshot they started on.

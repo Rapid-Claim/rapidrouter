@@ -67,7 +67,14 @@ export type CatalogPreset = {
   subscription?: boolean;
   models: CatalogModel[];
 };
-export type RouteGroup = { name: string; targets: string[] };
+/** One model in a routing group's pool, with its share of that pool. */
+export type RouteTarget = { target: string; weight: number };
+/**
+ * A routing group: the model id callers send. `primary` is the live
+ * traffic split, weighted; `fallback` is the reserve, only reached once
+ * the primary pool is exhausted.
+ */
+export type RouteGroup = { name: string; primary: RouteTarget[]; fallback: RouteTarget[] };
 
 export type Me = {
   principal: "admin_key" | "user";
@@ -126,6 +133,43 @@ export type UsageRecord = {
    * Extracted by the gateway at record time — absent on records written
    * before that shipped. */
   prompt?: string;
+};
+
+export type UsageSlice = {
+  name: string;
+  requests: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_micro_usd: number;
+};
+
+export type UsageBucket = {
+  ts: number;
+  requests: number;
+  failed: number;
+  input_tokens: number;
+  output_tokens: number;
+  cost_micro_usd: number;
+};
+
+/** Everything the Usage page needs for a window, from one server-side scan. */
+export type UsageSummary = {
+  requests: number;
+  errors: number;
+  attempts: number;
+  input_tokens: number;
+  output_tokens: number;
+  cached_tokens: number;
+  cost_micro_usd: number;
+  p50_latency_ms: number;
+  p95_latency_ms: number;
+  capped: boolean;
+  by_model: UsageSlice[];
+  by_provider: UsageSlice[];
+  by_key: UsageSlice[];
+  series: UsageBucket[];
+  bucket_secs: number;
 };
 
 /** Totals for a whole window, not the page on screen. */
@@ -230,6 +274,16 @@ export const api = {
       if (value !== undefined && value !== "") params.set(name, String(value));
     }
     return request<RequestsSummary>(`/requests/summary?${params}`);
+  },
+  /** Totals, groupings and a trend series for a window — one scan, one trip. */
+  usageSummary: (
+    window?: { since_ms?: number; until_ms?: number; provider?: string; model?: string; key?: string },
+  ) => {
+    const params = new URLSearchParams({ errors: "false" });
+    for (const [name, value] of Object.entries(window ?? {})) {
+      if (value !== undefined && value !== "") params.set(name, String(value));
+    }
+    return request<UsageSummary>(`/usage/summary?${params}`);
   },
   /** What was sent and what came back, for one request. */
   requestBodies: (id: string, ts: number) =>

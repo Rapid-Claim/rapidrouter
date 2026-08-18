@@ -13,6 +13,7 @@ pub struct RoutingTable {
     catalog:   HashMap<ModelName, ProviderId>,       // bare model name → provider
     aliases:   HashMap<String, TargetModel>,         // "fast" → groq/llama-3.3-70b
     fallbacks: HashMap<TargetModel, Vec<TargetModel>>,
+    groups:    HashMap<String, RoutingGroup>,        // "fast" → weighted primary + fallback pools
 }
 // per request: state.table.load()  — lock-free, ~1 ns
 ```
@@ -25,11 +26,13 @@ take the gateway down.
 
 ## Model resolution
 
-1. Explicit `provider/model` prefix wins.
-2. Alias lookup (config-defined names, repointable without code changes).
-3. Catalog lookup for bare names (first configured provider whose key
+1. Routing group by name — the model id an operator handed out, so nothing
+   may shadow it.
+2. Explicit `provider/model` prefix.
+3. Alias lookup (config-defined names, repointable without code changes).
+4. Catalog lookup for bare names (first configured provider whose key
    allowlist includes the model).
-4. Otherwise `404` naming the model and the configured candidates.
+5. Otherwise `404` naming the model and the configured candidates.
 
 ## Key selection — O(1), weighted, health-aware
 
@@ -59,9 +62,36 @@ Qualifying: connect errors, timeouts, 5xx, 429 (which also feeds the key's
 rate mask so a throttled key rests). Client-caused 4xx never trips a
 breaker.
 
-## Fallback chains
+## Routing groups
 
-Configured per model or alias:
+A group is one caller-facing model id over two weighted pools:
+
+```toml
+[groups.fast]
+primary = [
+  { target = "groq/llama-3.3-70b", weight = 3 },
+  { target = "openai/gpt-4o-mini", weight = 1 },
+]
+fallback = [{ target = "anthropic/claude-sonnet-4-5" }]
+```
+
+`primary` is a **split**: each request picks one member, in proportion to
+weight, so over many requests the pool is hit 75/25. `fallback` is a
+**reserve**: nothing in it is tried while any primary member remains.
+
+The plan is built by drawing each pool in weighted-random order without
+replacement (Efraimidis–Spirakis, `u^(1/w)` sorted descending). The head of
+the primary draw is the traffic split; the tail is the order the pool is
+exhausted in when that target fails, and it stays weighted — an operator who
+wrote 90/10 expects the heavy model to be the preferred second choice too.
+
+Groups are flat by construction: a group's targets are models, never other
+groups, which keeps a cycle check off the resolution path.
+
+## Fallback chains (legacy)
+
+`[aliases]` and `[fallbacks]` predate groups and still work — an alias is a
+group with one unweighted primary, and its chain is the reserve:
 
 ```toml
 [fallbacks]

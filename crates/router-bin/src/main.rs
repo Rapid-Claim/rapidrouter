@@ -205,8 +205,9 @@ fn check(path: &Path) -> ExitCode {
     match Config::load(path) {
         Ok(config) => {
             println!(
-                "OK: {} provider(s), {} alias(es), {} fallback chain(s)",
+                "OK: {} provider(s), {} routing group(s), {} alias(es), {} fallback chain(s)",
                 config.providers.len(),
+                config.groups.len(),
                 config.aliases.len(),
                 config.fallbacks.len(),
             );

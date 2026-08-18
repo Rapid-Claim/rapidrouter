@@ -10,7 +10,7 @@ use tokio::sync::Semaphore;
 use crate::breaker::{Admission, Breaker, BreakerConfig};
 use crate::config::{
     AuthMode, AzureSettings, BedrockSettings, CodexSettings, Config, ProviderKind, Retries,
-    RetryOn, TargetModel, VertexSettings,
+    RetryOn, RoutingGroup, TargetModel, VertexSettings, WeightedTarget,
 };
 use crate::credential::{self, Credential, Seat};
 use crate::error::{ErrorClass, GatewayError};
@@ -24,6 +24,7 @@ pub struct RoutingTable {
     catalog: BTreeMap<String, String>,
     aliases: BTreeMap<String, TargetModel>,
     fallbacks: BTreeMap<TargetModel, Vec<TargetModel>>,
+    groups: BTreeMap<String, RoutingGroup>,
     retries: Retries,
 }
 
@@ -260,6 +261,7 @@ impl RoutingTable {
             catalog,
             aliases: config.aliases.clone(),
             fallbacks: config.fallbacks.clone(),
+            groups: config.groups.clone(),
             retries: config.retries().clone(),
         }
     }
@@ -275,6 +277,9 @@ impl RoutingTable {
     /// fallback chain (skipping any fallback whose provider vanished in
     /// a reload), and the retry policy.
     pub fn plan(&self, requested: &str) -> Result<RoutePlan, GatewayError> {
+        if let Some(group) = self.groups.get(requested) {
+            return self.plan_group(requested, group);
+        }
         let primary = self.resolve_target(requested)?;
         let mut targets = vec![self.route_to(&primary, requested)?];
         if let Some(chain) = self.fallbacks.get(&primary) {
@@ -291,7 +296,49 @@ impl RoutingTable {
         })
     }
 
+    /// A group's plan: the primary pool drawn in weighted-random order,
+    /// then the fallback pool drawn the same way.
+    ///
+    /// Only the *head* of each draw carries the traffic split — that is
+    /// the target a healthy request goes to, and over many requests it is
+    /// hit in proportion to its weight. The tail is the order the pool is
+    /// exhausted in when that target fails, and weighting it too means a
+    /// heavy model is also the preferred *second* choice, which is what an
+    /// operator who wrote 90/10 expects.
+    fn plan_group(&self, requested: &str, group: &RoutingGroup) -> Result<RoutePlan, GatewayError> {
+        let mut targets = Vec::new();
+        for target in weighted_order(&group.primary)
+            .into_iter()
+            .chain(weighted_order(&group.fallback))
+        {
+            if let Ok(route) = self.route_to(&target, requested) {
+                targets.push(route);
+            }
+        }
+        if targets.is_empty() {
+            return Err(GatewayError::new(
+                ErrorClass::NotFound,
+                format!(
+                    "routing group `{requested}` has no usable target; every model in it \
+                     names a provider this gateway is not configured for"
+                ),
+            )
+            .with_param("model"));
+        }
+        Ok(RoutePlan {
+            targets,
+            max_attempts_per_target: self.retries.max_attempts.max(1),
+            retry_on: self.retries.on.clone(),
+        })
+    }
+
     fn resolve_target(&self, requested: &str) -> Result<TargetModel, GatewayError> {
+        // A group answers to its own name before anything else: it is the
+        // model id an operator handed out, and it must not be shadowed by
+        // a provider that happens to serve a model of the same name.
+        if let Some(group) = self.groups.get(requested) {
+            return Ok(weighted_pick_target(&group.primary));
+        }
         if let Some(target) = self.aliases.get(requested) {
             return Ok(target.clone());
         }
@@ -309,8 +356,8 @@ impl RoutingTable {
         Err(GatewayError::new(
             ErrorClass::NotFound,
             format!(
-                "unknown model `{requested}`; use `provider/model`, a configured alias, \
-                 or a model listed in a key's `models`"
+                "unknown model `{requested}`; use `provider/model`, a routing group, \
+                 a configured alias, or a model listed in a key's `models`"
             ),
         )
         .with_param("model"))
@@ -348,6 +395,14 @@ impl RoutingTable {
     /// The chain a target falls back through, if one is configured.
     pub fn fallbacks_for(&self, target: &TargetModel) -> Option<&Vec<TargetModel>> {
         self.fallbacks.get(target)
+    }
+
+    pub fn groups(&self) -> &BTreeMap<String, RoutingGroup> {
+        &self.groups
+    }
+
+    pub fn group(&self, name: &str) -> Option<&RoutingGroup> {
+        self.groups.get(name)
     }
 
     pub fn catalog(&self) -> &BTreeMap<String, String> {
@@ -511,6 +566,47 @@ impl ProviderRuntime {
             Some(weighted_pick(&eligible))
         }
     }
+}
+
+/// Draw a whole pool in weighted-random order, without replacement.
+///
+/// Efraimidis–Spirakis: give each entry the key `u^(1/w)` for a uniform
+/// `u`, then sort descending. The head comes out with probability exactly
+/// proportional to its weight — which is the traffic split — and each
+/// subsequent position is the same draw over what is left, so a failover
+/// walks the pool in an order that still respects the weights.
+fn weighted_order(pool: &[WeightedTarget]) -> Vec<TargetModel> {
+    if pool.len() < 2 {
+        return pool.iter().map(|w| w.target.clone()).collect();
+    }
+    let mut keyed: Vec<(f64, &TargetModel)> = pool
+        .iter()
+        .map(|w| {
+            // `f64()` is [0, 1); an exact zero would sort every entry it
+            // hits to the back regardless of weight.
+            let u = fastrand::f64().max(f64::MIN_POSITIVE);
+            (u.powf(1.0 / w.weight), &w.target)
+        })
+        .collect();
+    keyed.sort_by(|a, b| b.0.total_cmp(&a.0));
+    keyed.into_iter().map(|(_, t)| t.clone()).collect()
+}
+
+/// One weighted draw from a pool, for the callers that need a single
+/// target rather than a dispatch order.
+fn weighted_pick_target(pool: &[WeightedTarget]) -> TargetModel {
+    let total: f64 = pool.iter().map(|w| w.weight).sum();
+    let mut roll = fastrand::f64() * total;
+    for entry in pool {
+        roll -= entry.weight;
+        if roll <= 0.0 {
+            return entry.target.clone();
+        }
+    }
+    pool.last()
+        .expect("a validated group has a non-empty primary pool")
+        .target
+        .clone()
 }
 
 fn weighted_pick<'a>(keys: &[&'a KeyRuntime]) -> &'a KeyRuntime {
