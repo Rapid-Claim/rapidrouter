@@ -220,6 +220,11 @@ pub struct RawCodex {
     pub reasoning_effort: Option<String>,
     /// `low`|`medium`|`high`, or `""` for the backend default.
     pub verbosity: Option<String>,
+    /// Resolution used to rasterize an attached PDF. The backend takes no
+    /// document part, so pages are sent as images; see `router-media`.
+    pub pdf_dpi: Option<u32>,
+    /// Ceiling on pages rendered from one attached PDF.
+    pub pdf_max_pages: Option<usize>,
 }
 
 impl Default for RawProvider {

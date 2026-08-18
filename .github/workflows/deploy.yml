@@ -1,0 +1,192 @@
+name: deploy
+
+# Deploys only what CI already passed.
+#
+# `workflow_run` rather than `push`, because a push-triggered deploy races
+# the test suite and will happily ship a red build. This starts only after
+# `ci` reports success on main, and `workflow_dispatch` covers the manual
+# case (a rollback, or re-running a deploy whose SSH step flaked).
+#
+# Pull requests are deliberately NOT deployed: there is one production box
+# behind router.rapidclaims.ai and no preview environment, so deploying a
+# PR would put unreviewed code in front of live traffic. PRs get the full
+# `ci` workflow and nothing else.
+on:
+  workflow_run:
+    workflows: [ci]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+
+# One deploy at a time, and never cancel one midway: an interrupted deploy
+# can leave the box between `install` and `systemctl restart`.
+concurrency:
+  group: deploy-production
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    # A failed or cancelled CI run also fires `workflow_run`, so the
+    # conclusion has to be checked explicitly or this deploys red builds.
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    # To gate this behind a manual approval, create a `production`
+    # environment in repo settings (needs admin) and add
+    # `environment: production` here. The secrets below are repo-level, so
+    # they work with or without it.
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # `workflow_run` checks out the default branch by default, which
+          # for a busy main is not the commit CI just went green on.
+          ref: ${{ github.event.workflow_run.head_sha || github.ref }}
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: musl-deploy
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      # `console/dist` is embedded into the binary at compile time and is
+      # gitignored, so a fresh checkout has none. Skip this and the deploy
+      # ships a gateway whose console is the build.rs placeholder page.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+          cache-dependency-path: console/package-lock.json
+      - run: npm ci --no-audit --no-fund
+        working-directory: console
+      - run: npm run build
+        working-directory: console
+
+      - name: Build the static binary
+        run: cargo build --release --target x86_64-unknown-linux-musl -p router-bin
+
+      # Built here rather than on the box (which is what
+      # scripts/deploy-router.sh does): the runner has a warm cargo cache
+      # and the box then needs no toolchain, no Docker, and no source
+      # checkout — it receives one file.
+      - name: Record what is being shipped
+        id: build
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/rapid-router
+          file "$BIN" | grep -q 'static-pie\|statically linked' \
+            || { echo "::error::binary is not static; it will not run on the box"; exit 1; }
+          echo "sha=$(sha256sum "$BIN" | cut -d' ' -f1)" >> "$GITHUB_OUTPUT"
+          ls -l "$BIN"
+
+      - name: Authorize SSH
+        run: |
+          install -m 700 -d ~/.ssh
+          printf '%s\n' "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/deploy.pem
+          chmod 600 ~/.ssh/deploy.pem
+          # Pinned rather than StrictHostKeyChecking=no: this connection
+          # carries a key with sudo on the production box, and accepting
+          # any host key makes it trivially interceptable.
+          printf '%s\n' "${{ secrets.DEPLOY_KNOWN_HOSTS }}" > ~/.ssh/known_hosts
+          chmod 600 ~/.ssh/known_hosts
+
+      - name: Upload the binary
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER || 'ubuntu' }}
+        run: |
+          scp -i ~/.ssh/deploy.pem -o BatchMode=yes \
+            target/x86_64-unknown-linux-musl/release/rapid-router \
+            "$USER@$HOST:/tmp/rapid-router.incoming"
+
+      # Install, restart, verify — and put the old binary back if the new
+      # one does not come up. State lives in the S3 store, so the binary is
+      # the whole of a deploy and swapping it back is the whole of a
+      # rollback.
+      - name: Install, restart and verify
+        env:
+          HOST: ${{ secrets.DEPLOY_HOST }}
+          USER: ${{ secrets.DEPLOY_USER || 'ubuntu' }}
+          EXPECTED_SHA: ${{ steps.build.outputs.sha }}
+          GIT_SHA: ${{ github.event.workflow_run.head_sha || github.sha }}
+        run: |
+          ssh -i ~/.ssh/deploy.pem -o BatchMode=yes \
+              -o ServerAliveInterval=15 -o ServerAliveCountMax=8 \
+              "$USER@$HOST" \
+              "EXPECTED_SHA='$EXPECTED_SHA' GIT_SHA='$GIT_SHA' bash -s" <<'REMOTE'
+          set -euo pipefail
+
+          # The file survived the wire intact, or we stop before touching
+          # anything that is currently serving.
+          GOT="$(sha256sum /tmp/rapid-router.incoming | cut -d' ' -f1)"
+          if [ "$GOT" != "$EXPECTED_SHA" ]; then
+            echo "checksum mismatch: expected $EXPECTED_SHA, got $GOT" >&2
+            rm -f /tmp/rapid-router.incoming
+            exit 1
+          fi
+
+          sudo install -d -m 755 /opt/rapid-router/previous
+          if [ -f /opt/rapid-router/rapid-router ]; then
+            sudo cp -p /opt/rapid-router/rapid-router /opt/rapid-router/previous/rapid-router
+          fi
+
+          sudo install -m 755 /tmp/rapid-router.incoming /opt/rapid-router/rapid-router
+          rm -f /tmp/rapid-router.incoming
+          printf '%s\n' "$GIT_SHA" | sudo tee /opt/rapid-router/DEPLOYED_SHA >/dev/null
+          sudo systemctl restart rapid-router
+
+          healthy() {
+            for _ in $(seq 1 30); do
+              if curl -sf --max-time 3 http://127.0.0.1:8091/health >/dev/null; then
+                return 0
+              fi
+              sleep 1
+            done
+            return 1
+          }
+
+          if healthy; then
+            echo "healthy on the new binary"
+            curl -s http://127.0.0.1:8091/health; echo
+            exit 0
+          fi
+
+          echo "::error::new binary did not become healthy; rolling back" >&2
+          if [ -f /opt/rapid-router/previous/rapid-router ]; then
+            sudo install -m 755 /opt/rapid-router/previous/rapid-router /opt/rapid-router/rapid-router
+            sudo systemctl restart rapid-router
+            if healthy; then
+              echo "rolled back to the previous binary; it is healthy" >&2
+            else
+              echo "::error::rollback is also unhealthy — the box needs a human" >&2
+            fi
+          else
+            echo "::error::no previous binary to roll back to" >&2
+          fi
+          sudo journalctl -u rapid-router -n 40 --no-pager >&2 || true
+          exit 1
+          REMOTE
+
+      # The loopback check above proves the process is up; this proves the
+      # thing users actually reach is up, which is a different claim (nginx
+      # and the certificate sit in between).
+      - name: Public health check
+        run: |
+          URL="${{ secrets.DEPLOY_HEALTH_URL || 'https://router.rapidclaims.ai/health' }}"
+          for _ in $(seq 1 10); do
+            if curl -sf --max-time 5 "$URL"; then echo; echo "public endpoint healthy"; exit 0; fi
+            sleep 3
+          done
+          echo "::error::deployed, but $URL is not answering"
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          {
+            echo "### Deploy"
+            echo
+            echo "- commit: \`${{ github.event.workflow_run.head_sha || github.sha }}\`"
+            echo "- binary sha256: \`${{ steps.build.outputs.sha }}\`"
+            echo "- result: ${{ job.status }}"
+          } >> "$GITHUB_STEP_SUMMARY"

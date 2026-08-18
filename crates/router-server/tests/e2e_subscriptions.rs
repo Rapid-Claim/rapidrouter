@@ -647,3 +647,213 @@ async fn a_seat_can_be_checked_before_any_model_is_declared() {
     assert_eq!(result["status"], "ok", "{result}");
     assert_eq!(mock.last_request().path, "/v1/messages");
 }
+
+// ---------------------------------------------------------------------------
+// Documents
+// ---------------------------------------------------------------------------
+
+/// A one-page PDF with a line of text, built inline so the suite carries
+/// no binary fixture.
+fn one_page_pdf() -> Vec<u8> {
+    let text = b"BT /F1 14 Tf 20 50 Td (INVOICE TOTAL 42) Tj ET";
+    let objs: Vec<Vec<u8>> = vec![
+        b"<</Type/Catalog/Pages 2 0 R>>".to_vec(),
+        b"<</Type/Pages/Kids[3 0 R]/Count 1>>".to_vec(),
+        b"<</Type/Page/Parent 2 0 R/MediaBox[0 0 300 100]/Contents 4 0 R\
+           /Resources<</Font<</F1 5 0 R>>>>>>"
+            .to_vec(),
+        [
+            format!("<</Length {}>>stream\n", text.len()).into_bytes(),
+            text.to_vec(),
+            b"\nendstream".to_vec(),
+        ]
+        .concat(),
+        b"<</Type/Font/Subtype/Type1/BaseFont/Helvetica>>".to_vec(),
+    ];
+    let mut out = b"%PDF-1.4\n".to_vec();
+    let mut offsets = Vec::new();
+    for (i, o) in objs.iter().enumerate() {
+        offsets.push(out.len());
+        out.extend_from_slice(format!("{} 0 obj", i + 1).as_bytes());
+        out.extend_from_slice(o);
+        out.extend_from_slice(b"endobj\n");
+    }
+    let xref = out.len();
+    out.extend_from_slice(format!("xref\n0 {}\n", objs.len() + 1).as_bytes());
+    out.extend_from_slice(b"0000000000 65535 f \n");
+    for off in &offsets {
+        out.extend_from_slice(format!("{off:010} 00000 n \n").as_bytes());
+    }
+    out.extend_from_slice(
+        format!(
+            "trailer<</Size {}/Root 1 0 R>>\nstartxref\n{xref}\n%%EOF\n",
+            objs.len() + 1
+        )
+        .as_bytes(),
+    );
+    out
+}
+
+fn pdf_data_uri() -> String {
+    use base64::Engine;
+    format!(
+        "data:application/pdf;base64,{}",
+        base64::engine::general_purpose::STANDARD.encode(one_page_pdf())
+    )
+}
+
+/// The whole point of the feature: the Codex backend has no document part
+/// (its own client's content vocabulary is `input_text` / `input_image`
+/// and nothing else), so an attached PDF must arrive as page images. It
+/// used to be dropped in silence, and the model answered confidently about
+/// a document it had never been shown.
+#[tokio::test]
+async fn a_pdf_reaches_a_codex_seat_as_page_images() {
+    let (url, mock, _dir) = gateway().await;
+    let (status, _) = chat(
+        &url,
+        json!({"model": "codex/gpt-5.5", "messages": [{
+        "role": "user",
+        "content": [
+            {"type": "text", "text": "what is the total?"},
+            {"type": "file", "file": {
+                "filename": "invoice.pdf", "file_data": pdf_data_uri()}},
+        ]}]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let body = mock.last_request().body;
+    let content = &body["input"][0]["content"];
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[0]["text"], "what is the total?");
+    assert_eq!(
+        content[1]["type"], "input_image",
+        "the page must arrive as an image, not vanish: {content}"
+    );
+    assert!(
+        content[1]["image_url"]
+            .as_str()
+            .unwrap()
+            .starts_with("data:image/png;base64,"),
+        "a rendered page, inline"
+    );
+    assert!(
+        content.get(2).is_none(),
+        "a one-page document yields exactly one image"
+    );
+    assert!(
+        !body.to_string().contains("application/pdf"),
+        "no trace of the document part should survive translation"
+    );
+}
+
+/// A PDF that arrives in the Anthropic dialect must reach the same place.
+/// The inbound parser had no `document` arm at all, so a Claude-dialect
+/// caller's attachment was lost before translation even began.
+#[tokio::test]
+async fn an_anthropic_dialect_document_also_becomes_images() {
+    let (url, mock, _dir) = gateway().await;
+    use base64::Engine;
+    let payload = base64::engine::general_purpose::STANDARD.encode(one_page_pdf());
+    let res = reqwest::Client::new()
+        .post(format!("{url}/anthropic/v1/messages"))
+        .json(&json!({
+            "model": "codex/gpt-5.5",
+            "max_tokens": 100,
+            "messages": [{"role": "user", "content": [
+                {"type": "text", "text": "what is the total?"},
+                {"type": "document", "source": {
+                    "type": "base64", "media_type": "application/pdf", "data": payload}},
+            ]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let body = mock.last_request().body;
+    let content = &body["input"][0]["content"];
+    assert_eq!(content[1]["type"], "input_image", "got {content}");
+}
+
+/// A corrupt upload is the caller's problem to fix, and must say so —
+/// not 500, and not a confident answer about a document nobody could read.
+#[tokio::test]
+async fn a_corrupt_document_is_a_400_naming_the_problem() {
+    let (url, _mock, _dir) = gateway().await;
+    let (status, body) = chat(
+        &url,
+        json!({"model": "codex/gpt-5.5", "messages": [{
+            "role": "user",
+            "content": [{"type": "file", "file": {
+                "file_data": "data:application/pdf;base64,bm90IGEgcGRm"}}],
+        }]}),
+    )
+    .await;
+    assert_eq!(status, 400, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("PDF"),
+        "the message must name what could not be read: {body}"
+    );
+}
+
+/// Anthropic takes a PDF natively and has a text layer to work from, so
+/// rasterizing for it would be a downgrade. Only the dialects that cannot
+/// carry a document get one rendered.
+#[tokio::test]
+async fn a_native_document_target_is_not_rasterized() {
+    let (url, mock, _dir) = gateway().await;
+    let (status, _) = chat(
+        &url,
+        json!({"model": "claude-max/claude-sonnet-4-5", "max_tokens": 100,
+               "messages": [{"role": "user", "content": [
+                   {"type": "file", "file": {
+                       "filename": "invoice.pdf", "file_data": pdf_data_uri()}}]}]}),
+    )
+    .await;
+    assert_eq!(status, 200);
+
+    let body = mock.last_request().body;
+    let block = &body["messages"][0]["content"][0];
+    assert_eq!(block["type"], "document", "forwarded natively: {body}");
+    assert_eq!(block["source"]["media_type"], "application/pdf");
+}
+
+/// The Responses relay forwards a body verbatim, which is right for every
+/// surface feature the core cannot model — but wrong for a document, since
+/// there is nothing on this wire to relay one into. A document must pull
+/// the request off the relay path and through rasterization.
+#[tokio::test]
+async fn a_document_takes_the_translated_path_not_the_verbatim_relay() {
+    let (url, mock, _dir) = gateway().await;
+    let res = reqwest::Client::new()
+        .post(format!("{url}/v1/responses"))
+        .json(&json!({
+            "model": "codex/gpt-5.5",
+            "stream": true,
+            "input": [{"type": "message", "role": "user", "content": [
+                {"type": "input_text", "text": "what is the total?"},
+                {"type": "input_file", "filename": "invoice.pdf",
+                 "file_data": pdf_data_uri()},
+            ]}],
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 200);
+
+    let body = mock.last_request().body;
+    let content = &body["input"][0]["content"];
+    assert_eq!(
+        content[1]["type"], "input_image",
+        "the relay would have forwarded input_file verbatim: {content}"
+    );
+    assert!(
+        !body.to_string().contains("input_file"),
+        "no document part may survive to the backend"
+    );
+}

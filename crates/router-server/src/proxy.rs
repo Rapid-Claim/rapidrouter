@@ -30,6 +30,32 @@ use serde_json::Value;
 use crate::AppState;
 use crate::usage::{self, TokenUsage, UsageHook};
 
+/// Upper bound on attempts against one target, however large its pool.
+///
+/// A caller waits for every attempt serially, so an unbounded walk of a
+/// ninety-seat pool would trade one client's failed request for a minute
+/// of latency. Eight is enough to step over a run of bad seats — the odds
+/// of eight consecutive picks all being unusable are negligible once the
+/// bad ones are being benched as they are found — without letting one
+/// request become a stampede.
+const MAX_ATTEMPTS_PER_TARGET: u32 = 8;
+
+/// How many times to try one target: the configured budget, raised to the
+/// number of keys that could actually serve, capped.
+///
+/// The configured `max_attempts` (2 by default) is right for a couple of
+/// metered keys and wrong for a subscription pool, where each seat is an
+/// independent chance to be served and a bad seat says nothing about the
+/// next one.
+fn attempt_budget(route: &ResolvedRoute, plan: &RoutePlan, now_ms: u64) -> u32 {
+    let available = route
+        .provider
+        .healthy_key_count(&route.upstream_model, now_ms);
+    plan.max_attempts_per_target
+        .max(available)
+        .min(MAX_ATTEMPTS_PER_TARGET)
+}
+
 /// Enforce a virtual key's scope, rate limits, and budget — after model
 /// extraction, before any upstream work.
 fn vk_gate(vk: &VkRuntime, requested: &str, plan: &RoutePlan) -> Result<(), GatewayError> {
@@ -438,6 +464,85 @@ pub async fn handle_chat(
     }
 }
 
+/// Render any attached document to images for a target that cannot carry
+/// one, memoizing across targets and attempts.
+///
+/// Rendering a chart runs to hundreds of milliseconds of pure CPU, so it
+/// goes to a blocking thread: doing it inline would stall every other
+/// request sharing the runtime worker. It is also done at most once per
+/// request — the result is deterministic, so repeating it for each
+/// failover attempt would multiply the cost for an identical answer.
+/// Whether a raw Responses request body carries a document part.
+///
+/// Shape-only and cheap: it decides whether a Codex request can take the
+/// verbatim relay path, and a body with no attachment must pay nothing for
+/// the question.
+fn responses_body_has_documents(value: &Value) -> bool {
+    value["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .any(|part| part["type"] == "input_file" || part["type"] == "file")
+}
+
+async fn documents_as_images<'a>(
+    req: &'a ChatRequest,
+    cache: &'a mut Option<ChatRequest>,
+    route: &ResolvedRoute,
+) -> Result<&'a ChatRequest, GatewayError> {
+    if cache.is_none() {
+        let defaults = router_media::RasterSettings::default();
+        let settings = match route.provider.codex.as_ref() {
+            Some(codex) => router_media::RasterSettings {
+                dpi: codex.pdf_dpi,
+                max_pages: codex.pdf_max_pages,
+                ..defaults
+            },
+            None => defaults,
+        };
+        let source = req.clone();
+        let (rendered, report) = tokio::task::spawn_blocking(move || {
+            router_media::rasterize_request(&source, &settings)
+        })
+        .await
+        .map_err(|e| {
+            GatewayError::new(
+                ErrorClass::UpstreamError,
+                format!("document rasterization failed: {e}"),
+            )
+        })??;
+        metrics::counter!("rapid_pdf_pages_rendered_total",
+            "provider" => route.provider.name.clone())
+        .increment(report.pages_rendered as u64);
+        if report.pages_dropped > 0 {
+            // Never a silent truncation: a caller who attached a 200-page
+            // chart and got an answer about the first fifty pages must be
+            // able to find out why.
+            metrics::counter!("rapid_pdf_pages_dropped_total",
+                "provider" => route.provider.name.clone())
+            .increment(report.pages_dropped as u64);
+            tracing::warn!(
+                provider = %route.provider.name,
+                documents = report.documents,
+                rendered = report.pages_rendered,
+                dropped = report.pages_dropped,
+                "document exceeded the page ceiling; the remaining pages were NOT sent"
+            );
+        } else {
+            tracing::debug!(
+                provider = %route.provider.name,
+                documents = report.documents,
+                pages = report.pages_rendered,
+                "rasterized attached documents to images"
+            );
+        }
+        *cache = Some(rendered);
+    }
+    Ok(cache.as_ref().expect("just populated"))
+}
+
 async fn run_chat(
     state: &AppState,
     inbound: &InboundChat,
@@ -455,6 +560,9 @@ async fn run_chat(
 
     // Parsed lazily, at most once, only when some target needs translation.
     let mut internal: Option<ChatRequest> = None;
+    // The same request with attached documents rendered to images, for
+    // targets that cannot carry a document. Also at most once.
+    let mut rasterized: Option<ChatRequest> = None;
 
     let mut attempts: u32 = 0;
     let mut last_error: Option<GatewayError> = None;
@@ -490,6 +598,13 @@ async fn run_chat(
                 Some(r) => r,
                 None => internal.insert(inbound.to_internal()?),
             };
+            let req = if router_providers::needs_rasterized_documents(out_dialect)
+                && router_media::has_documents(req)
+            {
+                documents_as_images(req, &mut rasterized, route).await?
+            } else {
+                req
+            };
             let built = router_providers::build_outbound(
                 out_dialect,
                 req,
@@ -510,34 +625,42 @@ async fn run_chat(
             tracing::debug!(provider = %route.provider.name, param, "dropped unsupported parameter");
         }
 
-        for a_idx in 0..plan.max_attempts_per_target {
-            let is_last_candidate =
-                t_idx + 1 == n_targets && a_idx + 1 == plan.max_attempts_per_target;
+        // How many times this target is worth trying. The configured
+        // budget is a floor, not a ceiling: a pool of ninety seats is
+        // ninety chances to serve, and stopping at two meant one expired
+        // or exhausted seat ended a request the pool could have served.
+        // Bounded so a huge pool cannot turn one client request into a
+        // hundred upstream calls.
+        let budget = attempt_budget(route, &plan, clock::now_ms());
+        for a_idx in 0..budget {
+            let is_last_candidate = t_idx + 1 == n_targets && a_idx + 1 == budget;
             let now = clock::now_ms();
             let Some(choice) = route.provider.admit_key(&route.upstream_model, now) else {
                 // A subscription pool with every seat out of quota is rate
                 // limited, not out of capacity. The distinction is what
                 // the caller does next: a 503 invites an immediate retry,
                 // a 429 tells them there is a window to wait for.
-                last_error = Some(if route.provider.all_keys_benched(&route.upstream_model) {
-                    GatewayError::new(
-                        ErrorClass::RateLimited,
-                        format!(
-                            "every seat of provider `{}` is out of quota for model `{}`",
-                            route.provider.name, route.upstream_model
-                        ),
-                    )
-                    .with_provider(&route.provider.name)
-                } else {
-                    GatewayError::new(
-                        ErrorClass::NoCapacity,
-                        format!(
-                            "no healthy key of provider `{}` for model `{}`",
-                            route.provider.name, route.upstream_model
-                        ),
-                    )
-                    .with_provider(&route.provider.name)
-                });
+                last_error = Some(
+                    if route.provider.all_keys_benched(&route.upstream_model, now) {
+                        GatewayError::new(
+                            ErrorClass::RateLimited,
+                            format!(
+                                "every seat of provider `{}` is out of quota for model `{}`",
+                                route.provider.name, route.upstream_model
+                            ),
+                        )
+                        .with_provider(&route.provider.name)
+                    } else {
+                        GatewayError::new(
+                            ErrorClass::NoCapacity,
+                            format!(
+                                "no healthy key of provider `{}` for model `{}`",
+                                route.provider.name, route.upstream_model
+                            ),
+                        )
+                        .with_provider(&route.provider.name)
+                    },
+                );
                 break;
             };
             let Ok(permit) = route.provider.semaphore.clone().try_acquire_owned() else {
@@ -665,10 +788,24 @@ async fn attempt(
         }
         Ok(response) => {
             let status = response.status();
+            // A subscription seat's 401 is a fact about that seat's
+            // credential, not about the request: the other seats hold
+            // their own tokens and most of them work. Retrying it on the
+            // next seat is always right, and is not configurable for the
+            // same reason a connect error to one host does not stop us
+            // trying the next — the caller asked for an answer, not for a
+            // particular credential.
+            let seat_auth_failure =
+                route.provider.kind.is_subscription() && matches!(status.as_u16(), 401 | 403);
             let retryable = (status.as_u16() == 429 && plan.retry_on.contains(&RetryOn::Status429))
-                || (status.is_server_error() && plan.retry_on.contains(&RetryOn::Status5xx));
+                || (status.is_server_error() && plan.retry_on.contains(&RetryOn::Status5xx))
+                || seat_auth_failure;
 
-            if status.is_server_error() || status.as_u16() == 429 {
+            // A seat that cannot authenticate must leave the healthy pool,
+            // or every request keeps rediscovering it. Counted as a
+            // breaker failure so it opens after the configured threshold
+            // and is stepped over until it recovers.
+            if status.is_server_error() || status.as_u16() == 429 || seat_auth_failure {
                 breaker.record_failure(clock::now_ms());
             } else {
                 breaker.record_success(clock::now_ms());
@@ -688,8 +825,13 @@ async fn attempt(
                 // a seat that stays broken until someone notices: the
                 // proactive path only fires near a *known* expiry, and an
                 // out-of-band revocation has no expiry to be near.
+                // Not gated on `is_last_candidate`: renewing is worth
+                // doing even when there is no attempt left to spend on
+                // it, because the renewed token is what makes the *next*
+                // request succeed. Skipping it on the final attempt is
+                // how eighteen seats sat expired while every request that
+                // landed on one returned 401 to the caller.
                 if status.as_u16() == 401
-                    && !is_last_candidate
                     && let Some(key) = key
                     && let Some(seat) = key.seat()
                     && let Some(path) = key.source_path.as_deref()
@@ -708,16 +850,24 @@ async fn attempt(
                         "provider" => route.provider.name.clone(),
                     )
                     .increment(1);
-                    return AttemptOutcome::Retry(
-                        GatewayError::new(
-                            ErrorClass::UpstreamError,
-                            format!(
-                                "seat credential of provider `{}` was renewed; retrying",
-                                route.provider.name
-                            ),
-                        )
-                        .with_provider(&route.provider.name),
-                    );
+                    if !is_last_candidate {
+                        return AttemptOutcome::Retry(
+                            GatewayError::new(
+                                ErrorClass::UpstreamError,
+                                format!(
+                                    "seat credential of provider `{}` was renewed; retrying",
+                                    route.provider.name
+                                ),
+                            )
+                            .with_provider(&route.provider.name),
+                        );
+                    }
+                    // Out of attempts, but the seat is now usable again.
+                    // Clearing the failure we just recorded keeps it in
+                    // the pool for the next request instead of holding a
+                    // working seat out on the strength of a 401 we have
+                    // already fixed.
+                    breaker.record_success(clock::now_ms());
                 }
             }
 
@@ -1467,8 +1617,9 @@ async fn run_relay(
             );
             continue;
         }
-        for a_idx in 0..plan.max_attempts_per_target {
-            let is_last = t_idx + 1 == n_targets && a_idx + 1 == plan.max_attempts_per_target;
+        let budget = attempt_budget(route, &plan, clock::now_ms());
+        for a_idx in 0..budget {
+            let is_last = t_idx + 1 == n_targets && a_idx + 1 == budget;
             let now = clock::now_ms();
             let Some(choice) = route.provider.admit_key(&route.upstream_model, now) else {
                 last_error = Some(
@@ -2049,6 +2200,9 @@ async fn run_responses(
 
     // Parsed lazily, at most once, only when some target needs translation.
     let mut internal: Option<router_core::chat::ChatRequest> = None;
+    // Attached documents rendered to images, for targets that cannot carry
+    // a document. Computed at most once, like `internal`.
+    let mut rasterized: Option<router_core::chat::ChatRequest> = None;
 
     let mut attempts: u32 = 0;
     let mut last_error: Option<GatewayError> = None;
@@ -2078,7 +2232,15 @@ async fn run_responses(
         // features survive the trip. It answers in SSE and nothing else,
         // so a caller who wants a whole body still goes the translated
         // route, where the stream is aggregated at our end.
-        let codex_relay = out_dialect == Dialect::CodexResponses && stream && !wants_state;
+        // ...except when the caller attached a document. Relaying is
+        // verbatim, and this backend has no document part to relay one
+        // into, so a native relay would forward an `input_file` the
+        // backend cannot read. Translating instead is what routes the
+        // request through rasterization.
+        let codex_relay = out_dialect == Dialect::CodexResponses
+            && stream
+            && !wants_state
+            && !responses_body_has_documents(&value);
         let relay = out_dialect == Dialect::OpenAi || codex_relay;
         let (out_body, path, emulated) = if relay {
             let rewritten = if codex_relay {
@@ -2129,6 +2291,13 @@ async fn run_responses(
                     }
                     internal.insert(parsed.internal)
                 }
+            };
+            let req = if router_providers::needs_rasterized_documents(out_dialect)
+                && router_media::has_documents(req)
+            {
+                documents_as_images(req, &mut rasterized, route).await?
+            } else {
+                req
             };
             let built = router_providers::build_outbound(
                 out_dialect,

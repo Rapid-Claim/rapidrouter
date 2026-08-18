@@ -365,6 +365,8 @@ export function Drawer(props: {
   onClose: () => void;
   actions?: any;
   children?: any;
+  /// For drawers holding a wide table rather than a form.
+  wide?: boolean;
 }) {
   createEffect(() => {
     if (!props.open) return;
@@ -385,7 +387,13 @@ export function Drawer(props: {
           if (e.target === e.currentTarget) props.onClose();
         }}
       >
-        <aside class="drawer" role="dialog" aria-modal="true" aria-label={props.title}>
+        <aside
+          class="drawer"
+          classList={{ "drawer-wide": Boolean(props.wide) }}
+          role="dialog"
+          aria-modal="true"
+          aria-label={props.title}
+        >
           <header class="drawer-head">
             <div class="drawer-title">
               <h2>{props.title}</h2>

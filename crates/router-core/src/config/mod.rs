@@ -270,6 +270,17 @@ pub struct CodexSettings {
     pub reasoning_effort: Option<String>,
     /// Output-verbosity floor; `None` restores the backend's own default.
     pub verbosity: Option<String>,
+    /// Resolution for rasterizing an attached PDF.
+    ///
+    /// This backend accepts no document part at all — its own client's
+    /// content vocabulary is text and images and nothing else — so a PDF
+    /// is rendered to one image per page before translation. 150 DPI puts
+    /// a Letter page a little past the resolution vision models downsample
+    /// to, so raising it costs request bytes without adding detail.
+    pub pdf_dpi: u32,
+    /// Ceiling on pages rendered from one attached PDF. Pages beyond it
+    /// are reported, never silently cut.
+    pub pdf_max_pages: usize,
 }
 
 impl Default for CodexSettings {
@@ -278,6 +289,8 @@ impl Default for CodexSettings {
             version: "0.146.0".into(),
             reasoning_effort: Some("low".into()),
             verbosity: Some("low".into()),
+            pdf_dpi: 150,
+            pdf_max_pages: 50,
         }
     }
 }
