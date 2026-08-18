@@ -27,6 +27,7 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/usage", get(usage))
         .route("/requests", get(requests))
         .route("/requests/summary", get(requests_summary))
+        .route("/usage/summary", get(usage_summary))
         .route("/requests/{id}/bodies", get(request_bodies))
         .route("/providers", get(providers).post(create_provider))
         .route(
@@ -708,6 +709,30 @@ async fn requests_summary(
     let summary = state
         .usage
         .summary(since, query.until_ms.unwrap_or(now), &filter, query.errors);
+    Json(summary).into_response()
+}
+
+/// Everything the Usage page needs for a window, in one request.
+///
+/// Same filters and the same scan as `/requests`, so the page and the log
+/// table can never disagree about what happened in a window.
+async fn usage_summary(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<RequestsQuery>,
+) -> Response {
+    let now = crate::vkey::unix_now_ms();
+    let since = query
+        .since_ms
+        .unwrap_or_else(|| now.saturating_sub(3_600_000));
+    let filter = crate::usage::HistoryFilter {
+        provider: query.provider.clone().filter(|v| !v.is_empty()),
+        model: query.model.clone().filter(|v| !v.is_empty()),
+        vkey: query.key.clone().filter(|v| !v.is_empty()),
+    };
+    let summary =
+        state
+            .usage
+            .usage_summary(since, query.until_ms.unwrap_or(now), &filter, query.errors);
     Json(summary).into_response()
 }
 
@@ -1860,70 +1885,133 @@ async fn delete_model(
     commit_document(&state, version, doc).await
 }
 
-/// A routing group: one name callers use, and the ordered list of targets
-/// it resolves to.
+/// A routing group: the model id callers send, and the two weighted pools
+/// it dispatches over.
 ///
-/// This is `[aliases]` and `[fallbacks]` presented as the single thing
-/// they always were. An alias is a group's first target; the fallback
-/// chain is the rest. Splitting them across two tables made a routing
-/// decision something you had to reconstruct from two places.
+/// `primary` is the traffic split — every model in it serves live
+/// requests, in proportion to its weight. `fallback` is the reserve,
+/// reached only once the primary pool has nothing left to try, and
+/// weighted the same way among itself.
+///
+/// Legacy `[aliases]`/`[fallbacks]` entries are listed here too, as a
+/// group whose pools are all weight 1: they expressed the same idea with
+/// no way to say how much traffic went where. Saving one over this
+/// endpoint rewrites it as a `[groups]` entry.
 async fn list_routes(State(state): State<Arc<AppState>>) -> Response {
     let table = state.table.load();
-    let data: Vec<Value> = table
-        .aliases()
+    let mut data: Vec<Value> = table
+        .groups()
         .iter()
-        .map(|(name, target)| {
-            let primary = format!("{}/{}", target.provider, target.model);
-            let mut targets = vec![primary];
-            if let Some(chain) = table.fallbacks_for(target) {
-                targets.extend(chain.iter().map(|t| format!("{}/{}", t.provider, t.model)));
-            }
-            json!({ "name": name, "targets": targets })
+        .map(|(name, group)| {
+            json!({
+                "name": name,
+                "primary": pool_json(&group.primary),
+                "fallback": pool_json(&group.fallback),
+            })
         })
         .collect();
+    for (name, target) in table.aliases() {
+        if table.group(name).is_some() {
+            continue;
+        }
+        let chain = table
+            .fallbacks_for(target)
+            .map(Vec::as_slice)
+            .unwrap_or(&[]);
+        data.push(json!({
+            "name": name,
+            "primary": [json!({ "target": target.to_string(), "weight": 1.0 })],
+            "fallback": chain
+                .iter()
+                .map(|t| json!({ "target": t.to_string(), "weight": 1.0 }))
+                .collect::<Vec<_>>(),
+        }));
+    }
+    data.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
     Json(json!({ "data": data })).into_response()
+}
+
+fn pool_json(pool: &[router_core::config::WeightedTarget]) -> Vec<Value> {
+    pool.iter()
+        .map(|w| json!({ "target": w.target.to_string(), "weight": w.weight }))
+        .collect()
 }
 
 #[derive(Deserialize)]
 struct RouteWrite {
     name: String,
-    /// Ordered `provider/model` targets; the first is primary.
-    targets: Vec<String>,
+    /// Models that serve live traffic, split by weight.
+    primary: Vec<RouteTargetWrite>,
+    /// Models held in reserve for when the primary pool is exhausted.
+    #[serde(default)]
+    fallback: Vec<RouteTargetWrite>,
+}
+
+#[derive(Deserialize)]
+struct RouteTargetWrite {
+    target: String,
+    #[serde(default = "one")]
+    weight: f64,
+}
+
+fn one() -> f64 {
+    1.0
+}
+
+/// Render one pool as `[{ target = "…", weight = … }, …]`.
+fn pool_array(pool: &[RouteTargetWrite]) -> toml_edit::Array {
+    let mut array = toml_edit::Array::new();
+    for entry in pool {
+        let mut item = toml_edit::InlineTable::new();
+        item.insert("target", entry.target.as_str().into());
+        item.insert("weight", entry.weight.into());
+        array.push(toml_edit::Value::InlineTable(item));
+    }
+    array
 }
 
 async fn put_route(State(state): State<Arc<AppState>>, Json(input): Json<RouteWrite>) -> Response {
     if let Err(response) = writable(&state) {
         return response;
     }
-    let Some(primary) = input.targets.first() else {
-        return api_error(StatusCode::BAD_REQUEST, "a group needs at least one target");
-    };
+    if input.name.trim().is_empty() {
+        return api_error(StatusCode::BAD_REQUEST, "a group needs a name");
+    }
+    if input.primary.is_empty() {
+        return api_error(
+            StatusCode::BAD_REQUEST,
+            "a group needs at least one primary model",
+        );
+    }
+    for entry in input.primary.iter().chain(&input.fallback) {
+        if !(entry.weight.is_finite() && entry.weight > 0.0) {
+            return api_error(
+                StatusCode::BAD_REQUEST,
+                format!("weight for `{}` must be a number > 0", entry.target),
+            );
+        }
+    }
     let (version, mut doc) = match config_document(&state) {
         Ok(pair) => pair,
         Err(response) => return *response,
     };
-    let aliases = doc["aliases"].or_insert(toml_edit::table());
-    if let Some(table) = aliases.as_table_mut() {
-        table.set_implicit(false);
-    }
-    aliases[input.name.as_str()] = toml_edit::value(primary.as_str());
 
-    let rest: Vec<&String> = input.targets.iter().skip(1).collect();
-    let fallbacks = doc["fallbacks"].or_insert(toml_edit::table());
-    if let Some(table) = fallbacks.as_table_mut() {
-        table.set_implicit(false);
+    let groups = doc["groups"].or_insert(toml_edit::table());
+    if let Some(table) = groups.as_table_mut() {
+        table.set_implicit(true);
     }
-    if rest.is_empty() {
-        if let Some(table) = fallbacks.as_table_like_mut() {
-            table.remove(primary);
-        }
-    } else {
-        let mut chain = toml_edit::Array::new();
-        for target in rest {
-            chain.push(target.as_str());
-        }
-        fallbacks[primary.as_str()] = toml_edit::value(chain);
+    let mut entry = toml_edit::table();
+    entry["primary"] = toml_edit::value(pool_array(&input.primary));
+    if !input.fallback.is_empty() {
+        entry["fallback"] = toml_edit::value(pool_array(&input.fallback));
     }
+    groups[input.name.as_str()] = entry;
+
+    // Saving over a legacy alias migrates it: leaving both behind would
+    // define the same caller-facing name twice, which config validation
+    // rejects outright.
+    drop_legacy_alias(&mut doc, &input.name);
+
     commit_document(&state, version, doc).await
 }
 
@@ -1935,28 +2023,36 @@ async fn delete_route(State(state): State<Arc<AppState>>, Path(name): Path<Strin
         Ok(pair) => pair,
         Err(response) => return *response,
     };
+    if let Some(groups) = doc.get_mut("groups").and_then(|g| g.as_table_like_mut()) {
+        groups.remove(&name);
+    }
+    drop_legacy_alias(&mut doc, &name);
+    commit_document(&state, version, doc).await
+}
+
+/// Remove an `[aliases]` entry and the `[fallbacks]` chain it owned.
+///
+/// The chain is keyed by the *target*, not the alias, so it is only
+/// orphaned once no other alias still points there.
+fn drop_legacy_alias(doc: &mut toml_edit::DocumentMut, name: &str) {
     let primary = doc
         .get("aliases")
-        .and_then(|a| a.get(&name))
+        .and_then(|a| a.get(name))
         .and_then(|v| v.as_str())
         .map(str::to_owned);
     if let Some(aliases) = doc.get_mut("aliases").and_then(|a| a.as_table_like_mut()) {
-        aliases.remove(&name);
+        aliases.remove(name);
     }
-    // The chain is keyed by the target, so it is only orphaned if no other
-    // alias still points there.
-    if let Some(primary) = primary {
-        let still_used = doc
-            .get("aliases")
-            .and_then(|a| a.as_table_like())
-            .is_some_and(|a| a.iter().any(|(_, v)| v.as_str() == Some(primary.as_str())));
-        if !still_used
-            && let Some(fallbacks) = doc.get_mut("fallbacks").and_then(|f| f.as_table_like_mut())
-        {
-            fallbacks.remove(&primary);
-        }
+    let Some(primary) = primary else { return };
+    let still_used = doc
+        .get("aliases")
+        .and_then(|a| a.as_table_like())
+        .is_some_and(|a| a.iter().any(|(_, v)| v.as_str() == Some(primary.as_str())));
+    if !still_used
+        && let Some(fallbacks) = doc.get_mut("fallbacks").and_then(|f| f.as_table_like_mut())
+    {
+        fallbacks.remove(&primary);
     }
-    commit_document(&state, version, doc).await
 }
 
 #[derive(Deserialize)]

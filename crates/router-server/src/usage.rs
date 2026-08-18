@@ -1798,7 +1798,190 @@ fn percentile(sorted: &[u64], p: u64) -> u64 {
     sorted[rank.saturating_sub(1).min(sorted.len() - 1)]
 }
 
-/// for data only the drawer ever opens.
+/// Everything the Usage page needs for a window, from one scan.
+///
+/// The page used to derive all of this client-side from a single page of
+/// 1,000 records, so every figure on it was really "of the most recent
+/// thousand". On a gateway doing six figures a day that made "Last 24
+/// hours" and "Last hour" report the same number, and neither was the
+/// answer. Ranges over a day went to `/history` and were correct, which is
+/// why only those looked right.
+///
+/// Grouped and bucketed here rather than in three more round trips: the
+/// scan is the expensive part, and it is the same scan for all of them.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct UsageSummary {
+    pub requests: u64,
+    pub errors: u64,
+    pub attempts: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cached_tokens: u64,
+    pub cost_micro_usd: u64,
+    pub p50_latency_ms: u64,
+    pub p95_latency_ms: u64,
+    /// The scan hit its ceiling, so these are a floor. Reported, not hidden.
+    pub capped: bool,
+    pub by_model: Vec<UsageSlice>,
+    pub by_provider: Vec<UsageSlice>,
+    pub by_key: Vec<UsageSlice>,
+    /// Bucket start (unix seconds) -> totals, for the trend charts.
+    pub series: Vec<UsageBucket>,
+    /// Bucket width actually used, so the chart can label itself.
+    pub bucket_secs: u64,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct UsageSlice {
+    pub name: String,
+    pub requests: u64,
+    pub failed: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micro_usd: u64,
+}
+
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct UsageBucket {
+    pub ts: u64,
+    pub requests: u64,
+    pub failed: u64,
+    pub input_tokens: u64,
+    pub output_tokens: u64,
+    pub cost_micro_usd: u64,
+}
+
+/// Keep the chart under a few hundred points however wide the window is:
+/// a minute bucket over 24h is 1,440 points, which is more than the pixels
+/// available and more than uPlot should be asked to draw.
+fn bucket_width_secs(span_ms: u64) -> u64 {
+    const TARGET_POINTS: u64 = 240;
+    let span_secs = (span_ms / 1000).max(1);
+    let raw = span_secs.div_ceil(TARGET_POINTS).max(60);
+    // Round up to a friendly step so ticks land on readable times.
+    for step in [60, 300, 900, 1800, 3600, 7200, 21600, 86400] {
+        if raw <= step {
+            return step;
+        }
+    }
+    86400
+}
+
+impl UsagePipeline {
+    /// Aggregate a window into totals, groupings and a trend series.
+    pub fn usage_summary(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+        filter: &HistoryFilter,
+        errors_only: bool,
+    ) -> UsageSummary {
+        let records = self.collect_page(
+            SUMMARY_SCAN_CAP + 1,
+            since_ms,
+            until_ms,
+            filter,
+            errors_only,
+            None,
+        );
+        let bucket_secs = bucket_width_secs(until_ms.saturating_sub(since_ms));
+        // Two different ceilings, both of which make these figures a floor.
+        // The scan cap is the obvious one. The other is subtler: with no
+        // usage directory configured nothing is ever flushed, so the
+        // in-memory ring is the entire history and a full ring means older
+        // traffic is simply gone. Reporting that as an exact total is the
+        // same lie this endpoint was written to remove.
+        let ring_is_everything = self.data_dir.is_none() && records.len() >= RECENT_CAP;
+        let mut out = UsageSummary {
+            capped: records.len() > SUMMARY_SCAN_CAP || ring_is_everything,
+            bucket_secs,
+            ..Default::default()
+        };
+
+        let mut latencies: Vec<u64> = Vec::with_capacity(records.len().min(SUMMARY_SCAN_CAP));
+        let mut by_model: HashMap<String, UsageSlice> = HashMap::new();
+        let mut by_provider: HashMap<String, UsageSlice> = HashMap::new();
+        let mut by_key: HashMap<String, UsageSlice> = HashMap::new();
+        let mut series: BTreeMap<u64, UsageBucket> = BTreeMap::new();
+
+        for rec in records.iter().take(SUMMARY_SCAN_CAP) {
+            out.requests += 1;
+            let failed = u64::from(rec.status >= 400);
+            out.errors += failed;
+            out.attempts += u64::from(rec.attempts);
+            out.input_tokens += rec.input_tokens;
+            out.output_tokens += rec.output_tokens;
+            out.cached_tokens += rec.cached_tokens;
+            out.cost_micro_usd += rec.cost_micro_usd;
+            latencies.push(rec.latency_ms);
+
+            // A request that never reached a provider has no model and no
+            // provider; it is still a request, and grouping it under an
+            // empty name would hide exactly the failures worth seeing.
+            let add = |map: &mut HashMap<String, UsageSlice>, name: &str| {
+                let slice = map.entry(name.to_owned()).or_insert_with(|| UsageSlice {
+                    name: name.to_owned(),
+                    ..Default::default()
+                });
+                slice.requests += 1;
+                slice.failed += failed;
+                slice.input_tokens += rec.input_tokens;
+                slice.output_tokens += rec.output_tokens;
+                slice.cost_micro_usd += rec.cost_micro_usd;
+            };
+            let unset = "(none)";
+            add(
+                &mut by_model,
+                if rec.model.is_empty() {
+                    unset
+                } else {
+                    &rec.model
+                },
+            );
+            add(
+                &mut by_provider,
+                if rec.provider.is_empty() {
+                    unset
+                } else {
+                    &rec.provider
+                },
+            );
+            add(&mut by_key, rec.vkey.as_deref().unwrap_or(unset));
+
+            let bucket = (rec.ts / 1000 / bucket_secs) * bucket_secs;
+            let point = series.entry(bucket).or_insert(UsageBucket {
+                ts: bucket,
+                ..Default::default()
+            });
+            point.requests += 1;
+            point.failed += failed;
+            point.input_tokens += rec.input_tokens;
+            point.output_tokens += rec.output_tokens;
+            point.cost_micro_usd += rec.cost_micro_usd;
+        }
+
+        latencies.sort_unstable();
+        out.p50_latency_ms = percentile(&latencies, 50);
+        out.p95_latency_ms = percentile(&latencies, 95);
+
+        // Biggest first: the tables show a leaderboard, not an index.
+        let ranked = |map: HashMap<String, UsageSlice>| {
+            let mut v: Vec<UsageSlice> = map.into_values().collect();
+            v.sort_by(|a, b| {
+                b.requests
+                    .cmp(&a.requests)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            v
+        };
+        out.by_model = ranked(by_model);
+        out.by_provider = ranked(by_provider);
+        out.by_key = ranked(by_key);
+        out.series = series.into_values().collect();
+        out
+    }
+}
+
 /// A request's bodies, stored apart from its metadata.
 ///
 /// Its own stream, keyed by request id: a log listing reads metadata for
@@ -2198,6 +2381,149 @@ pub fn write_batch_for_test(dir: &std::path::Path, node: &str, seq: u64, batch: 
 #[doc(hidden)]
 pub fn write_rollups_for_test(dir: &std::path::Path, node: &str, seq: u64, batch: &[UsageRecord]) {
     write_rollups(dir, node, seq, &roll_up(batch)).expect("test corpus writes");
+}
+
+#[cfg(test)]
+mod usage_summary_tests {
+    use super::*;
+
+    fn record(i: u64, model: &str, status: u16) -> UsageRecord {
+        UsageRecord {
+            ts: 1_700_000_000_000 + i * 1000,
+            request_id: format!("req-{i}"),
+            endpoint: "chat".into(),
+            requested: model.into(),
+            provider: "mock".into(),
+            model: model.into(),
+            vkey: Some("vk-1".into()),
+            status,
+            stream: false,
+            input_tokens: 10,
+            output_tokens: 5,
+            cached_tokens: 0,
+            cost_micro_usd: 100,
+            latency_ms: i % 50,
+            overhead_us: 10,
+            attempts: 1,
+            tag: None,
+            prompt: None,
+        }
+    }
+
+    /// The bug this endpoint exists to fix: the Usage page derived every
+    /// figure from one page of 1,000 records, so a window holding more
+    /// than that reported 1,000 and called it the total.
+    ///
+    /// Written against a flushed store rather than the bare ring, because
+    /// that is the shape production has — the ring holds `RECENT_CAP` and
+    /// everything older is read back from the partitions.
+    #[test]
+    fn counts_past_the_page_size_that_used_to_cap_the_page() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        let records: Vec<UsageRecord> = (0..2_500).map(|i| record(i, "gpt-4o", 200)).collect();
+        // Flushed in batches, the way the writer actually does it.
+        for (batch, chunk) in records.chunks(500).enumerate() {
+            write_batch_for_test(dir.path(), "node-a", batch as u64, chunk);
+        }
+        let summary = pipeline.usage_summary(0, u64::MAX, &HistoryFilter::default(), false);
+        assert_eq!(
+            summary.requests, 2_500,
+            "every request in the window, not the first thousand"
+        );
+        assert_eq!(summary.input_tokens, 25_000);
+        assert_eq!(summary.output_tokens, 12_500);
+        assert!(!summary.capped);
+    }
+
+    /// The other ceiling: with nothing flushed, the ring is the whole
+    /// history, so a full ring has to say it is a floor.
+    #[test]
+    fn a_full_ring_with_no_store_reports_itself_as_a_floor() {
+        let pipeline = UsagePipeline::for_test(None);
+        for i in 0..1_500 {
+            pipeline.record(record(i, "gpt-4o", 200));
+        }
+        let summary = pipeline.usage_summary(0, u64::MAX, &HistoryFilter::default(), false);
+        assert_eq!(summary.requests, RECENT_CAP as u64);
+        assert!(
+            summary.capped,
+            "1,000 of 1,500 must not be presented as the total"
+        );
+    }
+
+    #[test]
+    fn groups_are_ranked_and_name_the_unrouted() {
+        let pipeline = UsagePipeline::for_test(None);
+        for i in 0..10 {
+            pipeline.record(record(i, "gpt-4o", 200));
+        }
+        for i in 10..13 {
+            pipeline.record(record(i, "claude", 200));
+        }
+        // A request that never reached a provider carries no model; it is
+        // still a request and must not vanish into an empty group name.
+        let mut orphan = record(99, "", 404);
+        orphan.provider = String::new();
+        pipeline.record(orphan);
+
+        let summary = pipeline.usage_summary(0, u64::MAX, &HistoryFilter::default(), false);
+        assert_eq!(summary.requests, 14);
+        assert_eq!(summary.errors, 1);
+        let names: Vec<(&str, u64)> = summary
+            .by_model
+            .iter()
+            .map(|s| (s.name.as_str(), s.requests))
+            .collect();
+        assert_eq!(names, vec![("gpt-4o", 10), ("claude", 3), ("(none)", 1)]);
+    }
+
+    #[test]
+    fn totals_agree_with_the_sum_of_every_grouping() {
+        let pipeline = UsagePipeline::for_test(None);
+        for i in 0..40 {
+            pipeline.record(record(i, if i % 2 == 0 { "a" } else { "b" }, 200));
+        }
+        let s = pipeline.usage_summary(0, u64::MAX, &HistoryFilter::default(), false);
+        for group in [&s.by_model, &s.by_provider, &s.by_key] {
+            assert_eq!(
+                group.iter().map(|g| g.requests).sum::<u64>(),
+                s.requests,
+                "a grouping that does not re-sum to the total is a grouping that lost rows"
+            );
+        }
+        assert_eq!(
+            s.series.iter().map(|b| b.requests).sum::<u64>(),
+            s.requests,
+            "the chart and the header must describe the same traffic"
+        );
+    }
+
+    #[test]
+    fn buckets_stay_readable_however_wide_the_window() {
+        // A minute bucket over 24h is 1,440 points — more than the pixels
+        // available. Each step is a round number so ticks land sensibly.
+        assert_eq!(bucket_width_secs(60 * 60 * 1000), 60);
+        assert_eq!(bucket_width_secs(24 * 60 * 60 * 1000), 900);
+        assert!(bucket_width_secs(30 * 24 * 60 * 60 * 1000) >= 7200);
+        assert_eq!(bucket_width_secs(0), 60, "an empty span still has a width");
+    }
+
+    #[test]
+    fn a_filter_narrows_the_totals_and_the_groups_together() {
+        let pipeline = UsagePipeline::for_test(None);
+        for i in 0..20 {
+            pipeline.record(record(i, if i < 5 { "a" } else { "b" }, 200));
+        }
+        let filter = HistoryFilter {
+            model: Some("a".into()),
+            ..Default::default()
+        };
+        let s = pipeline.usage_summary(0, u64::MAX, &filter, false);
+        assert_eq!(s.requests, 5);
+        assert_eq!(s.by_model.len(), 1);
+        assert_eq!(s.by_model[0].requests, 5);
+    }
 }
 
 #[cfg(test)]

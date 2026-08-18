@@ -64,10 +64,13 @@ import {
   type CatalogPreset,
   type InternalUser,
   type RouteGroup,
+  type RouteTarget,
   type Team,
   type UsageRecord,
   type VirtualKey,
   RequestsSummary,
+  UsageSlice,
+  UsageSummary,
 } from "./api";
 
 type Page =
@@ -1172,13 +1175,16 @@ function AddCredential(props: { provider: Provider; onDone: () => void; onError:
     </Show>
   </div>;
 }
-/// Routing groups: the name a caller sends, and the ordered list of
-/// targets it resolves through.
+/// Routing groups: the model id a caller sends, and the two weighted
+/// pools it dispatches over.
 ///
-/// This replaces a raw TOML editor. `[aliases]` and `[fallbacks]` are one
-/// idea split across two tables — the alias is the first target, the
-/// chain is the rest — and reading a routing decision meant assembling it
-/// from both. Here a group is one row, in order, first to last.
+/// A group is a split, not a chain. Everything in the primary pool serves
+/// live traffic in proportion to its weight — that is how you send 80% of
+/// a workload to one provider and 20% to another — and the fallback pool
+/// is the reserve, untouched until the primary pool has nothing left to
+/// try. So the editor asks for weights rather than an order: the order
+/// within a pool is a consequence of the weights, not something to drag
+/// into place.
 function Routing(props: { refresh: () => number }) {
   const [routes, { refetch }] = createResource(props.refresh, api.routes);
   const [providers] = createResource(props.refresh, api.providers);
@@ -1198,7 +1204,9 @@ function Routing(props: { refresh: () => number }) {
   const shown = createMemo(() => {
     const needle = search().trim().toLowerCase();
     const all = routes()?.data ?? [];
-    return needle ? all.filter((r) => `${r.name} ${r.targets.join(" ")}`.toLowerCase().includes(needle)) : all;
+    return needle
+      ? all.filter((r) => `${r.name} ${allTargets(r).join(" ")}`.toLowerCase().includes(needle))
+      : all;
   });
 
   return <div class="stack-lg">
@@ -1207,24 +1215,18 @@ function Routing(props: { refresh: () => number }) {
       onSearch={setSearch}
       searchPlaceholder="Search groups (press /)"
       filters={[]}
-      extra={<button class="button primary" onClick={() => setEditing({ name: "", targets: [] })}><Plus size={15} />New group</button>}
+      extra={<button class="button primary" onClick={() => setEditing({ name: "", primary: [], fallback: [] })}><Plus size={15} />New group</button>}
     />
     <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
     <section class="panel">
-      <SectionTitle title="Routing groups" subtitle="One model id for callers; the gateway tries each target in order" />
-      <Loading when={routes.loading && !routes()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No routing groups" action="A group lets callers ask for `fast` and fail over across providers." />}>
+      <SectionTitle title="Routing groups" subtitle="One model id for callers; traffic splits across the primary pool by weight, and falls back when it runs out" />
+      <Loading when={routes.loading && !routes()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No routing groups" action="A group lets callers ask for `fast` and have the traffic split across providers." />}>
         <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table>
-          <thead><tr><th>Group</th><th>Route order</th><th><span class="sr-only">Actions</span></th></tr></thead>
-          <tbody><For each={shown()}>{(group) => <tr class="clickable" onClick={() => setEditing({ ...group })}>
+          <thead><tr><th>Group</th><th>Primary split</th><th>Fallback</th><th><span class="sr-only">Actions</span></th></tr></thead>
+          <tbody><For each={shown()}>{(group) => <tr class="clickable" onClick={() => setEditing(cloneGroup(group))}>
             <td class="strong mono">{group.name}</td>
-            <td>
-              <div class="route-chain">
-                <For each={group.targets}>{(target, index) => <>
-                  <Show when={index()}><span class="route-arrow" aria-hidden="true">→</span></Show>
-                  <span class="pill" classList={{ accent: index() === 0 }}>{target}</span>
-                </>}</For>
-              </div>
-            </td>
+            <td><PoolPills pool={group.primary} accent /></td>
+            <td><PoolPills pool={group.fallback} /></td>
             <td class="actions">
               <button class="icon-button danger" title={`Delete ${group.name}`} aria-label={`Delete ${group.name}`} onClick={async (e) => {
                 e.stopPropagation();
@@ -1250,23 +1252,59 @@ function Routing(props: { refresh: () => number }) {
   </div>;
 }
 
+/// Every model a group can reach, primary first — for search and for the
+/// pages that only care which models are covered.
+function allTargets(group: RouteGroup): string[] {
+  return [...group.primary, ...group.fallback].map((t) => t.target);
+}
+
+function cloneGroup(group: RouteGroup): RouteGroup {
+  return { name: group.name, primary: group.primary.map((t) => ({ ...t })), fallback: group.fallback.map((t) => ({ ...t })) };
+}
+
+/// A pool's share of traffic, per member. Weights are ratios, so the
+/// number an operator typed is only meaningful next to its siblings —
+/// the percentage is what they actually wanted to know.
+function shares(pool: RouteTarget[]): number[] {
+  const total = pool.reduce((sum, t) => sum + (t.weight > 0 ? t.weight : 0), 0);
+  return pool.map((t) => (total > 0 ? (t.weight > 0 ? t.weight : 0) / total : 0));
+}
+
+function percent(share: number): string {
+  const value = share * 100;
+  // Two models at 1:2 are 33.3/66.7, and rounding both to whole numbers
+  // loses the point; a clean split should still read as "50%".
+  return `${value >= 10 || value === 0 ? Math.round(value) : value.toFixed(1)}%`;
+}
+
+function PoolPills(props: { pool: RouteTarget[]; accent?: boolean }) {
+  const split = createMemo(() => shares(props.pool));
+  return <Show when={props.pool.length} fallback={<span class="muted">—</span>}>
+    <div class="route-chain">
+      <For each={props.pool}>{(entry, index) => (
+        <span class="pill" classList={{ accent: props.accent }} title={`weight ${entry.weight}`}>
+          {entry.target}<span class="route-share">{percent(split()[index()])}</span>
+        </span>
+      )}</For>
+    </div>
+  </Show>;
+}
+
 function RouteDialog(props: { group: RouteGroup; options: Option[]; onClose: () => void; onDone: () => void }) {
   escapeCloses(props.onClose);
   const [name, setName] = createSignal(props.group.name);
-  const [targets, setTargets] = createSignal<string[]>(props.group.targets);
+  const [primary, setPrimary] = createSignal<RouteTarget[]>(props.group.primary);
+  const [fallback, setFallback] = createSignal<RouteTarget[]>(props.group.fallback);
   const [error, setError] = createSignal("");
   const [pending, setPending] = createSignal(false);
-  const move = (index: number, delta: number) => {
-    const next = [...targets()];
-    const to = index + delta;
-    if (to < 0 || to >= next.length) return;
-    [next[index], next[to]] = [next[to], next[index]];
-    setTargets(next);
-  };
+
+  const invalid = createMemo(() =>
+    [...primary(), ...fallback()].some((t) => !Number.isFinite(t.weight) || t.weight <= 0));
+
   return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
     <form class="dialog wide" role="dialog" aria-modal="true" aria-labelledby="route-title" onSubmit={async (e) => {
       e.preventDefault(); setError(""); setPending(true);
-      try { await api.putRoute({ name: name(), targets: targets() }); props.onDone(); }
+      try { await api.putRoute({ name: name(), primary: primary(), fallback: fallback() }); props.onDone(); }
       catch (err) { setError(err instanceof Error ? err.message : "Save failed"); }
       finally { setPending(false); }
     }}>
@@ -1277,39 +1315,98 @@ function RouteDialog(props: { group: RouteGroup; options: Option[]; onClose: () 
       <label>Group name
         <input required placeholder="fast" value={name()} onInput={(e) => setName(e.currentTarget.value)} />
       </label>
-      <div>
-        <p class="muted" style={{ "margin-bottom": "8px" }}>Targets, tried in order. The first is primary; the rest are fallbacks.</p>
-        <Show when={targets().length} fallback={<p class="muted">No targets yet.</p>}>
-          <ol class="route-editor">
-            <For each={targets()}>{(target, index) => (
-              <li>
-                <span class="route-rank">{index() === 0 ? "Primary" : `Fallback ${index()}`}</span>
-                <code class="mono">{target}</code>
-                <div class="route-controls">
-                  <button type="button" class="icon-button" aria-label="Move up" disabled={index() === 0} onClick={() => move(index(), -1)}>↑</button>
-                  <button type="button" class="icon-button" aria-label="Move down" disabled={index() === targets().length - 1} onClick={() => move(index(), 1)}>↓</button>
-                  <button type="button" class="icon-button danger" aria-label={`Remove ${target}`} onClick={() => setTargets(targets().filter((_, i) => i !== index()))}><X size={13} /></button>
-                </div>
-              </li>
-            )}</For>
-          </ol>
-        </Show>
-        <div class="route-add">
-          <Combobox
-            value=""
-            options={props.options.filter((o) => !targets().includes(o.value))}
-            onSelect={(value) => value && setTargets([...targets(), value])}
-            label="Add target"
-            placeholder={targets().length ? "Add a fallback…" : "Add the primary target…"}
-          />
-        </div>
-      </div>
+      <PoolEditor
+        title="Primary"
+        hint="Serves live traffic. Each request goes to one model, picked in proportion to its weight."
+        pool={primary()}
+        onChange={setPrimary}
+        options={props.options}
+        addLabel="Add a primary model…"
+      />
+      <PoolEditor
+        title="Fallback"
+        hint="Held in reserve. Reached only once every primary model has failed, then tried by weight."
+        pool={fallback()}
+        onChange={setFallback}
+        options={props.options}
+        addLabel="Add a fallback model…"
+        empty="No fallback — a request that exhausts the primary pool fails."
+      />
       <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
       <div class="dialog-actions">
         <button type="button" class="button outline" onClick={props.onClose}>Cancel</button>
-        <button class="button primary" disabled={pending() || !name() || !targets().length}>{pending() ? "Saving…" : "Save group"}</button>
+        <button class="button primary" disabled={pending() || !name() || !primary().length || invalid()}>{pending() ? "Saving…" : "Save group"}</button>
       </div>
     </form>
+  </div>;
+}
+
+/// One weighted pool. The share each model ends up with is shown next to
+/// its weight, because a weight on its own says nothing — an operator who
+/// types 3 against a sibling 1 is asking for 75%, and should be able to
+/// see that before saving rather than after traffic moves.
+function PoolEditor(props: {
+  title: string;
+  hint: string;
+  pool: RouteTarget[];
+  onChange: (pool: RouteTarget[]) => void;
+  options: Option[];
+  addLabel: string;
+  empty?: string;
+}) {
+  const split = createMemo(() => shares(props.pool));
+  // Scoped to this pool, not the group: the same model may serve live
+  // traffic and be another provider's reserve, but a pool cannot hold it
+  // twice — the gateway rejects that outright.
+  const available = createMemo(() => {
+    const held = new Set(props.pool.map((t) => t.target));
+    return props.options.filter((o) => !held.has(o.value));
+  });
+  const setWeight = (index: number, raw: string) => {
+    const next = props.pool.map((t, i) => (i === index ? { ...t, weight: Number(raw) } : t));
+    props.onChange(next);
+  };
+  return <div>
+    <div class="pool-head">
+      <h3>{props.title}</h3>
+      <p class="muted">{props.hint}</p>
+    </div>
+    <Show when={props.pool.length} fallback={<p class="muted">{props.empty ?? "No models yet."}</p>}>
+      <ol class="route-editor weighted">
+        <For each={props.pool}>{(entry, index) => (
+          <li>
+            <code class="mono">{entry.target}</code>
+            <label class="weight-field">
+              <span class="sr-only">{`Weight for ${entry.target}`}</span>
+              <input
+                type="number"
+                min="0"
+                step="any"
+                value={entry.weight}
+                aria-invalid={!(entry.weight > 0)}
+                onInput={(e) => setWeight(index(), e.currentTarget.value)}
+              />
+            </label>
+            <span class="route-share" aria-label={`${percent(split()[index()])} of ${props.title.toLowerCase()} traffic`}>
+              {percent(split()[index()])}
+            </span>
+            <div class="route-controls">
+              <button type="button" class="icon-button danger" aria-label={`Remove ${entry.target}`}
+                onClick={() => props.onChange(props.pool.filter((_, i) => i !== index()))}><X size={13} /></button>
+            </div>
+          </li>
+        )}</For>
+      </ol>
+    </Show>
+    <div class="route-add">
+      <Combobox
+        value=""
+        options={available()}
+        onSelect={(value) => value && props.onChange([...props.pool, { target: value, weight: 1 }])}
+        label={`Add to ${props.title.toLowerCase()}`}
+        placeholder={props.addLabel}
+      />
+    </div>
   </div>;
 }
 
@@ -1486,11 +1583,17 @@ function useTelemetry(
   // memo below: `/requests` with no `since_ms` defaults to the last
   // hour, so an unbounded read made "Last 24 hours" mean "last hour",
   // and filtering client-side only narrowed that hour further.
-  const [tail] = createResource(dep, () => {
+  // Sub-day windows are aggregated by the gateway, not derived from a
+  // page of records here. Deriving them meant every figure on this page
+  // was really "of the most recent 1,000 requests", so on a busy gateway
+  // "Last hour" and "Last 24 hours" reported the same number and neither
+  // was the answer. One scan server-side also covers restarts, which an
+  // in-memory aggregate would not — and deploys restart the box.
+  const [live] = createResource(dep, () => {
     const r = resolveRange(range());
     if (!r.live) return undefined;
     const f = filters();
-    return api.requests(false, 1000, {
+    return api.usageSummary({
       since_ms: Math.floor(r.startMs),
       until_ms: Math.ceil(r.endMs),
       provider: f.provider || undefined,
@@ -1513,20 +1616,6 @@ function useTelemetry(
   const byModelRes = historyFor("model");
   const byKeyRes = historyFor("key");
   const byProviderRes = historyFor("provider");
-
-  /// The gateway has already applied both, so this is not the filter —
-  /// it is what keeps the view honest while a refetch is in flight, when
-  /// `tail()` still holds the payload for the previous range.
-  const liveRecords = createMemo(() => {
-    const r = resolved();
-    if (!r.live) return [];
-    const f = filters();
-    return (tail()?.data ?? []).filter((rec) =>
-      rec.ts >= r.startMs && rec.ts <= r.endMs
-      && (!f.provider || rec.provider === f.provider)
-      && (!f.model || rec.model === f.model)
-      && (!f.key || rec.vkey === f.key));
-  });
 
   const sliceDays = (series: Record<string, DayBucket[]> | undefined) => {
     if (!series) return {};
@@ -1551,29 +1640,24 @@ function useTelemetry(
       cost: buckets.reduce((n, b) => n + b.cost_micro_usd, 0) / 1e6,
     }));
 
-  const liveSlices = (pick: (r: UsageRecord) => string) => {
-    const map = new Map<string, Slice>();
-    for (const rec of liveRecords()) {
-      const name = pick(rec) || "(none)";
-      const slice = map.get(name) ?? { name, requests: 0, failed: 0, input: 0, output: 0, cost: 0 };
-      slice.requests += 1;
-      if (rec.status >= 400) slice.failed += 1;
-      slice.input += rec.input_tokens;
-      slice.output += rec.output_tokens;
-      slice.cost += rec.cost_micro_usd / 1e6;
-      map.set(name, slice);
-    }
-    return [...map.values()];
-  };
+  const liveSlices = (pick: (s: UsageSummary) => UsageSlice[]): Slice[] =>
+    (live() ? pick(live()!) : []).map((s) => ({
+      name: s.name,
+      requests: s.requests,
+      failed: s.failed,
+      input: s.input_tokens,
+      output: s.output_tokens,
+      cost: s.cost_micro_usd / 1e6,
+    }));
 
   const byModel = createMemo<Slice[]>(() => resolved().live
-    ? liveSlices((r) => r.model)
+    ? liveSlices((s) => s.by_model)
     : slicesOf(sliceDays(byModelRes()?.data)));
   const byKey = createMemo<Slice[]>(() => resolved().live
-    ? liveSlices((r) => r.vkey ?? "")
+    ? liveSlices((s) => s.by_key)
     : slicesOf(sliceDays(byKeyRes()?.data)));
   const byProvider = createMemo<Slice[]>(() => resolved().live
-    ? liveSlices((r) => r.provider)
+    ? liveSlices((s) => s.by_provider)
     : slicesOf(sliceDays(byProviderRes()?.data)));
 
   /// Time series for the charts: minute buckets from the tail, or day
@@ -1582,18 +1666,13 @@ function useTelemetry(
     createMemo<TrendPoint[]>(() => {
       const r = resolved();
       if (r.live) {
-        const buckets = new Map<number, { requests: number; failed: number; input: number; output: number; cost: number }>();
-        for (const rec of liveRecords()) {
-          const minute = Math.floor(rec.ts / 60000) * 60;
-          const b = buckets.get(minute) ?? { requests: 0, failed: 0, input: 0, output: 0, cost: 0 };
-          b.requests += 1;
-          if (rec.status >= 400) b.failed += 1;
-          b.input += rec.input_tokens;
-          b.output += rec.output_tokens;
-          b.cost += rec.cost_micro_usd / 1e6;
-          buckets.set(minute, b);
-        }
-        return [...buckets.entries()].sort((a, b) => a[0] - b[0]).map(([ts, b]) => [ts, value(b)]);
+        return (live()?.series ?? []).map((b) => [b.ts, value({
+          requests: b.requests,
+          failed: b.failed,
+          input: b.input_tokens,
+          output: b.output_tokens,
+          cost: b.cost_micro_usd / 1e6,
+        })] as TrendPoint);
       }
       const perDay = new Map<string, { requests: number; failed: number; input: number; output: number; cost: number }>();
       for (const buckets of Object.values(sliceDays(byModelRes()?.data))) {
@@ -1612,13 +1691,13 @@ function useTelemetry(
         .map(([day, b]) => [Date.parse(`${day}T00:00:00`) / 1000, value(b)]);
     });
 
-  const truncated = createMemo(() => resolved().live && (tail()?.data.length ?? 0) >= 1000);
+  const truncated = createMemo(() => resolved().live && Boolean(live()?.capped));
   // "Still fetching" and "nothing to show" are different answers, and an
   // empty state shown during the first read is the wrong one.
   const loading = createMemo(() => resolved().live
-    ? tail.loading && !tail()
+    ? live.loading && !live()
     : byModelRes.loading && !byModelRes());
-  return { resolved, byModel, byKey, byProvider, trend, truncated, loading };
+  return { resolved, byModel, byKey, byProvider, trend, truncated, loading, live };
 }
 
 /// Shared filter row for the observability pages.
@@ -1768,7 +1847,7 @@ function Usage(props: { refresh: () => number }) {
     </section>
     </Loading>
     <Show when={t.truncated()}>
-      <p class="muted">Live view covers the most recent 1,000 requests; pick a day range for complete figures.</p>
+      <p class="muted">This window holds more requests than one scan covers; the figures above are a floor. Narrow the range or a filter for exact numbers.</p>
     </Show>
     <section class="flat-section">
       <header><h2>Tokens over time</h2><span class="muted">{t.resolved().label} · input vs output</span></header>
@@ -1833,7 +1912,7 @@ function Cost(props: { refresh: () => number }) {
     </section>
     </Loading>
     <Show when={t.truncated()}>
-      <p class="muted">Live view covers the most recent 1,000 requests; pick a day range for complete figures.</p>
+      <p class="muted">This window holds more requests than one scan covers; the figures above are a floor. Narrow the range or a filter for exact numbers.</p>
     </Show>
     <div class="two-up">
       <section class="flat-section">
@@ -2007,7 +2086,7 @@ function Requests(props: { refresh: () => number }) {
     const needle = search().trim().toLowerCase();
     if (!needle) return all();
     return all().filter((record) =>
-      `${record.requested} ${record.provider}/${record.model} ${record.vkey ?? ""} ${record.status} ${record.request_id} ${record.prompt ?? ""}`
+      `${record.requested} ${routeLabel(record)} ${record.vkey ?? ""} ${record.status} ${record.request_id} ${record.prompt ?? ""}`
         .toLowerCase()
         .includes(needle),
     );
@@ -2139,6 +2218,21 @@ function errorRate(summary?: RequestsSummary): string {
   return `${((summary.errors / summary.requests) * 100).toFixed(1)}% of requests`;
 }
 
+/// The route a request took, readable even when it never took one.
+///
+/// `model` is only filled in once a seat has been picked, so a request
+/// that died before that — a 503 with no attempts, which is what an
+/// exhausted provider looks like — carried an empty model and rendered as
+/// a bare "codex/". The model the caller *asked* for is known from the
+/// start, so it stands in: the row says what was wanted even when nothing
+/// served it. `requested` may already be provider-qualified, so only the
+/// last segment is taken and the provider is never printed twice.
+function routeLabel(record: UsageRecord): string {
+  const model = record.model || record.requested.split("/").pop() || "";
+  if (!record.provider) return record.requested || "—";
+  return model ? `${record.provider}/${model}` : record.provider;
+}
+
 /// One request, opened: what was sent, what came back, and the metadata
 /// that describes the trip.
 ///
@@ -2182,7 +2276,7 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
           <h3>Routing</h3>
           <dl>
             <div><dt>Status</dt><dd><Status text={String(record.status)} tone={record.status < 400 ? "success" : "danger"} /></dd></div>
-            <div><dt>Route</dt><dd class="mono">{record.provider}/{record.model}</dd></div>
+            <div><dt>Route</dt><dd class="mono">{routeLabel(record)}</dd></div>
             <div><dt>Requested</dt><dd class="mono">{record.requested}</dd></div>
             <div><dt>Endpoint</dt><dd class="mono">{record.endpoint}</dd></div>
             <div><dt>Virtual key</dt><dd class="mono">{record.vkey ?? "—"}</dd></div>
@@ -2215,12 +2309,24 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
                 <button type="button" aria-pressed={tab() === "input"} onClick={() => setTab("input")}>Input</button>
                 <button type="button" aria-pressed={tab() === "output"} onClick={() => setTab("output")}>Output</button>
               </div>
-              <Show when={renderable()}>
-                <div class="segmented" role="group" aria-label="View">
-                  <button type="button" aria-pressed={view() === "rendered"} onClick={() => setView("rendered")}>Rendered</button>
-                  <button type="button" aria-pressed={view() === "json"} onClick={() => setView("json")}>JSON</button>
-                </div>
-              </Show>
+              {/* Always mounted, disabled when the body did not parse.
+                  Unmounting it made switching Input → Output reflow the
+                  control row and slide the tabs sideways, which read as
+                  the drawer glitching rather than as "nothing to render". */}
+              <div class="segmented" role="group" aria-label="View">
+                <button
+                  type="button"
+                  disabled={!renderable()}
+                  title={renderable() ? undefined : "This body did not parse into a transcript"}
+                  aria-pressed={renderable() && view() === "rendered"}
+                  onClick={() => setView("rendered")}
+                >Rendered</button>
+                <button
+                  type="button"
+                  aria-pressed={!renderable() || view() === "json"}
+                  onClick={() => setView("json")}
+                >JSON</button>
+              </div>
             </div>
           }
         />
@@ -2274,8 +2380,8 @@ function RequestRows(props: {
             {/* One line, not two: the alias and the resolved route were
                 stacked, which doubled every row's height to show a string
                 that is usually the same one twice. */}
-            <td class="mono route-cell" title={`${record.requested} → ${record.provider}/${record.model}`}>
-              {record.provider}/{record.model}
+            <td class="mono route-cell" title={`${record.requested} → ${routeLabel(record)}`}>
+              {routeLabel(record)}
             </td>
             <Show when={!props.compact}>
               <td class="prompt-cell" title={record.prompt ?? ""}>
@@ -2322,7 +2428,8 @@ function Playground() {
   const modelOptions = createMemo<Option[]>(() => {
     const out: Option[] = [];
     for (const group of routes()?.data ?? []) {
-      out.push({ value: group.name, label: group.name, hint: `group · ${group.targets[0] ?? ""}` });
+      const split = group.primary.length > 1 ? `${group.primary.length} models` : (group.primary[0]?.target ?? "");
+      out.push({ value: group.name, label: group.name, hint: `group · ${split}` });
     }
     for (const provider of providers()?.data ?? []) {
       const models = new Set<string>();
@@ -3073,7 +3180,7 @@ function Models(props: { refresh: () => number }) {
           provider: provider.name,
           kind: provider.kind,
           format: formatOf(provider.name, provider.kind, model),
-          groups: (routes()?.data ?? []).filter((r) => r.targets.includes(target)).map((r) => r.name),
+          groups: (routes()?.data ?? []).filter((r) => allTargets(r).includes(target)).map((r) => r.name),
         });
       }
     }
