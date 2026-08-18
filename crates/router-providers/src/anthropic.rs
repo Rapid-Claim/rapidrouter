@@ -564,6 +564,31 @@ pub fn request_to_internal(body: &Value) -> Result<ChatRequest, GatewayError> {
                                 image_url: router_core::chat::ImageUrl { url, detail: None },
                             });
                         }
+                        // A PDF from a Claude-dialect caller. The outbound
+                        // side has always built these; without this arm
+                        // nothing could read one back, so a document was
+                        // dropped before translation even began.
+                        Some("document") => {
+                            let source = &block["source"];
+                            let media = source["media_type"]
+                                .as_str()
+                                .unwrap_or("application/pdf")
+                                .to_owned();
+                            let file = match source["type"].as_str() {
+                                Some("base64") => json!({
+                                    "filename": block["title"],
+                                    "file_data": format!(
+                                        "data:{media};base64,{}",
+                                        source["data"].as_str().unwrap_or_default()
+                                    ),
+                                }),
+                                _ => json!({
+                                    "filename": block["title"],
+                                    "file_url": source["url"],
+                                }),
+                            };
+                            parts.push(ContentPart::File { file });
+                        }
                         Some("tool_use") => tool_calls.push(ToolCall {
                             id: block["id"].as_str().unwrap_or_default().to_owned(),
                             call_type: "function".into(),
@@ -573,18 +598,27 @@ pub fn request_to_internal(body: &Value) -> Result<ChatRequest, GatewayError> {
                             },
                         }),
                         Some("tool_result") => {
+                            // Text AND images: a tool that answers with a
+                            // screenshot (browser, computer-use, chart
+                            // render) carries its whole answer in an image
+                            // block, and keeping only `text` handed the
+                            // model an empty result it could not act on.
                             let content = match &block["content"] {
-                                Value::String(s) => s.clone(),
-                                Value::Array(inner) => inner
-                                    .iter()
-                                    .filter_map(|b| b["text"].as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(""),
-                                _ => String::new(),
+                                Value::String(s) => Content::Text(s.clone()),
+                                Value::Array(inner) => {
+                                    let result: Vec<ContentPart> =
+                                        inner.iter().filter_map(result_part).collect();
+                                    match result.as_slice() {
+                                        [] => Content::Text(String::new()),
+                                        [ContentPart::Text { text }] => Content::Text(text.clone()),
+                                        _ => Content::Parts(result),
+                                    }
+                                }
+                                _ => Content::Text(String::new()),
                             };
                             messages.push(Message {
                                 role: "tool".into(),
-                                content: Some(Content::Text(content)),
+                                content: Some(content),
                                 tool_calls: None,
                                 tool_call_id: block["tool_use_id"].as_str().map(str::to_owned),
                                 name: None,
@@ -661,6 +695,34 @@ pub fn request_to_internal(body: &Value) -> Result<ChatRequest, GatewayError> {
         user: None,
         extra: Default::default(),
     })
+}
+
+/// One block of a `tool_result`'s content array, in the internal model.
+///
+/// Text and images only: those are the block types the Messages API
+/// permits inside a tool result, and anything else is left out rather than
+/// guessed at.
+fn result_part(block: &Value) -> Option<ContentPart> {
+    match block["type"].as_str() {
+        Some("text") => Some(ContentPart::Text {
+            text: block["text"].as_str().unwrap_or_default().to_owned(),
+        }),
+        Some("image") => {
+            let source = &block["source"];
+            let url = match source["type"].as_str() {
+                Some("base64") => format!(
+                    "data:{};base64,{}",
+                    source["media_type"].as_str().unwrap_or("image/png"),
+                    source["data"].as_str().unwrap_or_default()
+                ),
+                _ => source["url"].as_str().unwrap_or_default().to_owned(),
+            };
+            Some(ContentPart::ImageUrl {
+                image_url: router_core::chat::ImageUrl { url, detail: None },
+            })
+        }
+        _ => None,
+    }
 }
 
 fn simple_message(role: &str, text: String) -> Message {

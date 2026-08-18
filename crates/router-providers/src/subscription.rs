@@ -19,6 +19,7 @@
 //! Everything here is pure: header lists and JSON bodies in, no I/O.
 
 use router_core::chat::{ChatRequest, Content, ContentPart, Message};
+use router_core::{ErrorClass, GatewayError};
 use serde_json::{Map, Value, json};
 
 // ---------------------------------------------------------------------------
@@ -174,9 +175,13 @@ pub struct CodexRequest {
 ///   it checks `input` only, never `instructions`. A caller whose "return
 ///   JSON" wording lives in their system prompt would otherwise 400, so a
 ///   short neutral hint is appended when it is missing.
-pub fn codex_request(req: &ChatRequest, model: &str, settings: &CodexSettings) -> CodexRequest {
+pub fn codex_request(
+    req: &ChatRequest,
+    model: &str,
+    settings: &CodexSettings,
+) -> Result<CodexRequest, GatewayError> {
     let mut dropped = Vec::new();
-    let (instructions, input) = split_system_and_input(&req.messages);
+    let (instructions, input) = split_system_and_input(&req.messages)?;
 
     let text_format = codex_text_format(req.response_format.as_ref());
     let needs_json_hint = text_format
@@ -262,10 +267,10 @@ pub fn codex_request(req: &ChatRequest, model: &str, settings: &CodexSettings) -
         dropped.push(name.clone());
     }
 
-    CodexRequest {
+    Ok(CodexRequest {
         body: Value::Object(body),
         dropped_params: dropped,
-    }
+    })
 }
 
 /// A caller-supplied enum knob carried in `extra` (the Chat Completions
@@ -285,7 +290,9 @@ fn request_choice(req: &ChatRequest, name: &str) -> Option<String> {
 /// because this backend flattens a conversation and silently ignores
 /// native tool blocks replayed on the input array — a model that cannot
 /// see its own previous call will simply make it again.
-fn split_system_and_input(messages: &[Message]) -> (Option<String>, Vec<Value>) {
+fn split_system_and_input(
+    messages: &[Message],
+) -> Result<(Option<String>, Vec<Value>), GatewayError> {
     let mut instructions: Vec<String> = Vec::new();
     let mut input: Vec<Value> = Vec::new();
 
@@ -308,14 +315,39 @@ fn split_system_and_input(messages: &[Message]) -> (Option<String>, Vec<Value>) 
                     .as_ref()
                     .map(Content::as_text)
                     .unwrap_or_default();
-                input.push(user_text(format!("[tool_result for={id}] {text}")));
+                let mut content = vec![json!({
+                    "type": "input_text",
+                    "text": format!("[tool_result for={id}] {text}"),
+                })];
+                // A tool that answers with an image — a screenshot, a
+                // rendered chart — carries its whole answer there. The
+                // label stays text so the call it answers is still
+                // correlated; the image rides alongside it.
+                content.extend(image_parts(message).unwrap_or_default());
+                input.push(json!({
+                    "type": "message", "role": "user", "content": content,
+                }));
             }
             role => {
-                let mut content = message
-                    .content
-                    .as_ref()
-                    .map(|c| content_parts(c, role))
-                    .unwrap_or_default();
+                let mut content = match message.content.as_ref() {
+                    Some(c) => content_parts(c, role)?,
+                    None => Vec::new(),
+                };
+                // An assistant turn's content may hold only `output_text`;
+                // an `input_image` under `role: "assistant"` is refused by
+                // the backend outright. Carry the image on a user turn
+                // instead, exactly as a system-turn image is carried —
+                // the caller is telling us it is part of the context, so
+                // dropping it would answer from a prompt missing what the
+                // question is about.
+                if role == "assistant"
+                    && let Some(images) = image_parts(message)
+                {
+                    content.retain(|part| part["type"] != "input_image");
+                    input.push(json!({
+                        "type": "message", "role": "user", "content": images,
+                    }));
+                }
                 for call in message.tool_calls.iter().flatten() {
                     content.push(json!({
                         "type": if role == "assistant" { "output_text" } else { "input_text" },
@@ -337,7 +369,7 @@ fn split_system_and_input(messages: &[Message]) -> (Option<String>, Vec<Value>) 
     }
 
     let instructions = (!instructions.is_empty()).then(|| instructions.join("\n\n"));
-    (instructions, input)
+    Ok((instructions, input))
 }
 
 fn user_text(text: String) -> Value {
@@ -350,27 +382,49 @@ fn user_text(text: String) -> Value {
 
 /// Content parts in the Responses spelling. An assistant turn's text is
 /// `output_text`; everything the caller sends is `input_*`.
-fn content_parts(content: &Content, role: &str) -> Vec<Value> {
+fn content_parts(content: &Content, role: &str) -> Result<Vec<Value>, GatewayError> {
     let text_type = if role == "assistant" {
         "output_text"
     } else {
         "input_text"
     };
     match content {
-        Content::Text(text) if text.is_empty() => Vec::new(),
-        Content::Text(text) => vec![json!({"type": text_type, "text": text})],
+        Content::Text(text) if text.is_empty() => Ok(Vec::new()),
+        Content::Text(text) => Ok(vec![json!({"type": text_type, "text": text})]),
         Content::Parts(parts) => parts
             .iter()
             .filter_map(|part| match part {
-                ContentPart::Text { text } => Some(json!({"type": text_type, "text": text})),
-                ContentPart::ImageUrl { image_url } => {
-                    Some(json!({"type": "input_image", "image_url": image_url.url}))
-                }
-                // Audio and file parts have no Responses equivalent this
-                // backend accepts; the caller is told via dropped_params.
-                _ => None,
+                ContentPart::Text { text } => Some(Ok(json!({"type": text_type, "text": text}))),
+                ContentPart::ImageUrl { image_url } => Some(Ok(image_value(image_url))),
+                // A document reaching here was not rasterized — either the
+                // server skipped the pass or a new path forgot it. Saying
+                // so is the only honest outcome: dropping it silently is
+                // what made a model answer confidently about a PDF it was
+                // never shown.
+                ContentPart::File { .. } => Some(Err(GatewayError::new(
+                    ErrorClass::InvalidRequest,
+                    "this target cannot carry a document; it must be rasterized to images first",
+                )
+                .with_param("messages"))),
+                // Audio has no Responses equivalent this backend accepts.
+                ContentPart::InputAudio { .. } => None,
             })
             .collect(),
+    }
+}
+
+/// One image in the Responses spelling.
+///
+/// `detail` is carried when the caller set one: the backend accepts it
+/// (the Codex client's own `ImageDetail` is `auto|low|high|original`, and
+/// its default is `high`), so dropping it silently downgraded every image
+/// to whatever the backend chose.
+fn image_value(image_url: &router_core::chat::ImageUrl) -> Value {
+    match &image_url.detail {
+        Some(detail) if !detail.is_empty() => json!({
+            "type": "input_image", "image_url": image_url.url, "detail": detail,
+        }),
+        _ => json!({"type": "input_image", "image_url": image_url.url}),
     }
 }
 
@@ -381,9 +435,7 @@ fn image_parts(message: &Message) -> Option<Vec<Value>> {
     let images: Vec<Value> = parts
         .iter()
         .filter_map(|part| match part {
-            ContentPart::ImageUrl { image_url } => {
-                Some(json!({"type": "input_image", "image_url": image_url.url}))
-            }
+            ContentPart::ImageUrl { image_url } => Some(image_value(image_url)),
             _ => None,
         })
         .collect();
@@ -577,7 +629,7 @@ mod tests {
             message("system", "You are helpful."),
             message("user", "hello"),
         ]);
-        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default());
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
         assert_eq!(built.body["stream"], true);
         assert_eq!(built.body["store"], false, "nothing retained upstream");
         assert_eq!(built.body["instructions"], "You are helpful.");
@@ -596,7 +648,7 @@ mod tests {
         let mut req = request(vec![message("user", "hi")]);
         req.max_tokens = Some(256);
         req.temperature = Some(0.7);
-        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default());
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
         assert!(built.dropped_params.contains(&"max_tokens".to_owned()));
         assert!(built.dropped_params.contains(&"temperature".to_owned()));
     }
@@ -606,7 +658,7 @@ mod tests {
         let mut req = request(vec![message("user", "hi")]);
         req.extra.insert("reasoning_effort".into(), json!("high"));
         req.extra.insert("verbosity".into(), json!("high"));
-        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default());
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
         assert_eq!(built.body["reasoning"]["effort"], "high");
         assert_eq!(built.body["text"]["verbosity"], "high");
         assert!(
@@ -622,7 +674,8 @@ mod tests {
             verbosity: None,
             ..CodexSettings::default()
         };
-        let built = codex_request(&request(vec![message("user", "hi")]), "gpt-5.5", &settings);
+        let built =
+            codex_request(&request(vec![message("user", "hi")]), "gpt-5.5", &settings).unwrap();
         assert!(built.body.get("reasoning").is_none());
         assert!(built.body.get("text").is_none(), "no text object at all");
     }
@@ -640,7 +693,7 @@ mod tests {
             },
         }]);
         req.tool_choice = Some(json!({"type": "function", "function": {"name": "get_weather"}}));
-        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default());
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
         let tool = &built.body["tools"][0];
         assert_eq!(tool["type"], "function");
         assert_eq!(
@@ -680,7 +733,7 @@ mod tests {
             message("user", "extract the codes"),
         ]);
         req.response_format = Some(json!({"type": "json_object"}));
-        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default());
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
         let input = built.body["input"].as_array().unwrap();
         // The caller's "JSON" wording went to `instructions`, which the
         // backend does not check — so the hint must have been added.
@@ -690,7 +743,7 @@ mod tests {
         // A caller who says it in the user turn gets no hint.
         let mut said_it = request(vec![message("user", "reply as json")]);
         said_it.response_format = Some(json!({"type": "json_object"}));
-        let built = codex_request(&said_it, "gpt-5.5", &CodexSettings::default());
+        let built = codex_request(&said_it, "gpt-5.5", &CodexSettings::default()).unwrap();
         assert_eq!(built.body["input"].as_array().unwrap().len(), 1);
     }
 
@@ -710,7 +763,7 @@ mod tests {
         result.tool_call_id = Some("call_1".into());
 
         let req = request(vec![message("user", "weather?"), assistant, result]);
-        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default());
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
         let input = built.body["input"].as_array().unwrap();
         assert_eq!(input.len(), 3);
         let call_text = input[1]["content"][0]["text"].as_str().unwrap();
@@ -729,7 +782,7 @@ mod tests {
             ]}]
         }))
         .unwrap();
-        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default());
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
         let content = built.body["input"][0]["content"].as_array().unwrap();
         assert_eq!(content[0]["type"], "input_text");
         assert_eq!(content[1]["type"], "input_image");

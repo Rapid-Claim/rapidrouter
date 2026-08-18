@@ -464,6 +464,85 @@ pub async fn handle_chat(
     }
 }
 
+/// Render any attached document to images for a target that cannot carry
+/// one, memoizing across targets and attempts.
+///
+/// Rendering a chart runs to hundreds of milliseconds of pure CPU, so it
+/// goes to a blocking thread: doing it inline would stall every other
+/// request sharing the runtime worker. It is also done at most once per
+/// request — the result is deterministic, so repeating it for each
+/// failover attempt would multiply the cost for an identical answer.
+/// Whether a raw Responses request body carries a document part.
+///
+/// Shape-only and cheap: it decides whether a Codex request can take the
+/// verbatim relay path, and a body with no attachment must pay nothing for
+/// the question.
+fn responses_body_has_documents(value: &Value) -> bool {
+    value["input"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|item| item["content"].as_array())
+        .flatten()
+        .any(|part| part["type"] == "input_file" || part["type"] == "file")
+}
+
+async fn documents_as_images<'a>(
+    req: &'a ChatRequest,
+    cache: &'a mut Option<ChatRequest>,
+    route: &ResolvedRoute,
+) -> Result<&'a ChatRequest, GatewayError> {
+    if cache.is_none() {
+        let defaults = router_media::RasterSettings::default();
+        let settings = match route.provider.codex.as_ref() {
+            Some(codex) => router_media::RasterSettings {
+                dpi: codex.pdf_dpi,
+                max_pages: codex.pdf_max_pages,
+                ..defaults
+            },
+            None => defaults,
+        };
+        let source = req.clone();
+        let (rendered, report) = tokio::task::spawn_blocking(move || {
+            router_media::rasterize_request(&source, &settings)
+        })
+        .await
+        .map_err(|e| {
+            GatewayError::new(
+                ErrorClass::UpstreamError,
+                format!("document rasterization failed: {e}"),
+            )
+        })??;
+        metrics::counter!("rapid_pdf_pages_rendered_total",
+            "provider" => route.provider.name.clone())
+        .increment(report.pages_rendered as u64);
+        if report.pages_dropped > 0 {
+            // Never a silent truncation: a caller who attached a 200-page
+            // chart and got an answer about the first fifty pages must be
+            // able to find out why.
+            metrics::counter!("rapid_pdf_pages_dropped_total",
+                "provider" => route.provider.name.clone())
+            .increment(report.pages_dropped as u64);
+            tracing::warn!(
+                provider = %route.provider.name,
+                documents = report.documents,
+                rendered = report.pages_rendered,
+                dropped = report.pages_dropped,
+                "document exceeded the page ceiling; the remaining pages were NOT sent"
+            );
+        } else {
+            tracing::debug!(
+                provider = %route.provider.name,
+                documents = report.documents,
+                pages = report.pages_rendered,
+                "rasterized attached documents to images"
+            );
+        }
+        *cache = Some(rendered);
+    }
+    Ok(cache.as_ref().expect("just populated"))
+}
+
 async fn run_chat(
     state: &AppState,
     inbound: &InboundChat,
@@ -481,6 +560,9 @@ async fn run_chat(
 
     // Parsed lazily, at most once, only when some target needs translation.
     let mut internal: Option<ChatRequest> = None;
+    // The same request with attached documents rendered to images, for
+    // targets that cannot carry a document. Also at most once.
+    let mut rasterized: Option<ChatRequest> = None;
 
     let mut attempts: u32 = 0;
     let mut last_error: Option<GatewayError> = None;
@@ -515,6 +597,13 @@ async fn run_chat(
             let req = match &internal {
                 Some(r) => r,
                 None => internal.insert(inbound.to_internal()?),
+            };
+            let req = if router_providers::needs_rasterized_documents(out_dialect)
+                && router_media::has_documents(req)
+            {
+                documents_as_images(req, &mut rasterized, route).await?
+            } else {
+                req
             };
             let built = router_providers::build_outbound(
                 out_dialect,
@@ -2111,6 +2200,9 @@ async fn run_responses(
 
     // Parsed lazily, at most once, only when some target needs translation.
     let mut internal: Option<router_core::chat::ChatRequest> = None;
+    // Attached documents rendered to images, for targets that cannot carry
+    // a document. Computed at most once, like `internal`.
+    let mut rasterized: Option<router_core::chat::ChatRequest> = None;
 
     let mut attempts: u32 = 0;
     let mut last_error: Option<GatewayError> = None;
@@ -2140,7 +2232,15 @@ async fn run_responses(
         // features survive the trip. It answers in SSE and nothing else,
         // so a caller who wants a whole body still goes the translated
         // route, where the stream is aggregated at our end.
-        let codex_relay = out_dialect == Dialect::CodexResponses && stream && !wants_state;
+        // ...except when the caller attached a document. Relaying is
+        // verbatim, and this backend has no document part to relay one
+        // into, so a native relay would forward an `input_file` the
+        // backend cannot read. Translating instead is what routes the
+        // request through rasterization.
+        let codex_relay = out_dialect == Dialect::CodexResponses
+            && stream
+            && !wants_state
+            && !responses_body_has_documents(&value);
         let relay = out_dialect == Dialect::OpenAi || codex_relay;
         let (out_body, path, emulated) = if relay {
             let rewritten = if codex_relay {
@@ -2191,6 +2291,13 @@ async fn run_responses(
                     }
                     internal.insert(parsed.internal)
                 }
+            };
+            let req = if router_providers::needs_rasterized_documents(out_dialect)
+                && router_media::has_documents(req)
+            {
+                documents_as_images(req, &mut rasterized, route).await?
+            } else {
+                req
             };
             let built = router_providers::build_outbound(
                 out_dialect,

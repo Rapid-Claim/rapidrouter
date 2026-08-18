@@ -77,6 +77,16 @@ Hard-won details, all measured against the live backend:
   `response.completed` — on this backend that final event carries an *empty*
   `output` array. Reading only `response.completed` yields a 200 with no tool
   calls: a silent failure, worse than an error.
+- **There is no document part.** The backend's content vocabulary is
+  `input_text` and `input_image` and nothing else — the Codex client's own
+  `ContentItem` enum has three variants and none of them is a file, so a PDF
+  has no representation on this wire at all. An attached document is
+  rendered to one image per page before translation (`router-media`, pure
+  Rust so the release build stays a static musl binary), at
+  `codex.pdf_dpi` (default 150) and capped at `codex.pdf_max_pages`
+  (default 50). Pages beyond the cap are logged and counted, never silently
+  cut. Anthropic and Gemini take a PDF natively and are *not* pre-rendered:
+  rasterizing would throw away the text layer those APIs read.
 - **`json_object` requires the word "json" in `input`**, and the backend
   checks `input` only — never `instructions`. Since a caller's "return JSON"
   wording usually lives in the system prompt (which maps to `instructions`),

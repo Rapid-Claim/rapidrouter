@@ -697,6 +697,29 @@ fn validate_codex(
     ) {
         settings.verbosity = verbosity;
     }
+    // Bounded rather than free: a DPI of 5 renders an unreadable page and a
+    // DPI of 2000 builds a request body no upstream will accept, and both
+    // fail far from the typo that caused them.
+    if let Some(dpi) = raw.and_then(|c| c.pdf_dpi) {
+        if !(36..=600).contains(&dpi) {
+            errors.push(ConfigError::new(
+                format!("{path}.codex.pdf_dpi"),
+                "must be between 36 and 600",
+            ));
+        } else {
+            settings.pdf_dpi = dpi;
+        }
+    }
+    if let Some(pages) = raw.and_then(|c| c.pdf_max_pages) {
+        if pages == 0 {
+            errors.push(ConfigError::new(
+                format!("{path}.codex.pdf_max_pages"),
+                "must be at least 1",
+            ));
+        } else {
+            settings.pdf_max_pages = pages;
+        }
+    }
     Some(settings)
 }
 

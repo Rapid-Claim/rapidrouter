@@ -56,6 +56,22 @@ pub fn wire_dialect(kind: ProviderKind) -> Option<Dialect> {
     }
 }
 
+/// Whether a dialect needs documents rendered to images before it can be
+/// built for.
+///
+/// Only the Codex backend does. Its content vocabulary is `input_text` and
+/// `input_image` — the official client's own `ContentItem` enum has three
+/// variants and none of them is a file — so a PDF has no representation on
+/// that wire at all. Anthropic and Gemini both take a document natively and
+/// must NOT be pre-rendered: rasterizing would throw away the extractable
+/// text layer those APIs use.
+pub fn needs_rasterized_documents(dialect: Dialect) -> bool {
+    match dialect {
+        Dialect::CodexResponses => true,
+        Dialect::OpenAi | Dialect::Anthropic | Dialect::Gemini | Dialect::Bedrock => false,
+    }
+}
+
 /// A fully translated upstream request body plus its metadata.
 pub struct OutboundRequest {
     /// Path (and query) appended to the provider's base URL.
@@ -145,7 +161,7 @@ pub fn build_outbound(
             // whole body upstream.
             let _ = stream;
             let settings = codex.cloned().unwrap_or_default();
-            let built = subscription::codex_request(req, model, &settings);
+            let built = subscription::codex_request(req, model, &settings)?;
             Ok(OutboundRequest {
                 path: "/backend-api/codex/responses".into(),
                 body: serde_json::to_vec(&built.body)

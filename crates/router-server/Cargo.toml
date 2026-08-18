@@ -11,6 +11,7 @@ console = []
 
 [dependencies]
 router-core = { workspace = true }
+router-media = { workspace = true }
 router-providers = { workspace = true }
 router-store = { workspace = true }
 bytes = { workspace = true }
