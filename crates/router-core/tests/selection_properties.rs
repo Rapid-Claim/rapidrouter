@@ -100,10 +100,7 @@ fn group_table(primary: &[f64], fallback: &[f64]) -> RoutingTable {
         pool(0, primary)
     ));
     if !fallback.is_empty() {
-        toml.push_str(&format!(
-            "fallback = [{}]\n",
-            pool(primary.len(), fallback)
-        ));
+        toml.push_str(&format!("fallback = [{}]\n", pool(primary.len(), fallback)));
     }
     let config = Config::from_str_with_env(&toml, Format::Toml, &|_: &str| None).unwrap();
     RoutingTable::from_config(&config)

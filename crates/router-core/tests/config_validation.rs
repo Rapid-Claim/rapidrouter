@@ -677,7 +677,9 @@ primary = [{{ target = "cheap" }}]
 #[test]
 fn routing_group_without_primary_rejected() {
     assert_invalid(
-        &format!("{TWO_PROVIDERS}\n[groups.fast]\nfallback = [{{ target = \"openai/gpt-4o-mini\" }}]\n"),
+        &format!(
+            "{TWO_PROVIDERS}\n[groups.fast]\nfallback = [{{ target = \"openai/gpt-4o-mini\" }}]\n"
+        ),
         &[],
         "groups.fast.primary",
         "at least one primary model",
@@ -781,7 +783,9 @@ primary = [{{ target = "openai/gpt-4o-mini" }}]
 #[test]
 fn routing_group_colliding_with_provider_rejected() {
     assert_invalid(
-        &format!("{TWO_PROVIDERS}\n[groups.openai]\nprimary = [{{ target = \"openai/gpt-4o-mini\" }}]\n"),
+        &format!(
+            "{TWO_PROVIDERS}\n[groups.openai]\nprimary = [{{ target = \"openai/gpt-4o-mini\" }}]\n"
+        ),
         &[],
         "groups.openai",
         "collides with a provider name",
