@@ -20,10 +20,16 @@ set -euo pipefail
 
 HOST="${DEPLOY_HOST:-34.233.227.213}"
 SSH_KEY="${DEPLOY_KEY:-$HOME/.ssh/ashutosh-server.pem}"
-SSH=(ssh -i "$SSH_KEY" -o BatchMode=yes "ubuntu@${HOST}")
+# Keepalives are not optional here: the build step is minutes of silence
+# on the connection, and without them a NAT or firewall idle-timeout drops
+# it with neither end noticing. The script then blocks forever on a socket
+# that will never answer, after the box has already finished building —
+# which is exactly what happened, leaving a built binary uninstalled.
+SSH_OPTS=(-i "$SSH_KEY" -o BatchMode=yes -o ServerAliveInterval=15 -o ServerAliveCountMax=8)
+SSH=(ssh "${SSH_OPTS[@]}" "ubuntu@${HOST}")
 
 echo "==> Syncing source"
-rsync -az -e "ssh -i $SSH_KEY" \
+rsync -az -e "ssh ${SSH_OPTS[*]}" \
   --exclude target --exclude node_modules --exclude .git \
   --exclude .rapidrouter --exclude console/dist \
   ./ "ubuntu@${HOST}:rapid-router-src/"
