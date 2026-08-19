@@ -1,7 +1,10 @@
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   Boxes,
   ChartNoAxesCombined,
+  ChevronsUpDown,
   Coins,
   ChevronRight,
   CircleGauge,
@@ -420,6 +423,14 @@ function Providers(props: { refresh: () => number }) {
     return needle ? all.filter((p) => `${p.name} ${p.kind}`.toLowerCase().includes(needle)) : all;
   });
 
+  // The drawer opens on the seats with the most room left, because the
+  // question it is opened to answer is almost always "which of these
+  // can take traffic right now". Any column can take over from there.
+  const [sort, setSort] = createSignal<CredSort>({ column: "headroom", dir: "desc" });
+  const sortBy = (column: CredColumn) => setSort((prev) => prev.column === column
+    ? { column, dir: prev.dir === "asc" ? "desc" : "asc" }
+    : { column, dir: CRED_SORT_DIR[column] });
+
   // A check is a real request per credential, so the page says which one
   // is in flight ("*" for all) and keeps each result until the next run.
   const [checking, setChecking] = createSignal<string | null>(null);
@@ -529,13 +540,18 @@ function Providers(props: { refresh: () => number }) {
             <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
               <table class="dense">
                 <thead><tr>
-                  <th>Credential</th>
-                  <th>{provider.subscription ? "Plan windows" : "Limits"}</th>
-                  <th>Token</th>
-                  <th>Health</th>
+                  <SortHeader label="Credential" column="credential" sort={sort()} onSort={sortBy} />
+                  <SortHeader
+                    label={provider.subscription ? "Plan windows" : "Limits"}
+                    column="headroom"
+                    sort={sort()}
+                    onSort={sortBy}
+                  />
+                  <SortHeader label="Token" column="token" sort={sort()} onSort={sortBy} />
+                  <SortHeader label="Health" column="health" sort={sort()} onSort={sortBy} />
                   <th><span class="sr-only">Actions</span></th>
                 </tr></thead>
-                <tbody><For each={provider.keys}>{(key) => (
+                <tbody><For each={sortCredentials(provider.keys, sort(), provider.subscription)}>{(key) => (
                   <CredentialRow
                     providerKey={key}
                     kind={provider.kind}
@@ -895,6 +911,19 @@ function formatClock(ms: number): string {
     : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
+/// A wall-clock moment, date and time both. "resets in 4h" makes an
+/// operator do the arithmetic against a clock they can already see, and
+/// gets it wrong across a day boundary; the moment itself does not.
+function formatMoment(ms: number): string {
+  const date = new Date(ms);
+  const sameDay = date.toDateString() === new Date().toDateString();
+  return date.toLocaleString(undefined, {
+    ...(sameDay ? {} : { month: "short", day: "numeric" }),
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
 function providerHealth(provider: Provider): { label: string; tone: "success" | "danger" | "muted" } {
   if (!provider.keys.length) return { label: "No keys", tone: "muted" };
   if (provider.keys.every((k: ProviderKey) => k.health === "benched")) return { label: "Out of quota", tone: "danger" };
@@ -918,6 +947,98 @@ function planWindowLabel(length_s: number): string {
   if (length_s < 86400) return `${Math.round(length_s / 3600)}-hour limit`;
   const days = Math.round(length_s / 86400);
   return days === 7 ? "Weekly limit" : `${days}-day limit`;
+}
+
+/// The credential columns an operator can order the table by.
+type CredColumn = "credential" | "headroom" | "token" | "health";
+type CredSort = { column: CredColumn; dir: "asc" | "desc" };
+
+/// The direction a column starts in when it is first clicked. Every one
+/// of these puts the answer to the column's own question on top: most
+/// room left, soonest expiry, healthiest, A first. Clicking again flips.
+const CRED_SORT_DIR: Record<CredColumn, "asc" | "desc"> = {
+  credential: "asc",
+  headroom: "desc",
+  token: "asc",
+  health: "asc",
+};
+
+/// How much of its longest plan window a seat has left, 0…1.
+///
+/// The longest window is the weekly one on the plans that report both,
+/// and weekly headroom is what decides whether a seat is worth routing
+/// to: one with 90% of its week left is still a good seat at 95% of a
+/// 5-hour window, and a seat with the week spent is not, however empty
+/// its 5-hour window looks right now.
+function planHeadroom(key: ProviderKey): number | null {
+  const windows = [key.quota?.primary, key.quota?.secondary]
+    .filter((w): w is QuotaWindow => Boolean(w?.length_s));
+  if (!windows.length) return null;
+  const longest = windows.reduce((a, b) => (b.length_s! > a.length_s! ? b : a));
+  return 1 - Math.min(Math.max(longest.utilization, 0), 1);
+}
+
+const CRED_HEALTH_RANK: Record<string, number> = {
+  ready: 0, healthy: 0, near_limit: 1, probing: 2, open: 3, exhausted: 4, benched: 4,
+};
+
+/// What a column sorts on. `null` means this credential has nothing to
+/// sort by, and always sinks to the bottom whichever way the column
+/// points — a seat that has never reported a window is not the emptiest
+/// one, it is the unknown one, and floating it to the top of "most room
+/// left" would send traffic at a seat nobody has heard from.
+function credSortValue(key: ProviderKey, column: CredColumn, subscription: boolean): number | string | null {
+  switch (column) {
+    case "credential":
+      return (key.credential?.email ?? key.name).toLowerCase();
+    case "headroom": {
+      if (subscription) return planHeadroom(key);
+      // A metered key has no window; its column shows the ceiling left
+      // this minute, so that is what its column sorts on.
+      const left = key.limits.rpm?.remaining ?? key.limits.tpm?.remaining;
+      return left ?? null;
+    }
+    case "token":
+      return key.credential?.expires_at_ms ?? null;
+    case "health":
+      return CRED_HEALTH_RANK[key.status ?? key.health] ?? 5;
+  }
+}
+
+function sortCredentials(keys: ProviderKey[], sort: CredSort, subscription: boolean): ProviderKey[] {
+  const dir = sort.dir === "asc" ? 1 : -1;
+  return [...keys].sort((a, b) => {
+    const left = credSortValue(a, sort.column, subscription);
+    const right = credSortValue(b, sort.column, subscription);
+    if (left === null || right === null) {
+      if (left === right) return a.name.localeCompare(b.name);
+      return left === null ? 1 : -1;
+    }
+    const order = typeof left === "string" || typeof right === "string"
+      ? String(left).localeCompare(String(right))
+      : left - right;
+    // Ties fall back to the name so the order is the same on every
+    // poll; a pool of seats all sitting at 0% used would otherwise
+    // reshuffle under the cursor every few seconds.
+    return order ? order * dir : a.name.localeCompare(b.name);
+  });
+}
+
+function SortHeader(props: {
+  label: string;
+  column: CredColumn;
+  sort: CredSort;
+  onSort: (column: CredColumn) => void;
+}) {
+  const active = () => props.sort.column === props.column;
+  return <th aria-sort={active() ? (props.sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+    <button type="button" class="th-sort" classList={{ active: active() }} onClick={() => props.onSort(props.column)}>
+      {props.label}
+      <Show when={active()} fallback={<ChevronsUpDown size={11} class="th-sort-idle" />}>
+        <Show when={props.sort.dir === "asc"} fallback={<ArrowDown size={11} />}><ArrowUp size={11} /></Show>
+      </Show>
+    </button>
+  </th>;
 }
 
 /// One credential as a table row.
@@ -964,17 +1085,13 @@ function CredentialRow(props: {
     return <div class="cred-window">
       <span class="cred-window-label">{planWindowLabel(win.length_s!)}</span>
       <div class={`meter ${meterTone}`}><i style={{ width: `${pct}%` }} /></div>
-      <span class="cred-window-pct">{pct}%{win.resets_in_s ? ` · resets ${formatDuration(win.resets_in_s)}` : ""}</span>
+      <span class="cred-window-pct">{pct}%{win.resets_in_s ? ` · resets ${formatMoment(Date.now() + win.resets_in_s * 1000)}` : ""}</span>
     </div>;
   };
 
   return <tr>
     <td>
       <strong>{key().credential?.email ?? key().name}</strong>
-      <small>
-        <Show when={key().credential?.email}>{key().name} · </Show>
-        {key().models?.length ? `${key().models!.length} model${key().models!.length > 1 ? "s" : ""}` : "every model"} · weight {key().weight}
-      </small>
     </td>
     <td>
       <Show when={props.subscription} fallback={
@@ -989,9 +1106,6 @@ function CredentialRow(props: {
         <Show when={planWindows().length} fallback={<span class="muted">Reports after the first request</span>}>
           <For each={planWindows()}>{(win) => windowCell(win)}</For>
         </Show>
-        <Show when={key().health === "benched" && key().benched_until_ms}>
-          <small class="muted">Out until {new Date(key().benched_until_ms!).toLocaleString()}</small>
-        </Show>
       </Show>
     </td>
     <td>
@@ -1004,10 +1118,9 @@ function CredentialRow(props: {
           // renews it on the next request. Only a credential that
           // cannot refresh is actually a problem worth alarming about.
           if (cred.can_refresh) {
-            return <>
-              <small>Renews automatically</small>
-              <Show when={at}><small class="muted">{cred.expired ? "renews on next use" : `valid until ${formatClock(at!)}`}</small></Show>
-            </>;
+            return <small class="muted">
+              {!at || cred.expired ? "renews on next use" : `valid until ${formatClock(at)}`}
+            </small>;
           }
           if (!at) return <small class="muted">No readable expiry</small>;
           const days = Math.round((at - Date.now()) / 86_400_000);
@@ -2998,15 +3111,6 @@ function SectionTitle(props: { title: string; subtitle: string; action?: any }) 
 function Fact(props: { label: string; value: string }) { return <div><dt>{props.label}</dt><dd>{props.value}</dd></div>; }
 function Status(props: { text: string; tone: "success" | "danger" | "muted" }) { return <span class={`status ${props.tone}`}><span />{props.text}</span>; }
 function Empty(props: { title: string; action: string }) { return <div class="empty"><strong>{props.title}</strong><p>{props.action}</p></div>; }
-/// Seconds as the coarsest unit that still says something useful. A
-/// weekly quota window reported as "604800s" tells an operator nothing;
-/// "7d" tells them which plan window they are looking at.
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  if (seconds < 86400) return `${(seconds / 3600).toFixed(seconds < 36000 ? 1 : 0)}h`;
-  return `${(seconds / 86400).toFixed(seconds < 864000 ? 1 : 0)}d`;
-}
 
 /// Daily spend, one line per series. Bars would imply the days are
 /// independent buckets to compare; a line reads as a trend, which is

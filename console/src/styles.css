@@ -428,6 +428,29 @@ th {
   font-size: 11px;
 }
 th.num, td.num { text-align: right; }
+
+/* A sortable heading is still a heading: the control is the word, and
+   the arrow only appears once it is carrying the sort. The idle chevron
+   shows on hover so the column advertises that it can be clicked
+   without every header shouting it at rest. */
+.th-sort {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  background: none;
+  border: 0;
+  padding: 0;
+  margin: 0;
+  color: inherit;
+  font: inherit;
+  cursor: pointer;
+  border-radius: 4px;
+}
+.th-sort:hover { color: var(--text); }
+.th-sort.active { color: var(--text); font-weight: 600; }
+.th-sort:focus-visible { box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus) 65%, transparent); }
+.th-sort-idle { opacity: 0; transition: opacity 90ms ease; }
+.th-sort:hover .th-sort-idle, .th-sort:focus-visible .th-sort-idle { opacity: 0.55; }
 td { height: 38px; padding: 7px 9px; border-bottom: 1px solid var(--border-soft); vertical-align: middle; font-variant-numeric: tabular-nums; color: var(--title); }
 tbody tr:last-child td { border-bottom: 0; }
 td strong, td small { display: block; }
