@@ -10,6 +10,7 @@ import {
   CircleGauge,
   Copy,
   KeyRound,
+  LogIn,
   LogOut,
   PanelLeft,
   Play,
@@ -61,6 +62,7 @@ import {
   login,
   sessionToken,
   type DayBucket,
+  type DeviceLogin,
   type Provider,
   type ProviderKey,
   type QuotaWindow,
@@ -427,6 +429,7 @@ function Providers(props: { refresh: () => number }) {
   // question it is opened to answer is almost always "which of these
   // can take traffic right now". Any column can take over from there.
   const [sort, setSort] = createSignal<CredSort>({ column: "headroom", dir: "desc" });
+  const [loggingIn, setLoggingIn] = createSignal<{ provider: string; key: string; email: string | null } | null>(null);
   const sortBy = (column: CredColumn) => setSort((prev) => prev.column === column
     ? { column, dir: prev.dir === "asc" ? "desc" : "asc" }
     : { column, dir: CRED_SORT_DIR[column] });
@@ -559,6 +562,11 @@ function Providers(props: { refresh: () => number }) {
                     checking={checking() === "*" || checking() === key.name}
                     probe={probes()[key.name] ?? null}
                     onCheck={() => runProbe(provider.name, key.name)}
+                    onLogin={() => setLoggingIn({
+                      provider: provider.name,
+                      key: key.name,
+                      email: key.credential?.email ?? null,
+                    })}
                     onRemove={async () => {
                       setError("");
                       try { await api.deleteProviderKey(provider.name, key.name); await refetch(); }
@@ -573,6 +581,19 @@ function Providers(props: { refresh: () => number }) {
         <AddCredential provider={provider} onDone={refetch} onError={setError} />
       </>}</Show>
     </Drawer>
+
+    <Show when={loggingIn()} keyed>{(target) => (
+      <DeviceLoginDialog
+        provider={target.provider}
+        credential={target.key}
+        email={target.email}
+        onClose={() => setLoggingIn(null)}
+        // Left open on success: the operator reads "signed in as …",
+        // which is the confirmation they came for. The table behind it
+        // is refreshed so the row stops claiming it needs a login.
+        onSignedIn={() => { void refetch(); }}
+      />
+    )}</Show>
 
     <Show when={adding()}>
       <AddProviderDialog
@@ -1041,6 +1062,138 @@ function SortHeader(props: {
   </th>;
 }
 
+/// Sign a Codex seat back in with a one-time code.
+///
+/// The gateway does the OAuth; this dialog is a display for a code and a
+/// link, and a poller for the answer. Closing it does not cancel the
+/// login — the exchange rotates a refresh token that has to be written
+/// to disk, so it runs server-side and finishes whether or not anyone is
+/// watching. Re-opening on the same seat re-attaches to the same code.
+function DeviceLoginDialog(props: {
+  provider: string;
+  credential: string;
+  email?: string | null;
+  onClose: () => void;
+  onSignedIn: () => void;
+}) {
+  escapeCloses(props.onClose);
+  const [login, setLogin] = createSignal<DeviceLogin | null>(null);
+  const [error, setError] = createSignal("");
+  const [copied, setCopied] = createSignal(false);
+
+  // Narrowed here rather than at each use: `outcome` is a discriminated
+  // union and JSX callbacks are not where TypeScript narrows it.
+  const signedAs = () => {
+    const outcome = login()?.outcome;
+    return outcome?.state === "signed" ? outcome.email : null;
+  };
+  const failure = () => {
+    const outcome = login()?.outcome;
+    return outcome?.state === "failed" ? outcome.reason : null;
+  };
+  const state = () => login()?.outcome.state;
+
+  // Registered synchronously, at setup: an `onCleanup` after an `await`
+  // has no owner to attach to, and the poller would outlive the dialog.
+  let timer: ReturnType<typeof setInterval> | undefined;
+  onCleanup(() => clearInterval(timer));
+
+  onMount(async () => {
+    let started: DeviceLogin;
+    try {
+      started = await api.startDeviceLogin(props.provider, props.credential);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start the login");
+      return;
+    }
+    setLogin(started);
+    if (started.outcome.state !== "waiting") return;
+
+    // Polled rather than streamed: a login takes as long as a person
+    // takes, and one small request every three seconds for a few minutes
+    // is cheaper than holding a connection open for it.
+    timer = setInterval(async () => {
+      try {
+        const next = await api.deviceLoginStatus(props.provider, props.credential, started.session);
+        setLogin(next);
+        if (next.outcome.state !== "waiting") {
+          clearInterval(timer);
+          if (next.outcome.state === "signed") props.onSignedIn();
+        }
+      } catch (err) {
+        clearInterval(timer);
+        setError(err instanceof Error ? err.message : "Lost track of the login");
+      }
+    }, 3000);
+  });
+
+  return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="device-login-title">
+      <header class="dialog-head">
+        <div>
+          <h2 id="device-login-title">Sign in again</h2>
+          <p class="muted">{props.email ?? props.credential}</p>
+        </div>
+        <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={props.onClose}><X size={16} /></button>
+      </header>
+
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+
+      <Show when={login()} fallback={<Show when={!error()}><p class="muted">Asking OpenAI for a code…</p></Show>}>
+        {(current) => <Switch>
+          <Match when={state() === "signed"}>
+            <p class="login-done" role="status">
+              Signed in{signedAs() ? ` as ${signedAs()}` : ""}. The seat is live again — no restart needed.
+            </p>
+          </Match>
+          <Match when={failure()}>
+            <p class="form-error" role="alert">{failure()}</p>
+            <p class="muted">Nothing changed: the seat still has the credential it had.</p>
+          </Match>
+          <Match when={state() === "waiting"}>
+            <ol class="login-steps">
+              <li>
+                Open <a href={current().verification_url} target="_blank" rel="noreferrer noopener">{current().verification_url}</a> and
+                sign in as <strong>{props.email ?? "this account"}</strong>.
+              </li>
+              <li>
+                Enter this one-time code:
+                <div class="login-code">
+                  <code>{current().user_code}</code>
+                  <button
+                    type="button"
+                    class="button outline"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(current().user_code);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 1500);
+                      } catch { setCopied(false); }
+                    }}
+                  ><Copy size={14} />{copied() ? "Copied" : "Copy"}</button>
+                </div>
+              </li>
+              <li>Come back here. The credential is written for you.</li>
+            </ol>
+            <p class="muted" role="status">
+              <RefreshCw size={12} class="spin" /> Waiting for you to finish — the code expires {formatMoment(current().expires_at_ms)}.
+            </p>
+            {/* The one thing a code like this is dangerous for. The CLI
+                says it too, in the same words. */}
+            <p class="muted">Device codes are a common phishing target. Never share this code.</p>
+          </Match>
+        </Switch>}
+      </Show>
+
+      <div class="dialog-actions">
+        <button type="button" class="button outline" onClick={props.onClose}>
+          {state() === "waiting" ? "Close — the login keeps running" : "Close"}
+        </button>
+      </div>
+    </div>
+  </div>;
+}
+
 /// One credential as a table row.
 function CredentialRow(props: {
   providerKey: ProviderKey;
@@ -1048,10 +1201,22 @@ function CredentialRow(props: {
   subscription: boolean;
   onRemove: () => void;
   onCheck: () => void;
+  onLogin: () => void;
   checking?: boolean;
   probe?: { status: string; detail: string } | null;
 }) {
   const key = () => props.providerKey;
+  // Two different ways a seat asks to be signed in again, and neither is
+  // reliable alone. The credential itself only knows it cannot renew;
+  // a refresh token that has been *revoked* still looks renewable from
+  // here and only confesses when something uses it, which is what the
+  // probe detail carries back.
+  const needsLogin = () => {
+    const cred = key().credential;
+    if (cred && !cred.can_refresh && cred.expired) return true;
+    const detail = props.probe?.detail?.toLowerCase() ?? "";
+    return props.probe?.status !== "ok" && (detail.includes("sign") || detail.includes("token is expired"));
+  };
   // The server folds breaker, quota and credential into one word; fall
   // back to raw breaker health for a gateway that has not been updated.
   const statusLabel = () => ({
@@ -1149,6 +1314,22 @@ function CredentialRow(props: {
       </Show>
     </td>
     <td class="actions">
+      {/* Codex seats only: this is Codex's own device-code endpoint. The
+          button is always offered rather than shown only when a seat
+          looks dead, because the signal for "needs a login" is a probe
+          away — a revoked refresh token reads as a perfectly ordinary
+          "renews on next use" until something actually tries it. */}
+      <Show when={props.kind === "CodexSubscription"}>
+        <button
+          class="icon-button"
+          classList={{ danger: needsLogin() }}
+          title={needsLogin() ? `Sign ${key().name} in again — its credential is dead` : `Sign ${key().name} in again`}
+          aria-label={`Sign ${key().name} in again`}
+          onClick={props.onLogin}
+        >
+          <LogIn size={14} />
+        </button>
+      </Show>
       <button
         class="icon-button"
         title={`Check ${key().name}`}
