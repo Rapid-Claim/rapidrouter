@@ -46,6 +46,14 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             "/providers/{name}/keys/{key}",
             axum::routing::delete(delete_provider_key),
         )
+        .route(
+            "/providers/{name}/keys/{key}/device-login",
+            post(start_device_login),
+        )
+        .route(
+            "/providers/{name}/keys/{key}/device-login/{session}",
+            get(device_login_status),
+        )
         .route("/catalog", get(catalog))
         .route("/pricing/refresh", post(refresh_pricing))
         .route("/secrets", post(put_secret))
@@ -1385,6 +1393,57 @@ async fn probe_provider(
         }
     }
     Json(json!({ "results": results })).into_response()
+}
+
+/// Mint a one-time code so an operator can sign a dead seat back in.
+///
+/// Deliberately not gated on `writable`: this writes the seat's own
+/// credential file, which is exactly what the refresher does on its own
+/// every ten days. A node whose *config* is file-managed still owns its
+/// credentials, and refusing here would leave the one class of seat that
+/// cannot self-heal with no way to heal at all.
+async fn start_device_login(
+    State(state): State<Arc<AppState>>,
+    Path((name, key)): Path<(String, String)>,
+) -> Response {
+    match crate::device_login::start(&state, &name, &key).await {
+        Ok((session, login)) => Json(json!({
+            "session": session,
+            "user_code": login.user_code,
+            "verification_url": login.verification_url,
+            "expires_at_ms": login.expires_at_ms,
+            "outcome": login.outcome.as_json(),
+        }))
+        .into_response(),
+        Err(refusal) => api_error(refusal.status, refusal.message),
+    }
+}
+
+/// Where a login has got to. Polled by the console while the dialog is
+/// open; the flow itself runs server-side and does not depend on it.
+async fn device_login_status(
+    State(state): State<Arc<AppState>>,
+    Path((name, key, session)): Path<(String, String, String)>,
+) -> Response {
+    let Some(login) = state.logins.get(&session) else {
+        // Also the answer for a login that finished long enough ago to
+        // have been reaped, which is why it says what to do about it.
+        return api_error(
+            StatusCode::NOT_FOUND,
+            "that login is no longer being tracked — start a new one",
+        );
+    };
+    if login.provider != name || login.key != key {
+        return api_error(StatusCode::NOT_FOUND, "that login belongs to another seat");
+    }
+    Json(json!({
+        "session": session,
+        "user_code": login.user_code,
+        "verification_url": login.verification_url,
+        "expires_at_ms": login.expires_at_ms,
+        "outcome": login.outcome.as_json(),
+    }))
+    .into_response()
 }
 
 /// The model a probe should ask for: whatever this credential declares

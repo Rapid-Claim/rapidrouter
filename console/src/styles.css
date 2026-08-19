@@ -546,6 +546,32 @@ tr.selected td { background: var(--surface-2); color: var(--text); }
 .dialog-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 16px; }
 .dialog-head p { margin-top: 3px; }
 
+/* Device-code login. The code is the whole point of the dialog, so it is
+   the only thing in it set at a size you can read across a desk while
+   typing it into a phone. */
+.login-steps { margin: 0; padding-left: 20px; display: flex; flex-direction: column; gap: 12px; color: var(--text); }
+.login-steps li { line-height: 1.5; }
+.login-code { display: flex; align-items: center; gap: 10px; margin-top: 8px; }
+.login-code code {
+  font-family: var(--font-mono);
+  font-size: 22px;
+  letter-spacing: 0.16em;
+  font-weight: 600;
+  color: var(--title);
+  background: var(--field);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-control);
+  padding: 8px 14px;
+  user-select: all;
+}
+.login-done {
+  background: var(--success-soft);
+  color: var(--success);
+  padding: 10px 14px;
+  border-radius: var(--radius-control);
+  margin: 0;
+}
+
 .secret-banner {
   border: 1px solid var(--accent-line);
   background: var(--accent-soft);

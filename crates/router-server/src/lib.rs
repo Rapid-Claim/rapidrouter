@@ -4,6 +4,7 @@
 mod admin;
 #[cfg(feature = "console")]
 mod console;
+pub mod device_login;
 mod proxy;
 pub mod refresh;
 mod upstream;
@@ -86,6 +87,8 @@ pub struct AppState {
     /// In-flight subscription-credential renewals, so concurrent requests
     /// against one seat share a single OAuth round trip.
     pub refreshes: refresh::RefreshRegistry,
+    /// Device-code logins an operator has started from the console.
+    pub logins: device_login::DeviceLoginRegistry,
     draining: AtomicBool,
     prometheus: PrometheusHandle,
 }
@@ -152,6 +155,7 @@ impl AppState {
             applied_text: ArcSwap::from_pointee(None),
             upstream: upstream::UpstreamClient::new(),
             refreshes: refresh::RefreshRegistry::default(),
+            logins: device_login::DeviceLoginRegistry::default(),
             draining: AtomicBool::new(false),
             prometheus: prometheus_handle().clone(),
         })

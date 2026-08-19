@@ -230,12 +230,15 @@ async fn post_refresh(
 
 /// Write via a temporary file in the same directory, then rename.
 ///
+/// Shared with [`crate::device_login`], which installs a credential the
+/// same way and must not invent a second answer to "how is this written".
+///
 /// The rename is atomic within a filesystem, so a reader — the vendor's
 /// own CLI, or another node — never observes a half-written credential.
 /// The temporary file is created alongside the target rather than in
 /// `/tmp` precisely so the rename cannot cross a filesystem boundary and
 /// silently degrade into a copy.
-fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
+pub(crate) fn write_atomic(path: &str, contents: &str) -> std::io::Result<()> {
     let target = std::path::Path::new(path);
     let directory = target.parent().unwrap_or_else(|| std::path::Path::new("."));
     let temporary = directory.join(format!(

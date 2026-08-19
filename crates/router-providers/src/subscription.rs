@@ -107,6 +107,83 @@ pub const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Where a Codex credential is renewed.
 pub const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
+// -- Device-code login ---------------------------------------------------
+//
+// The browser flow the Codex CLI runs by default is unusable here: it
+// pins its redirect to `http://localhost:1455/auth/callback`, which is
+// the operator's own machine, not the gateway. Device-code login is the
+// same client id reaching the same tokens without a redirect back to us
+// — the operator signs in on whatever machine has a browser, and this
+// process collects the result by polling.
+//
+// Shapes taken from the Codex CLI's `login/src/device_code_auth.rs`
+// (v0.136.0) and confirmed against the live endpoints (2026-08-19). It
+// resembles RFC 8628 without being it, and every difference is a way to
+// get this wrong:
+//
+// - The request and poll bodies are JSON, not form-encoded — unlike
+//   every other OAuth call in this file.
+// - `interval` comes back as a *string* (`"5"`), not a number.
+// - An outstanding code answers `403` with an
+//   `deviceauth_authorization_pending` code in the body, not the `200`
+//   plus `error: authorization_pending` an RFC 8628 client waits for. A
+//   client that treats non-2xx as fatal gives up on the first poll.
+// - What the poll finally returns is not a token but an authorization
+//   code with its own PKCE pair, which must then be exchanged at the
+//   ordinary token endpoint.
+
+/// Where a one-time code is minted.
+pub const CODEX_DEVICE_USERCODE_URL: &str =
+    "https://auth.openai.com/api/accounts/deviceauth/usercode";
+
+/// Where an outstanding one-time code is polled.
+pub const CODEX_DEVICE_TOKEN_URL: &str = "https://auth.openai.com/api/accounts/deviceauth/token";
+
+/// The page the operator opens to enter the code.
+pub const CODEX_DEVICE_VERIFICATION_URL: &str = "https://auth.openai.com/codex/device";
+
+/// The redirect the device-code authorization code was issued against.
+/// Nothing is served here — the value only has to match what the code was
+/// minted for, or the exchange is refused.
+pub const CODEX_DEVICE_REDIRECT_URI: &str = "https://auth.openai.com/deviceauth/callback";
+
+/// How long a one-time code stays good.
+///
+/// The response does carry an `expires_at` timestamp, which the CLI
+/// ignores in favour of this same constant. Followed here for the same
+/// reason it is there: reading it would mean parsing RFC 3339 in a crate
+/// that has no date library, to learn a number that was fifteen minutes
+/// every time it was measured (verified live 2026-08-19).
+pub const CODEX_DEVICE_CODE_TTL_S: u64 = 15 * 60;
+
+/// Fallback poll spacing for a response that omits `interval`.
+pub const CODEX_DEVICE_POLL_INTERVAL_S: u64 = 5;
+
+/// Ask for a one-time code.
+pub fn codex_device_usercode_body() -> String {
+    json!({ "client_id": CODEX_OAUTH_CLIENT_ID }).to_string()
+}
+
+/// Ask whether the operator has finished signing in yet.
+pub fn codex_device_poll_body(device_auth_id: &str, user_code: &str) -> String {
+    json!({ "device_auth_id": device_auth_id, "user_code": user_code }).to_string()
+}
+
+/// Trade the authorization code the poll returned for real tokens.
+///
+/// The verifier comes from the poll response rather than from us: the
+/// device endpoint generates the PKCE pair on the operator's behalf, so
+/// this half of the exchange is simply relaying it.
+pub fn codex_device_exchange_form(code: &str, code_verifier: &str) -> String {
+    format!(
+        "grant_type=authorization_code&code={}&redirect_uri={}&client_id={}&code_verifier={}",
+        form_encode(code),
+        form_encode(CODEX_DEVICE_REDIRECT_URI),
+        form_encode(CODEX_OAUTH_CLIENT_ID),
+        form_encode(code_verifier)
+    )
+}
+
 /// The Codex CLI version this gateway presents itself as.
 ///
 /// **Not cosmetic.** The ChatGPT backend gates model families on it and
@@ -511,23 +588,29 @@ pub fn codex_tool_choice(choice: &Value) -> Value {
     choice.clone()
 }
 
+/// Percent-encode a value for an `x-www-form-urlencoded` body.
+///
+/// Hand-rolled rather than pulled in: the unreserved set is four lines,
+/// and a token that arrives with a `+` in it must not be decoded as a
+/// space at the other end.
+fn form_encode(value: &str) -> String {
+    value
+        .bytes()
+        .map(|b| match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                (b as char).to_string()
+            }
+            _ => format!("%{b:02X}"),
+        })
+        .collect()
+}
+
 /// The form body that renews a Codex credential.
 pub fn codex_refresh_form(refresh_token: &str) -> String {
-    let encode = |value: &str| {
-        value
-            .bytes()
-            .map(|b| match b {
-                b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
-                    (b as char).to_string()
-                }
-                _ => format!("%{b:02X}"),
-            })
-            .collect::<String>()
-    };
     format!(
         "grant_type=refresh_token&client_id={}&refresh_token={}",
-        encode(CODEX_OAUTH_CLIENT_ID),
-        encode(refresh_token)
+        form_encode(CODEX_OAUTH_CLIENT_ID),
+        form_encode(refresh_token)
     )
 }
 
@@ -798,6 +881,35 @@ mod tests {
             form.contains("refresh_token=rt.1.AA%2Bbc%2Fd%3D"),
             "reserved characters must be percent-encoded: {form}"
         );
+    }
+
+    #[test]
+    fn device_login_bodies_are_json_not_forms() {
+        // The device endpoints take JSON. Sending them a form body is
+        // the mistake to make here, because every neighbouring OAuth
+        // call in this file is form-encoded.
+        let start: Value = serde_json::from_str(&codex_device_usercode_body()).expect("json body");
+        assert_eq!(start["client_id"], CODEX_OAUTH_CLIENT_ID);
+
+        let poll: Value =
+            serde_json::from_str(&codex_device_poll_body("dev-1", "ABCD-EFGH")).expect("json body");
+        assert_eq!(poll["device_auth_id"], "dev-1");
+        assert_eq!(poll["user_code"], "ABCD-EFGH");
+    }
+
+    #[test]
+    fn the_device_exchange_carries_the_verifier_the_poll_returned() {
+        let form = codex_device_exchange_form("auth-code+1", "verifier/2");
+        assert!(form.contains("grant_type=authorization_code"));
+        assert!(form.contains("code=auth-code%2B1"));
+        assert!(form.contains("code_verifier=verifier%2F2"));
+        // The redirect is not a page we serve; it only has to match what
+        // the code was minted against, or the exchange is refused.
+        assert!(
+            form.contains("redirect_uri=https%3A%2F%2Fauth.openai.com%2Fdeviceauth%2Fcallback"),
+            "{form}"
+        );
+        assert!(form.contains(&format!("client_id={CODEX_OAUTH_CLIENT_ID}")));
     }
 }
 
