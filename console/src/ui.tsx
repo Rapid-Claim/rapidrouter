@@ -372,7 +372,12 @@ export function Drawer(props: {
     if (!props.open) return;
     const onKey = (event: KeyboardEvent) => {
       if (event.key !== "Escape") return;
-      if (document.querySelector(".combobox-popup")) return;
+      // One Escape, one layer — the same rule `escapeCloses` follows, from
+      // the bottom of the stack. A dialog opened from inside the drawer
+      // registers its listener after this one, so this runs while the
+      // dialog is still in the document and stands down; the dialog's own
+      // listener then closes it. Without this, one press takes both.
+      if (document.querySelector(".combobox-popup, .dialog-backdrop")) return;
       props.onClose();
     };
     document.addEventListener("keydown", onKey);

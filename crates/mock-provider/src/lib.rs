@@ -6,6 +6,7 @@
 //! - `err-500`  -> 500 with a provider-style error body
 //! - `err-429`  -> 429 with `retry-after: 7`
 //! - `slow`     -> 2s delay before responding
+//! - `slow-body` -> headers immediately, body 500ms later (Anthropic only)
 //! - anything else -> a well-formed completion (or SSE stream when
 //!   `"stream": true`), echoing the model name it was asked for
 
@@ -398,7 +399,7 @@ async fn anthropic_messages(
         "end_turn"
     };
 
-    axum::Json(json!({
+    let payload = json!({
         "id": "msg_mock",
         "type": "message",
         "role": "assistant",
@@ -407,8 +408,26 @@ async fn anthropic_messages(
         "stop_reason": stop_reason,
         "stop_sequence": null,
         "usage": {"input_tokens": 11, "output_tokens": 5}
-    }))
-    .into_response()
+    });
+    if model == "slow-body" {
+        return delayed_body(payload, Duration::from_millis(500));
+    }
+    axum::Json(payload).into_response()
+}
+
+/// Headers now, body later — a provider that has started answering but
+/// has not finished generating. Every real upstream we translate for
+/// behaves this way, and it is the only shape that tells a gateway which
+/// stops its upstream clock at the headers from one that does not.
+fn delayed_body(payload: Value, delay: Duration) -> Response {
+    let stream = futures_util::stream::once(async move {
+        tokio::time::sleep(delay).await;
+        Ok::<_, std::convert::Infallible>(bytes::Bytes::from(payload.to_string()))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from_stream(stream))
+        .expect("static response parts")
 }
 
 /// Anthropic event stream: ping interleaved, tool arguments split across

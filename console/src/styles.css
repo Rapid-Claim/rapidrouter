@@ -523,7 +523,12 @@ tr.selected td { background: var(--surface-2); color: var(--text); }
 .code-editor { display: block; }
 .code-editor > span { display: block; padding: 8px 14px; background: var(--surface-2); border-bottom: 1px solid var(--border); font-size: 11px; color: var(--muted); }
 
-.dialog-backdrop { position: fixed; inset: 0; background: rgb(10 8 7 / 55%); z-index: 20; display: grid; place-items: center; padding: 20px; }
+/* Above the drawer (40), below a combobox popup (60). A dialog is always
+   opened *from* something — and now that one of them is opened from
+   inside the drawer, a dialog that sorts under it renders as a click that
+   did nothing. The popup stays on top because a combobox inside a dialog
+   has to be usable. */
+.dialog-backdrop { position: fixed; inset: 0; background: rgb(10 8 7 / 55%); z-index: 50; display: grid; place-items: center; padding: 20px; }
 .dialog {
   width: min(560px, 100%);
   max-height: min(86vh, 780px);
