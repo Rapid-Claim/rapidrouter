@@ -754,3 +754,39 @@ async fn upstream_error_rendered_in_inbound_dialect() {
     let body: Value = res.json().await.unwrap();
     assert_eq!(body["error"]["status"], "NOT_FOUND");
 }
+
+// ===========================================================================
+// the overhead receipt, on a path that has to drain the upstream
+// ===========================================================================
+
+/// `x-rapid-overhead-us` measures the gateway, not the model. The
+/// translated non-streaming path is the one that can get this wrong: the
+/// providers we translate for stream their answer even when the caller
+/// asked for one shot, so the gateway drains the body itself, and a clock
+/// that stops at the upstream's headers books the whole generation as
+/// overhead. That read a 7.3s answer as 6.7s of gateway time.
+#[tokio::test]
+async fn overhead_receipt_excludes_the_wait_for_the_upstream_body() {
+    let gw = gateway().await;
+    let res = oai_chat(
+        &gw,
+        json!({"model": "anthropic/slow-body", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+
+    assert_eq!(res.status(), 200);
+    let overhead: u64 = res.headers()["x-rapid-overhead-us"]
+        .to_str()
+        .unwrap()
+        .parse()
+        .unwrap();
+    // The mock withholds its body for 500ms. None of that is ours.
+    assert!(
+        overhead < 200_000,
+        "upstream body wait charged as gateway overhead: {overhead}us"
+    );
+
+    // And the answer still translated correctly on the way through.
+    let body: Value = res.json().await.unwrap();
+    assert_eq!(body["choices"][0]["message"]["content"], "mock response");
+}
