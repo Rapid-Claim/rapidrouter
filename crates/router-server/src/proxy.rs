@@ -413,8 +413,20 @@ fn rewrite_model_value(body: &Bytes, model: &str) -> Bytes {
 
 /// Time spent waiting on the upstream, carried via response extensions
 /// so `finalize` can report gateway-added time rather than total time.
+///
+/// The wait ends when we stop needing anything from the upstream, which
+/// is not always when its headers land. A response we hand back as a live
+/// body is done at the headers — the rest arrives on the caller's clock.
+/// One we have to drain before we can answer is not done until the last
+/// byte, and that drain is upstream's time, not ours.
 #[derive(Clone, Copy)]
 struct UpstreamTime(std::time::Duration);
+
+/// Record how long a response waited on the upstream, for [`finalize`].
+fn with_upstream_time(mut response: Response, waited: std::time::Duration) -> Response {
+    response.extensions_mut().insert(UpstreamTime(waited));
+    response
+}
 
 /// One upstream try, described precisely enough for the dispatch loop to
 /// decide between forwarding, retrying, and advancing the chain.
@@ -899,17 +911,16 @@ async fn attempt(
                 );
             }
 
-            let mut served = if ctx.passthrough {
-                AttemptOutcome::Serve(forward_response(response, permit))
+            if ctx.passthrough {
+                AttemptOutcome::Serve(with_upstream_time(
+                    forward_response(response, permit),
+                    upstream_elapsed,
+                ))
             } else {
-                translated_response(route, response, permit, ctx).await
-            };
-            if let AttemptOutcome::Serve(response) = &mut served {
-                response
-                    .extensions_mut()
-                    .insert(UpstreamTime(upstream_elapsed));
+                // Stamps its own wait: the paths that collect the body
+                // waited longer than the headers took to arrive.
+                translated_response(route, response, permit, ctx, upstream_started).await
             }
-            served
         }
     }
 }
@@ -1014,6 +1025,7 @@ async fn translated_response(
     response: http::Response<hyper::body::Incoming>,
     permit: tokio::sync::OwnedSemaphorePermit,
     ctx: TranslationCtx,
+    upstream_started: Instant,
 ) -> AttemptOutcome {
     let status = response.status();
 
@@ -1021,6 +1033,7 @@ async fn translated_response(
         let body = collect_capped(response.into_body(), 1024 * 1024)
             .await
             .unwrap_or_default();
+        let waited = upstream_started.elapsed();
         let message = extract_upstream_error(&body)
             .unwrap_or_else(|| format!("provider `{}` returned {status}", route.provider.name));
         let class = match status.as_u16() {
@@ -1036,15 +1049,24 @@ async fn translated_response(
         let mut response = error_response_for(ctx.render, &err);
         // Preserve the upstream's status; class mapping may coarsen it.
         *response.status_mut() = status;
-        return AttemptOutcome::Serve(response);
+        return AttemptOutcome::Serve(with_upstream_time(response, waited));
     }
 
     if !ctx.stream {
-        let body = match collect_capped(response.into_body(), MAX_TRANSLATED_RESPONSE).await {
+        // The caller asked for one answer, but the providers we translate
+        // for stream theirs regardless, so the whole generation arrives
+        // here rather than in the header wait. Ending the upstream clock
+        // at the headers is how a 7-second answer reported 6.7 seconds of
+        // gateway overhead. Everything after this line — parsing,
+        // translating, rendering — is ours, and still counts as overhead.
+        let collected = collect_capped(response.into_body(), MAX_TRANSLATED_RESPONSE).await;
+        let waited = upstream_started.elapsed();
+        let body = match collected {
             Ok(body) => body,
             Err(err) => {
                 drop(permit);
-                return AttemptOutcome::Serve(error_response_for(ctx.render, &err));
+                let response = error_response_for(ctx.render, &err);
+                return AttemptOutcome::Serve(with_upstream_time(response, waited));
             }
         };
         drop(permit);
@@ -1055,10 +1077,14 @@ async fn translated_response(
             ctx.emulated,
         ) {
             Ok(v) => v,
-            Err(err) => return AttemptOutcome::Serve(error_response_for(ctx.render, &err)),
+            Err(err) => {
+                let response = error_response_for(ctx.render, &err);
+                return AttemptOutcome::Serve(with_upstream_time(response, waited));
+            }
         };
         let rendered = router_providers::render_for(ctx.render, &openai);
-        return AttemptOutcome::Serve((StatusCode::OK, axum::Json(rendered)).into_response());
+        let response = (StatusCode::OK, axum::Json(rendered)).into_response();
+        return AttemptOutcome::Serve(with_upstream_time(response, waited));
     }
 
     // Streaming: upstream SSE -> internal chunks -> inbound frames.
@@ -1072,7 +1098,9 @@ async fn translated_response(
         .header(header::CACHE_CONTROL, "no-cache")
         .body(body)
         .expect("static response parts");
-    AttemptOutcome::Serve(response)
+    // Handed back as a live body, so the wait ended at the headers; the
+    // chunks that follow are translated on the caller's clock.
+    AttemptOutcome::Serve(with_upstream_time(response, upstream_started.elapsed()))
 }
 
 /// Upstream wire framing: SSE for most dialects, AWS event-stream for

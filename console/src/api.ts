@@ -57,6 +57,18 @@ export type ProviderKey = {
   source_path: string | null;
 };
 
+/** A device-code login in progress, as the console polls it. */
+export type DeviceLogin = {
+  session: string;
+  user_code: string;
+  verification_url: string;
+  expires_at_ms: number;
+  outcome:
+    | { state: "waiting" }
+    | { state: "signed"; email: string | null }
+    | { state: "failed"; reason: string };
+};
+
 export type QuotaWindow = {
   utilization: number;
   resets_in_s: number | null;
@@ -361,6 +373,16 @@ export const api = {
     request(`/providers/${encodeURIComponent(name)}/keys/${encodeURIComponent(key)}`, {
       method: "DELETE",
     }),
+  startDeviceLogin: (name: string, key: string) =>
+    request<DeviceLogin>(
+      `/providers/${encodeURIComponent(name)}/keys/${encodeURIComponent(key)}/device-login`,
+      { method: "POST" },
+    ),
+  deviceLoginStatus: (name: string, key: string, session: string) =>
+    request<DeviceLogin>(
+      `/providers/${encodeURIComponent(name)}/keys/${encodeURIComponent(key)}`
+      + `/device-login/${encodeURIComponent(session)}`,
+    ),
   addModel: (provider: string, id: string) =>
     request<{ version: number }>(`/providers/${encodeURIComponent(provider)}/models`, {
       method: "POST",

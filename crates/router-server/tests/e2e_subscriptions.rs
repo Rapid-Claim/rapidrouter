@@ -857,3 +857,123 @@ async fn a_document_takes_the_translated_path_not_the_verbatim_relay() {
         "no document part may survive to the backend"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The console's "Sign in again" button
+// ---------------------------------------------------------------------------
+
+/// An admin session, for the endpoints the console calls.
+async fn admin_token(url: &str) -> String {
+    reqwest::Client::new()
+        .post(format!("{url}/admin/api/session"))
+        .json(&json!({"key": "probe-test-key"}))
+        .send()
+        .await
+        .unwrap()
+        .json::<Value>()
+        .await
+        .unwrap()["token"]
+        .as_str()
+        .expect("a session token")
+        .to_owned()
+}
+
+async fn start_login(url: &str, provider: &str, key: &str) -> (reqwest::StatusCode, Value) {
+    let token = admin_token(url).await;
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{url}/admin/api/providers/{provider}/keys/{key}/device-login"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    let status = res.status();
+    (status, res.json::<Value>().await.unwrap_or(Value::Null))
+}
+
+/// Every refusal happens before a code is minted.
+///
+/// Worth asserting as a group: each one is a case where minting would
+/// have "worked" — OpenAI hands out a code for any caller — and then
+/// stranded the operator entering it, because there was never a seat the
+/// result could be written to.
+#[tokio::test]
+async fn a_login_is_refused_before_a_code_is_minted() {
+    let (url, _mock, _dir) = gateway().await;
+
+    let (status, body) = start_login(&url, "codex", "no-such-seat").await;
+    assert_eq!(status, 404, "{body}");
+
+    let (status, body) = start_login(&url, "no-such-provider", "seat-1").await;
+    assert_eq!(status, 404, "{body}");
+
+    // Claude seats are renewed by their own CLI. Codex's device endpoint
+    // would mint a code for one and it could never be claimed.
+    let (status, body) = start_login(&url, "claude-max", "seat-1").await;
+    assert_eq!(status, 409, "{body}");
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Codex"),
+        "the refusal has to say why: {body}"
+    );
+}
+
+/// A login id that is not being tracked is a 404 that says what to do,
+/// not a hang: the console polls this, and an outcome it can never reach
+/// would leave the dialog spinning forever.
+#[tokio::test]
+async fn an_unknown_login_is_not_left_pending() {
+    let (url, _mock, _dir) = gateway().await;
+    let token = admin_token(&url).await;
+    let res = reqwest::Client::new()
+        .get(format!(
+            "{url}/admin/api/providers/codex/keys/seat-1/device-login/dl_nothing"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+    let body: Value = res.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("start a new one"),
+        "{body}"
+    );
+}
+
+/// The console must not be able to read one seat's login through another
+/// seat's URL — the outcome carries the account it signed in as.
+#[tokio::test]
+async fn a_login_is_not_readable_through_another_seats_url() {
+    let (url, _mock, _dir) = gateway().await;
+    let token = admin_token(&url).await;
+    let res = reqwest::Client::new()
+        .get(format!(
+            "{url}/admin/api/providers/claude-max/keys/seat-1/device-login/dl_nothing"
+        ))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 404);
+}
+
+/// Device login is an admin endpoint like any other.
+#[tokio::test]
+async fn a_login_cannot_be_started_without_an_admin_session() {
+    let (url, _mock, _dir) = gateway().await;
+    let res = reqwest::Client::new()
+        .post(format!(
+            "{url}/admin/api/providers/codex/keys/seat-1/device-login"
+        ))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(res.status(), 401);
+}

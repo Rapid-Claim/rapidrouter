@@ -1,12 +1,16 @@
 import {
   Activity,
+  ArrowDown,
+  ArrowUp,
   Boxes,
   ChartNoAxesCombined,
+  ChevronsUpDown,
   Coins,
   ChevronRight,
   CircleGauge,
   Copy,
   KeyRound,
+  LogIn,
   LogOut,
   PanelLeft,
   Play,
@@ -58,6 +62,7 @@ import {
   login,
   sessionToken,
   type DayBucket,
+  type DeviceLogin,
   type Provider,
   type ProviderKey,
   type QuotaWindow,
@@ -429,6 +434,15 @@ function Providers(props: { refresh: () => number }) {
     return needle ? all.filter((p) => `${p.name} ${p.kind}`.toLowerCase().includes(needle)) : all;
   });
 
+  // The drawer opens on the seats with the most room left, because the
+  // question it is opened to answer is almost always "which of these
+  // can take traffic right now". Any column can take over from there.
+  const [sort, setSort] = createSignal<CredSort>({ column: "headroom", dir: "desc" });
+  const [loggingIn, setLoggingIn] = createSignal<{ provider: string; key: string; email: string | null } | null>(null);
+  const sortBy = (column: CredColumn) => setSort((prev) => prev.column === column
+    ? { column, dir: prev.dir === "asc" ? "desc" : "asc" }
+    : { column, dir: CRED_SORT_DIR[column] });
+
   // A check is a real request per credential, so the page says which one
   // is in flight ("*" for all) and keeps each result until the next run.
   const [checking, setChecking] = createSignal<string | null>(null);
@@ -538,13 +552,18 @@ function Providers(props: { refresh: () => number }) {
             <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
               <table class="dense">
                 <thead><tr>
-                  <th>Credential</th>
-                  <th>{provider.subscription ? "Plan windows" : "Limits"}</th>
-                  <th>Token</th>
-                  <th>Health</th>
+                  <SortHeader label="Credential" column="credential" sort={sort()} onSort={sortBy} />
+                  <SortHeader
+                    label={provider.subscription ? "Plan windows" : "Limits"}
+                    column="headroom"
+                    sort={sort()}
+                    onSort={sortBy}
+                  />
+                  <SortHeader label="Token" column="token" sort={sort()} onSort={sortBy} />
+                  <SortHeader label="Health" column="health" sort={sort()} onSort={sortBy} />
                   <th><span class="sr-only">Actions</span></th>
                 </tr></thead>
-                <tbody><For each={provider.keys}>{(key) => (
+                <tbody><For each={sortCredentials(provider.keys, sort(), provider.subscription)}>{(key) => (
                   <CredentialRow
                     providerKey={key}
                     kind={provider.kind}
@@ -552,6 +571,11 @@ function Providers(props: { refresh: () => number }) {
                     checking={checking() === "*" || checking() === key.name}
                     probe={probes()[key.name] ?? null}
                     onCheck={() => runProbe(provider.name, key.name)}
+                    onLogin={() => setLoggingIn({
+                      provider: provider.name,
+                      key: key.name,
+                      email: key.credential?.email ?? null,
+                    })}
                     onRemove={async () => {
                       setError("");
                       try { await api.deleteProviderKey(provider.name, key.name); await refetch(); }
@@ -566,6 +590,19 @@ function Providers(props: { refresh: () => number }) {
         <AddCredential provider={provider} onDone={refetch} onError={setError} />
       </>}</Show>
     </Drawer>
+
+    <Show when={loggingIn()} keyed>{(target) => (
+      <DeviceLoginDialog
+        provider={target.provider}
+        credential={target.key}
+        email={target.email}
+        onClose={() => setLoggingIn(null)}
+        // Left open on success: the operator reads "signed in as …",
+        // which is the confirmation they came for. The table behind it
+        // is refreshed so the row stops claiming it needs a login.
+        onSignedIn={() => { void refetch(); }}
+      />
+    )}</Show>
 
     <Show when={adding()}>
       <AddProviderDialog
@@ -904,12 +941,32 @@ function formatClock(ms: number): string {
     : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
-/// How long ago, said the way somebody reads a freshness stamp. The
-/// gateway sweeps every sixty seconds, so "just now" has to mean the last
-/// minute or the whole page would read as stale between ticks.
+/// A wall-clock moment, date and time both. "resets in 4h" makes an
+/// operator do the arithmetic against a clock they can already see, and
+/// gets it wrong across a day boundary; the moment itself does not.
+function formatMoment(ms: number): string {
+  const date = new Date(ms);
+  const sameDay = date.toDateString() === new Date().toDateString();
+  return date.toLocaleString(undefined, {
+    ...(sameDay ? {} : { month: "short", day: "numeric" }),
+    hour: "numeric",
+    minute: "2-digit",
+  });
+}
+
+/// How long ago, said the way somebody reads a freshness stamp.
+///
+/// An age is right here where [`formatMoment`] is right for a reset: the
+/// question is "is this current", and "checked at 09:14" makes the reader
+/// work that out against a clock. The gateway sweeps every sixty seconds,
+/// so "just now" has to cover a little more than a minute — otherwise
+/// every seat on the page reads as stale in the gap between ticks.
 function formatAge(ms: number): string {
   const seconds = Math.max(0, (Date.now() - ms) / 1000);
-  return seconds < 75 ? "just now" : `${formatDuration(seconds)} ago`;
+  if (seconds < 75) return "just now";
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m ago`;
+  if (seconds < 86400) return `${Math.round(seconds / 3600)}h ago`;
+  return `${Math.round(seconds / 86400)}d ago`;
 }
 
 /// The check words the gateway returns, in the terms an operator uses.
@@ -949,6 +1006,230 @@ function planWindowLabel(length_s: number): string {
   return days === 7 ? "Weekly limit" : `${days}-day limit`;
 }
 
+/// The credential columns an operator can order the table by.
+type CredColumn = "credential" | "headroom" | "token" | "health";
+type CredSort = { column: CredColumn; dir: "asc" | "desc" };
+
+/// The direction a column starts in when it is first clicked. Every one
+/// of these puts the answer to the column's own question on top: most
+/// room left, soonest expiry, healthiest, A first. Clicking again flips.
+const CRED_SORT_DIR: Record<CredColumn, "asc" | "desc"> = {
+  credential: "asc",
+  headroom: "desc",
+  token: "asc",
+  health: "asc",
+};
+
+/// How much of its longest plan window a seat has left, 0…1.
+///
+/// The longest window is the weekly one on the plans that report both,
+/// and weekly headroom is what decides whether a seat is worth routing
+/// to: one with 90% of its week left is still a good seat at 95% of a
+/// 5-hour window, and a seat with the week spent is not, however empty
+/// its 5-hour window looks right now.
+function planHeadroom(key: ProviderKey): number | null {
+  const windows = [key.quota?.primary, key.quota?.secondary]
+    .filter((w): w is QuotaWindow => Boolean(w?.length_s));
+  if (!windows.length) return null;
+  const longest = windows.reduce((a, b) => (b.length_s! > a.length_s! ? b : a));
+  return 1 - Math.min(Math.max(longest.utilization, 0), 1);
+}
+
+const CRED_HEALTH_RANK: Record<string, number> = {
+  ready: 0, healthy: 0, near_limit: 1, probing: 2, open: 3, exhausted: 4, benched: 4,
+};
+
+/// What a column sorts on. `null` means this credential has nothing to
+/// sort by, and always sinks to the bottom whichever way the column
+/// points — a seat that has never reported a window is not the emptiest
+/// one, it is the unknown one, and floating it to the top of "most room
+/// left" would send traffic at a seat nobody has heard from.
+function credSortValue(key: ProviderKey, column: CredColumn, subscription: boolean): number | string | null {
+  switch (column) {
+    case "credential":
+      return (key.credential?.email ?? key.name).toLowerCase();
+    case "headroom": {
+      if (subscription) return planHeadroom(key);
+      // A metered key has no window; its column shows the ceiling left
+      // this minute, so that is what its column sorts on.
+      const left = key.limits.rpm?.remaining ?? key.limits.tpm?.remaining;
+      return left ?? null;
+    }
+    case "token":
+      return key.credential?.expires_at_ms ?? null;
+    case "health":
+      return CRED_HEALTH_RANK[key.status ?? key.health] ?? 5;
+  }
+}
+
+function sortCredentials(keys: ProviderKey[], sort: CredSort, subscription: boolean): ProviderKey[] {
+  const dir = sort.dir === "asc" ? 1 : -1;
+  return [...keys].sort((a, b) => {
+    const left = credSortValue(a, sort.column, subscription);
+    const right = credSortValue(b, sort.column, subscription);
+    if (left === null || right === null) {
+      if (left === right) return a.name.localeCompare(b.name);
+      return left === null ? 1 : -1;
+    }
+    const order = typeof left === "string" || typeof right === "string"
+      ? String(left).localeCompare(String(right))
+      : left - right;
+    // Ties fall back to the name so the order is the same on every
+    // poll; a pool of seats all sitting at 0% used would otherwise
+    // reshuffle under the cursor every few seconds.
+    return order ? order * dir : a.name.localeCompare(b.name);
+  });
+}
+
+function SortHeader(props: {
+  label: string;
+  column: CredColumn;
+  sort: CredSort;
+  onSort: (column: CredColumn) => void;
+}) {
+  const active = () => props.sort.column === props.column;
+  return <th aria-sort={active() ? (props.sort.dir === "asc" ? "ascending" : "descending") : "none"}>
+    <button type="button" class="th-sort" classList={{ active: active() }} onClick={() => props.onSort(props.column)}>
+      {props.label}
+      <Show when={active()} fallback={<ChevronsUpDown size={11} class="th-sort-idle" />}>
+        <Show when={props.sort.dir === "asc"} fallback={<ArrowDown size={11} />}><ArrowUp size={11} /></Show>
+      </Show>
+    </button>
+  </th>;
+}
+
+/// Sign a Codex seat back in with a one-time code.
+///
+/// The gateway does the OAuth; this dialog is a display for a code and a
+/// link, and a poller for the answer. Closing it does not cancel the
+/// login — the exchange rotates a refresh token that has to be written
+/// to disk, so it runs server-side and finishes whether or not anyone is
+/// watching. Re-opening on the same seat re-attaches to the same code.
+function DeviceLoginDialog(props: {
+  provider: string;
+  credential: string;
+  email?: string | null;
+  onClose: () => void;
+  onSignedIn: () => void;
+}) {
+  escapeCloses(props.onClose);
+  const [login, setLogin] = createSignal<DeviceLogin | null>(null);
+  const [error, setError] = createSignal("");
+  const [copied, setCopied] = createSignal(false);
+
+  // Narrowed here rather than at each use: `outcome` is a discriminated
+  // union and JSX callbacks are not where TypeScript narrows it.
+  const signedAs = () => {
+    const outcome = login()?.outcome;
+    return outcome?.state === "signed" ? outcome.email : null;
+  };
+  const failure = () => {
+    const outcome = login()?.outcome;
+    return outcome?.state === "failed" ? outcome.reason : null;
+  };
+  const state = () => login()?.outcome.state;
+
+  // Registered synchronously, at setup: an `onCleanup` after an `await`
+  // has no owner to attach to, and the poller would outlive the dialog.
+  let timer: ReturnType<typeof setInterval> | undefined;
+  onCleanup(() => clearInterval(timer));
+
+  onMount(async () => {
+    let started: DeviceLogin;
+    try {
+      started = await api.startDeviceLogin(props.provider, props.credential);
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start the login");
+      return;
+    }
+    setLogin(started);
+    if (started.outcome.state !== "waiting") return;
+
+    // Polled rather than streamed: a login takes as long as a person
+    // takes, and one small request every three seconds for a few minutes
+    // is cheaper than holding a connection open for it.
+    timer = setInterval(async () => {
+      try {
+        const next = await api.deviceLoginStatus(props.provider, props.credential, started.session);
+        setLogin(next);
+        if (next.outcome.state !== "waiting") {
+          clearInterval(timer);
+          if (next.outcome.state === "signed") props.onSignedIn();
+        }
+      } catch (err) {
+        clearInterval(timer);
+        setError(err instanceof Error ? err.message : "Lost track of the login");
+      }
+    }, 3000);
+  });
+
+  return <div class="dialog-backdrop" role="presentation" onMouseDown={(e) => { if (e.target === e.currentTarget) props.onClose(); }}>
+    <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="device-login-title">
+      <header class="dialog-head">
+        <div>
+          <h2 id="device-login-title">Sign in again</h2>
+          <p class="muted">{props.email ?? props.credential}</p>
+        </div>
+        <button type="button" class="icon-button" aria-label="Close" title="Close (Esc)" onClick={props.onClose}><X size={16} /></button>
+      </header>
+
+      <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+
+      <Show when={login()} fallback={<Show when={!error()}><p class="muted">Asking OpenAI for a code…</p></Show>}>
+        {(current) => <Switch>
+          <Match when={state() === "signed"}>
+            <p class="login-done" role="status">
+              Signed in{signedAs() ? ` as ${signedAs()}` : ""}. The seat is live again — no restart needed.
+            </p>
+          </Match>
+          <Match when={failure()}>
+            <p class="form-error" role="alert">{failure()}</p>
+            <p class="muted">Nothing changed: the seat still has the credential it had.</p>
+          </Match>
+          <Match when={state() === "waiting"}>
+            <ol class="login-steps">
+              <li>
+                Open <a href={current().verification_url} target="_blank" rel="noreferrer noopener">{current().verification_url}</a> and
+                sign in as <strong>{props.email ?? "this account"}</strong>.
+              </li>
+              <li>
+                Enter this one-time code:
+                <div class="login-code">
+                  <code>{current().user_code}</code>
+                  <button
+                    type="button"
+                    class="button outline"
+                    onClick={async () => {
+                      try {
+                        await navigator.clipboard.writeText(current().user_code);
+                        setCopied(true);
+                        setTimeout(() => setCopied(false), 1500);
+                      } catch { setCopied(false); }
+                    }}
+                  ><Copy size={14} />{copied() ? "Copied" : "Copy"}</button>
+                </div>
+              </li>
+              <li>Come back here. The credential is written for you.</li>
+            </ol>
+            <p class="muted" role="status">
+              <RefreshCw size={12} class="spin" /> Waiting for you to finish — the code expires {formatMoment(current().expires_at_ms)}.
+            </p>
+            {/* The one thing a code like this is dangerous for. The CLI
+                says it too, in the same words. */}
+            <p class="muted">Device codes are a common phishing target. Never share this code.</p>
+          </Match>
+        </Switch>}
+      </Show>
+
+      <div class="dialog-actions">
+        <button type="button" class="button outline" onClick={props.onClose}>
+          {state() === "waiting" ? "Close — the login keeps running" : "Close"}
+        </button>
+      </div>
+    </div>
+  </div>;
+}
+
 /// One credential as a table row.
 function CredentialRow(props: {
   providerKey: ProviderKey;
@@ -956,10 +1237,22 @@ function CredentialRow(props: {
   subscription: boolean;
   onRemove: () => void;
   onCheck: () => void;
+  onLogin: () => void;
   checking?: boolean;
   probe?: { status: string; detail: string } | null;
 }) {
   const key = () => props.providerKey;
+  // Two different ways a seat asks to be signed in again, and neither is
+  // reliable alone. The credential itself only knows it cannot renew;
+  // a refresh token that has been *revoked* still looks renewable from
+  // here and only confesses when something uses it, which is what the
+  // probe detail carries back.
+  const needsLogin = () => {
+    const cred = key().credential;
+    if (cred && !cred.can_refresh && cred.expired) return true;
+    const detail = props.probe?.detail?.toLowerCase() ?? "";
+    return props.probe?.status !== "ok" && (detail.includes("sign") || detail.includes("token is expired"));
+  };
   // The server folds breaker, quota and credential into one word; fall
   // back to raw breaker health for a gateway that has not been updated.
   const statusLabel = () => ({
@@ -1019,17 +1312,13 @@ function CredentialRow(props: {
     return <div class="cred-window">
       <span class="cred-window-label">{planWindowLabel(win.length_s!)}</span>
       <div class={`meter ${meterTone}`}><i style={{ width: `${pct}%` }} /></div>
-      <span class="cred-window-pct">{pct}%{win.resets_in_s ? ` · resets ${formatDuration(win.resets_in_s)}` : ""}</span>
+      <span class="cred-window-pct">{pct}%{win.resets_in_s ? ` · resets ${formatMoment(Date.now() + win.resets_in_s * 1000)}` : ""}</span>
     </div>;
   };
 
   return <tr>
     <td>
       <strong>{key().credential?.email ?? key().name}</strong>
-      <small>
-        <Show when={key().credential?.email}>{key().name} · </Show>
-        {key().models?.length ? `${key().models!.length} model${key().models!.length > 1 ? "s" : ""}` : "every model"} · weight {key().weight}
-      </small>
     </td>
     <td>
       <Show when={props.subscription} fallback={
@@ -1044,9 +1333,6 @@ function CredentialRow(props: {
         <Show when={planWindows().length} fallback={<span class="muted">Reports after the first request</span>}>
           <For each={planWindows()}>{(win) => windowCell(win)}</For>
         </Show>
-        <Show when={key().health === "benched" && key().benched_until_ms}>
-          <small class="muted">Out until {new Date(key().benched_until_ms!).toLocaleString()}</small>
-        </Show>
       </Show>
     </td>
     <td>
@@ -1059,10 +1345,9 @@ function CredentialRow(props: {
           // renews it on the next request. Only a credential that
           // cannot refresh is actually a problem worth alarming about.
           if (cred.can_refresh) {
-            return <>
-              <small>Renews automatically</small>
-              <Show when={at}><small class="muted">{cred.expired ? "renews on next use" : `valid until ${formatClock(at!)}`}</small></Show>
-            </>;
+            return <small class="muted">
+              {!at || cred.expired ? "renews on next use" : `valid until ${formatClock(at)}`}
+            </small>;
           }
           if (!at) return <small class="muted">No readable expiry</small>;
           const days = Math.round((at - Date.now()) / 86_400_000);
@@ -1089,6 +1374,22 @@ function CredentialRow(props: {
       </Show>
     </td>
     <td class="actions">
+      {/* Codex seats only: this is Codex's own device-code endpoint. The
+          button is always offered rather than shown only when a seat
+          looks dead, because the signal for "needs a login" is a probe
+          away — a revoked refresh token reads as a perfectly ordinary
+          "renews on next use" until something actually tries it. */}
+      <Show when={props.kind === "CodexSubscription"}>
+        <button
+          class="icon-button"
+          classList={{ danger: needsLogin() }}
+          title={needsLogin() ? `Sign ${key().name} in again — its credential is dead` : `Sign ${key().name} in again`}
+          aria-label={`Sign ${key().name} in again`}
+          onClick={props.onLogin}
+        >
+          <LogIn size={14} />
+        </button>
+      </Show>
       <button
         class="icon-button"
         title={`Check ${key().name}`}
@@ -3051,15 +3352,6 @@ function SectionTitle(props: { title: string; subtitle: string; action?: any }) 
 function Fact(props: { label: string; value: string }) { return <div><dt>{props.label}</dt><dd>{props.value}</dd></div>; }
 function Status(props: { text: string; tone: "success" | "danger" | "muted" }) { return <span class={`status ${props.tone}`}><span />{props.text}</span>; }
 function Empty(props: { title: string; action: string }) { return <div class="empty"><strong>{props.title}</strong><p>{props.action}</p></div>; }
-/// Seconds as the coarsest unit that still says something useful. A
-/// weekly quota window reported as "604800s" tells an operator nothing;
-/// "7d" tells them which plan window they are looking at.
-function formatDuration(seconds: number): string {
-  if (seconds < 60) return `${Math.round(seconds)}s`;
-  if (seconds < 3600) return `${Math.round(seconds / 60)}m`;
-  if (seconds < 86400) return `${(seconds / 3600).toFixed(seconds < 36000 ? 1 : 0)}h`;
-  return `${(seconds / 86400).toFixed(seconds < 864000 ? 1 : 0)}d`;
-}
 
 /// Daily spend, one line per series. Bars would imply the days are
 /// independent buckets to compare; a line reads as a trend, which is
