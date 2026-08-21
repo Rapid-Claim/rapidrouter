@@ -409,6 +409,15 @@ function Providers(props: { refresh: () => number }) {
   const [providers, { refetch }] = createResource(props.refresh, api.providers);
   const [catalog] = createResource(props.refresh, api.catalog);
   const [selected, setSelected] = createSignal<string>("");
+  // Opening a provider refetches before showing it. The page otherwise
+  // only reloads when the gateway pushes an event, so a console left open
+  // on a quiet router would open the drawer onto a snapshot from whenever
+  // traffic last stopped — the one moment an operator most needs the
+  // current state of every seat.
+  const open = (name: string) => {
+    setSelected(name);
+    void refetch();
+  };
   const [adding, setAdding] = createSignal(false);
   const [search, setSearch] = createSignal("");
   const [error, setError] = createSignal("");
@@ -469,7 +478,7 @@ function Providers(props: { refresh: () => number }) {
           <thead><tr><th>Provider</th><th>Type</th><th class="num">Keys</th><th>Health</th><th>Endpoint</th></tr></thead>
           <tbody><For each={shown()}>{(provider) => {
             const health = () => providerHealth(provider);
-            return <tr class="clickable" onClick={() => setSelected(provider.name)}>
+            return <tr class="clickable" onClick={() => open(provider.name)}>
               <td>
                 <span class="provider-cell">
                   <ProviderMark name={provider.name} kind={provider.kind} />
@@ -895,6 +904,26 @@ function formatClock(ms: number): string {
     : date.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
 
+/// How long ago, said the way somebody reads a freshness stamp. The
+/// gateway sweeps every sixty seconds, so "just now" has to mean the last
+/// minute or the whole page would read as stale between ticks.
+function formatAge(ms: number): string {
+  const seconds = Math.max(0, (Date.now() - ms) / 1000);
+  return seconds < 75 ? "just now" : `${formatDuration(seconds)} ago`;
+}
+
+/// The check words the gateway returns, in the terms an operator uses.
+/// Only ever a fallback: an upstream that explained itself is quoted
+/// verbatim instead, because its explanation is the more useful one.
+const CHECK_STATUS: Record<string, string> = {
+  ok: "ready",
+  rate_limited: "rate limited",
+  unauthorized: "credential rejected",
+  provider_error: "provider error",
+  rejected: "request rejected",
+  unreachable: "could not reach provider",
+};
+
 function providerHealth(provider: Provider): { label: string; tone: "success" | "danger" | "muted" } {
   if (!provider.keys.length) return { label: "No keys", tone: "muted" };
   if (provider.keys.every((k: ProviderKey) => k.health === "benched")) return { label: "Out of quota", tone: "danger" };
@@ -951,6 +980,32 @@ function CredentialRow(props: {
         return "danger";
     }
   };
+  // What the provider last said about this seat, in one line.
+  //
+  // A check running in this tab wins while it is in flight, because it is
+  // newer than anything the gateway has recorded yet. Otherwise this is
+  // the gateway's own record — written by its sixty-second sweep, by
+  // whoever last ran a check, or by the last request the seat served —
+  // which is what makes an opened drawer show the state of the fleet
+  // rather than the history of one browser session.
+  const checkNote = () => {
+    const live = props.probe;
+    const seen = key().last_check;
+    if (!live && !seen) return null;
+    const status = live?.status ?? seen!.status;
+    const detail = live?.detail ?? seen!.detail;
+    const when = live ? "just now" : formatAge(seen!.checked_at_ms);
+    // "served" is the stronger claim of the two: it means a real caller
+    // was answered, not that we asked on their behalf.
+    const how = !live && seen!.probed === false ? "served" : "checked";
+    return {
+      ok: status === "ok",
+      text: status === "ok"
+        ? `${how} ${when}`
+        : `${detail || CHECK_STATUS[status] || status} · ${when}`,
+    };
+  };
+
   // Only the windows the provider sized. The Codex backend answers with
   // an empty `secondary` set when a plan has one window — 0% used, no
   // length, no reset — and a nameless meter reading 0% next to an
@@ -1026,10 +1081,8 @@ function CredentialRow(props: {
         warning: statusTone() === "warning",
         danger: statusTone() === "danger",
       }}>{statusLabel()}</span>
-      <Show when={props.probe}>
-        <small classList={{ danger: props.probe!.status !== "ok", muted: props.probe!.status === "ok" }}>
-          {props.probe!.status === "ok" ? "checked just now" : props.probe!.detail || props.probe!.status}
-        </small>
+      <Show when={checkNote()} keyed>
+        {(note) => <small classList={{ danger: !note.ok, muted: note.ok }}>{note.text}</small>}
       </Show>
       <Show when={key().credential && !key().credential!.can_refresh && key().credential!.expired}>
         <small class="danger">re-authorise needed</small>

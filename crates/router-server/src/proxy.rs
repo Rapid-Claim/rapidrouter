@@ -20,7 +20,7 @@ use router_core::quota;
 
 use crate::refresh;
 use router_core::eventstream::EventStreamParser;
-use router_core::router::{KeyRuntime, ResolvedRoute, RoutePlan};
+use router_core::router::{CheckOutcome, KeyRuntime, ResolvedRoute, RoutePlan};
 use router_core::sse::SseParser;
 use router_core::vkey::{self, VkDeny, VkRuntime};
 use router_core::{ErrorClass, GatewayError, clock, json};
@@ -819,6 +819,21 @@ async fn attempt(
             if route.provider.kind.is_subscription() {
                 bench_exhausted_seat(route, breaker, key, response.headers(), status);
 
+                // Real traffic is the best evidence there is that a seat
+                // works, so it updates the same record the checks write.
+                // The body is not read for a detail here — it is on its
+                // way to the caller — but the status word and code are
+                // what the console shows.
+                if let Some(key) = key {
+                    key.record_check(CheckOutcome {
+                        status: check_status(status).into(),
+                        detail: String::new(),
+                        http_status: Some(status.as_u16()),
+                        probed: false,
+                        observed_ms: clock::now_ms(),
+                    });
+                }
+
                 // A seat whose credential was revoked or expired
                 // out-of-band answers 401. Renewing it in place and
                 // retrying is the difference between a transient blip and
@@ -1488,11 +1503,25 @@ pub(crate) async fn probe_key(
         .await;
 
     match result {
-        Err(err) => ProbeOutcome {
-            status: "unreachable".into(),
-            detail: err.to_string(),
-            http_status: None,
-        },
+        Err(err) => {
+            // Not a breaker failure: we never reached the provider, so
+            // this says nothing about the credential. It is still the last
+            // thing we know, so the console gets to say so.
+            if let Some(key) = key {
+                key.record_check(CheckOutcome {
+                    status: "unreachable".into(),
+                    detail: err.to_string(),
+                    http_status: None,
+                    probed: true,
+                    observed_ms: clock::now_ms(),
+                });
+            }
+            ProbeOutcome {
+                status: "unreachable".into(),
+                detail: err.to_string(),
+                http_status: None,
+            }
+        }
         Ok(response) => {
             let http_status = response.status();
             let headers = response.headers().clone();
@@ -1503,13 +1532,23 @@ pub(crate) async fn probe_key(
             let breaker = provider.breaker_for(key);
             bench_exhausted_seat(&route, breaker, key, &headers, http_status);
 
-            let status = match http_status.as_u16() {
-                429 => "rate_limited",
-                401 | 403 => "unauthorized",
-                s if s >= 500 => "provider_error",
-                s if s >= 400 => "rejected",
-                _ => "ok",
-            };
+            // A check is a real request, so let it settle the breaker the
+            // same way a real request would. Without this a seat whose
+            // credential has been re-authenticated answers the check with
+            // a clean 200 and still reads "open" for ever: the request
+            // path prefers the healthy pool and only offers the half-open
+            // probe slot when that pool is empty, which in a fleet of
+            // ninety seats it never is. The check is the operator's way
+            // back in, and it has to be able to close the breaker.
+            let seat_auth_failure =
+                provider.kind.is_subscription() && matches!(http_status.as_u16(), 401 | 403);
+            if http_status.is_server_error() || http_status.as_u16() == 429 || seat_auth_failure {
+                breaker.record_failure(clock::now_ms());
+            } else {
+                breaker.record_success(clock::now_ms());
+            }
+
+            let status = check_status(http_status);
             let detail = if http_status.is_success() {
                 String::new()
             } else {
@@ -1518,12 +1557,38 @@ pub(crate) async fn probe_key(
                     .unwrap_or_default();
                 extract_upstream_error(&body).unwrap_or_else(|| http_status.to_string())
             };
+            // Kept on the key, not just returned to the caller: the
+            // console needs to show the state of a seat when a drawer is
+            // opened, which may be hours after the check that established
+            // it and in a different browser from the one that ran it.
+            if let Some(key) = key {
+                key.record_check(CheckOutcome {
+                    status: status.into(),
+                    detail: detail.clone(),
+                    http_status: Some(http_status.as_u16()),
+                    probed: true,
+                    observed_ms: clock::now_ms(),
+                });
+            }
             ProbeOutcome {
                 status: status.into(),
                 detail,
                 http_status: Some(http_status.as_u16()),
             }
         }
+    }
+}
+
+/// One word for what an upstream status means about the credential that
+/// carried it. Shared so a seat's recorded state reads the same whether a
+/// check established it or real traffic did.
+fn check_status(status: http::StatusCode) -> &'static str {
+    match status.as_u16() {
+        429 => "rate_limited",
+        401 | 403 => "unauthorized",
+        s if s >= 500 => "provider_error",
+        s if s >= 400 => "rejected",
+        _ => "ok",
     }
 }
 

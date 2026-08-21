@@ -24,9 +24,10 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use metrics_exporter_prometheus::{PrometheusBuilder, PrometheusHandle};
-use router_core::config::{Config, ProviderKind};
-use router_core::credential::Seat;
-use router_core::router::RoutingTable;
+use router_core::breaker::Admission;
+use router_core::clock;
+use router_core::config::Config;
+use router_core::router::{ProviderRuntime, RoutingTable};
 use router_core::vkey::{self, VirtualKeyDef, VkRuntime, VkTable};
 use router_core::{ErrorClass, GatewayError};
 use router_store::{ControlPlaneError, Store};
@@ -363,10 +364,23 @@ impl AppState {
     /// it, and a token that cannot be renewed is a fact the console can
     /// show rather than one discovered by failing a caller.
     ///
-    /// Deliberately renewal only, not probing. A probe spends real quota
-    /// on every seat on every tick, which on a subscription plan is the
-    /// resource being conserved; expiry is knowable from the token itself,
-    /// so this reads it instead of asking the provider.
+    /// It also brings seats whose breaker has opened back into rotation,
+    /// which nothing else does. Selection prefers the healthy pool and
+    /// only falls through to offering a half-open probe slot when that
+    /// pool is empty — so in a fleet of any size, an open breaker is never
+    /// asked again and the seat is retired for good. That is how a batch
+    /// of seats stayed out at 0% after their credentials had been
+    /// re-authenticated: the credential was fixed, but nothing was ever
+    /// going to send the request that noticed.
+    ///
+    /// Probing here rather than on the request path is the point. It costs
+    /// the caller nothing, and the breaker's own cooldown still bounds it
+    /// to one probe per seat per cooldown, so a permanently dead seat
+    /// costs one `max_tokens: 1` request a tick and no caller latency.
+    /// Only seats that are actually out are probed — a healthy seat is
+    /// never asked, and a seat benched on a quota window is left alone
+    /// until the window rolls, because that is the resource a subscription
+    /// plan is conserving.
     pub fn spawn_seat_maintenance(self: &Arc<Self>, interval: Duration) {
         let state = self.clone();
         tokio::spawn(async move {
@@ -375,56 +389,116 @@ impl AppState {
                 let table = state.table.load();
                 // Collected first so the routing snapshot is not held
                 // across an await; a reload may swap it underneath us.
-                let seats: Vec<(ProviderKind, String, Arc<Seat>, String)> = table
+                // The provider handle comes along because recovery needs
+                // to build a probe against it, not just the seat.
+                let seats: Vec<(Arc<ProviderRuntime>, usize)> = table
                     .providers()
                     .filter(|p| p.kind.is_subscription())
-                    .flat_map(|p| {
-                        p.keys.iter().filter_map(|k| {
-                            Some((
-                                p.kind,
-                                p.name.clone(),
-                                k.seat()?.clone(),
-                                k.source_path.clone()?,
-                            ))
-                        })
-                    })
+                    .flat_map(|p| (0..p.keys.len()).map(|index| (p.clone(), index)))
                     .collect();
                 drop(table);
 
                 let mut renewed = 0usize;
                 let mut failed = 0usize;
-                for (kind, provider, seat, path) in seats {
-                    let now = vkey::unix_now_ms();
-                    if !seat.current().wants_refresh(now, refresh::REFRESH_SKEW_MS)
-                        && !seat.current().is_expired(now)
-                    {
-                        continue;
+                let mut recovered = 0usize;
+                for (provider, index) in seats {
+                    let key = &provider.keys[index];
+
+                    if let (Some(seat), Some(path)) = (key.seat(), key.source_path.as_deref()) {
+                        let now = vkey::unix_now_ms();
+                        let state_now = seat.current();
+                        if state_now.wants_refresh(now, refresh::REFRESH_SKEW_MS)
+                            || state_now.is_expired(now)
+                        {
+                            if refresh::refresh_now(
+                                &state.upstream,
+                                &state.refreshes,
+                                provider.kind,
+                                seat,
+                                &refresh::Persist::File(path.to_owned()),
+                                now,
+                            )
+                            .await
+                            {
+                                renewed += 1;
+                                metrics::counter!(
+                                    "rapid_seat_refresh_total",
+                                    "provider" => provider.name.clone(),
+                                )
+                                .increment(1);
+                            } else {
+                                failed += 1;
+                            }
+                        }
                     }
-                    if refresh::refresh_now(
-                        &state.upstream,
-                        &state.refreshes,
-                        kind,
-                        &seat,
-                        &refresh::Persist::File(path),
-                        now,
-                    )
-                    .await
-                    {
-                        renewed += 1;
+
+                    if Self::recover_seat(&state, &provider, index).await {
+                        recovered += 1;
                         metrics::counter!(
-                            "rapid_seat_refresh_total",
-                            "provider" => provider.clone(),
+                            "rapid_seat_recovered_total",
+                            "provider" => provider.name.clone(),
                         )
                         .increment(1);
-                    } else {
-                        failed += 1;
                     }
                 }
-                if renewed > 0 || failed > 0 {
-                    tracing::info!(renewed, failed, "subscription seats renewed");
+                if renewed > 0 || failed > 0 || recovered > 0 {
+                    tracing::info!(renewed, failed, recovered, "subscription seats maintained");
+                    // Nudge any open console: a seat that just came back
+                    // or was just renewed is exactly what somebody staring
+                    // at the providers page is waiting to see. Only when
+                    // something actually changed — a tick that found
+                    // nothing to do must not refresh every browser every
+                    // minute.
+                    let _ = state.events.send(json!({ "type": "seats_checked" }));
                 }
             }
         });
+    }
+
+    /// Offer one out-of-service seat its half-open probe, off the request
+    /// path. `true` when the seat came back.
+    ///
+    /// `admit` is the authority on whether a probe is owed, and taking the
+    /// slot from here is what keeps this honest: the breaker still allows
+    /// exactly one probe per cooldown, so a request that arrives mid-probe
+    /// cannot double up, and a seat still inside its cooldown — or benched
+    /// on a quota window the provider declared — is skipped without a
+    /// request being sent. An `Admission::Yes` means the bench had already
+    /// elapsed and `admit` cleared it, so the seat is back with nothing
+    /// spent.
+    async fn recover_seat(
+        state: &Arc<Self>,
+        provider: &Arc<ProviderRuntime>,
+        index: usize,
+    ) -> bool {
+        let key = &provider.keys[index];
+        if key.breaker.looks_healthy(clock::now_ms()) {
+            return false;
+        }
+        if !matches!(key.breaker.admit(clock::now_ms()), Admission::Probe) {
+            return false;
+        }
+        let Some(model) = admin::probe_model(provider, &key.name) else {
+            // Nothing to ask for. Hand the probe slot back rather than
+            // leaving the breaker half-open until the cooldown reclaims
+            // it, which would hold a live seat out for no reason.
+            key.breaker.record_failure(clock::now_ms());
+            return false;
+        };
+        // `probe_key` settles the breaker with the outcome, so a seat that
+        // answers closes itself and rejoins the pool on the next request.
+        let outcome = proxy::probe_key(state, provider.clone(), &key.name, &model).await;
+        let back = key.breaker.looks_healthy(clock::now_ms());
+        if !back {
+            tracing::debug!(
+                provider = %provider.name,
+                seat = %key.name,
+                status = %outcome.status,
+                detail = %outcome.detail,
+                "seat is still out"
+            );
+        }
+        back
     }
 
     pub fn spawn_refresher(self: &Arc<Self>, interval: Duration) {
