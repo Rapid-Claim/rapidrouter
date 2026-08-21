@@ -7,7 +7,6 @@ front the mock provider (models: gpt-4o etc., err-429/err-500 stubs).
 
 import sys
 
-import httpx
 import openai
 from openai import OpenAI
 
@@ -133,7 +132,12 @@ def s_server_error():
 def s_sdk_retries():
     # The SDK's own retry logic must see well-formed 429s; with 1 retry it
     # fails after ~2 attempts, proving retry-after parsing worked.
-    retrying = client.with_options(max_retries=1, timeout=httpx.Timeout(30.0))
+    # Seconds as a plain float rather than the SDK's HTTP client's own
+    # timeout type: which library that is has changed under us once
+    # already (openai 3.x and anthropic 1.x moved from httpx to
+    # httpx2), and a suite whose job is to track the official SDKs
+    # must not import whichever one they happen to vendor this year.
+    retrying = client.with_options(max_retries=1, timeout=30.0)
     try:
         retrying.chat.completions.create(model="openai/err-429", messages=[])
         raise AssertionError("expected RateLimitError after retries")
