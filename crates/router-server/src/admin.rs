@@ -1457,7 +1457,10 @@ async fn device_login_status(
 /// credential that is perfectly able to answer. A metered provider gets
 /// no such guess — an id the account cannot reach would fail the check
 /// and blame the credential.
-fn probe_model(provider: &router_core::router::ProviderRuntime, key_name: &str) -> Option<String> {
+pub(crate) fn probe_model(
+    provider: &router_core::router::ProviderRuntime,
+    key_name: &str,
+) -> Option<String> {
     provider
         .keys
         .iter()
@@ -2233,6 +2236,26 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                             "can_refresh": s.refresh_token.is_some(),
                             "expired": s.is_expired(now_unix),
                         })),
+                        // The last word from the provider on this
+                        // credential — from the maintenance sweep, from an
+                        // operator's check, or from real traffic. Held on
+                        // the gateway rather than in the browser so an
+                        // opened drawer shows the state of the seat now,
+                        // not the result of a check this tab happened to
+                        // run. Wall-clocked the same way the quota
+                        // observation is, and for the same reason.
+                        "last_check": k.last_check().map(|c| json!({
+                            "status": c.status,
+                            "detail": c.detail,
+                            "http_status": c.http_status,
+                            "probed": c.probed,
+                            "checked_at_ms":
+                                now_unix.saturating_sub(now.saturating_sub(c.observed_ms)),
+                        })),
+                        // How many requests this key has been handed. The
+                        // console shows it because "evenly spread" is a
+                        // claim an operator should be able to check.
+                        "leases": k.leases(),
                         "source_path": k.source_path,
                     })
                 })

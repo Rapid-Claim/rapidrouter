@@ -39,6 +39,21 @@ export type ProviderKey = {
   } | null;
   /** Subscription seats only; metered keys have no expiry to report. */
   credential: { email?: string | null; expires_at_ms: number | null; can_refresh: boolean; expired: boolean } | null;
+  /**
+   * The last thing the provider said about this credential — from the
+   * gateway's own sweep, an operator's check, or real traffic. Held
+   * server-side, so it survives a reload and is the same for everyone
+   * looking; `probed` is false when it was simply the last live request.
+   */
+  last_check: {
+    status: "ok" | "rate_limited" | "unauthorized" | "provider_error" | "rejected" | "unreachable";
+    detail: string;
+    http_status: number | null;
+    probed: boolean;
+    checked_at_ms: number;
+  } | null;
+  /** Requests dispatched against this key, ever. */
+  leases?: number;
   source_path: string | null;
 };
 

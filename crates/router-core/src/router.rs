@@ -16,6 +16,7 @@ use crate::credential::{self, Credential, Seat};
 use crate::error::{ErrorClass, GatewayError};
 use crate::quota::Quota;
 use crate::secret::SecretString;
+use crate::sync::{AtomicU64, Ordering};
 use crate::token_bucket::TokenBucket;
 
 pub struct RoutingTable {
@@ -77,6 +78,38 @@ pub struct KeyRuntime {
     /// this seat", which is otherwise invisible until traffic starts
     /// failing.
     quota: Mutex<Option<QuotaSnapshot>>,
+    /// Requests dispatched against this key, ever. The running balance
+    /// [`balanced_pick`] levels; see there for why it is cumulative.
+    leases: AtomicU64,
+    /// The last thing the provider actually said about this credential.
+    check: Mutex<Option<CheckOutcome>>,
+}
+
+/// What the provider last told us about one credential, and when.
+///
+/// The breaker says whether we are sending this key traffic and the quota
+/// snapshot says how much of its plan is left; this is the evidence
+/// underneath both, and it is what an operator is really asking for when
+/// they open a seat — *when did we last hear from this, and what did it
+/// say*. Before it existed the console could only show the result of a
+/// check the operator had run in that browser tab, which vanished on
+/// reload and never reflected the gateway's own sixty-second sweep.
+#[derive(Debug, Clone)]
+pub struct CheckOutcome {
+    /// `ok`, `unauthorized`, `rate_limited`, `provider_error`, `rejected`
+    /// or `unreachable` — the same words the check endpoint returns.
+    pub status: String,
+    /// The upstream's own explanation, when there was a failure to
+    /// explain. Empty on success.
+    pub detail: String,
+    pub http_status: Option<u16>,
+    /// `true` when this came from a deliberate check — the console button
+    /// or the maintenance sweep — and `false` when it is simply what the
+    /// last real request returned. Worth distinguishing: "we asked and it
+    /// was fine" and "it served a caller a moment ago" are different
+    /// kinds of reassurance, and the second is the stronger one.
+    pub probed: bool,
+    pub observed_ms: u64,
 }
 
 /// A quota reading with the wall-clock time it was taken, so the console
@@ -109,6 +142,34 @@ impl KeyRuntime {
     /// The latest quota view, if this key has ever served a request.
     pub fn quota(&self) -> Option<QuotaSnapshot> {
         self.quota.lock().ok().and_then(|slot| *slot)
+    }
+
+    /// Record what the provider just said about this credential.
+    pub fn record_check(&self, outcome: CheckOutcome) {
+        if let Ok(mut slot) = self.check.lock() {
+            *slot = Some(outcome);
+        }
+    }
+
+    /// The last word from the provider on this credential, if there has
+    /// ever been one.
+    pub fn last_check(&self) -> Option<CheckOutcome> {
+        self.check.lock().ok().and_then(|slot| slot.clone())
+    }
+
+    /// How many requests have been dispatched against this key.
+    pub fn leases(&self) -> u64 {
+        self.leases.load(Ordering::Relaxed)
+    }
+
+    /// Charge one dispatch to this key's running balance.
+    ///
+    /// `Relaxed` on purpose: this is a load-levelling hint, not a
+    /// correctness invariant. A lost increment under contention costs one
+    /// request of fairness and nothing else, and paying for ordering on
+    /// every selection would be real cost for no benefit.
+    fn take_lease(&self) {
+        self.leases.fetch_add(1, Ordering::Relaxed);
     }
 
     /// Spend one request against this key's own ceiling. `false` means
@@ -195,7 +256,9 @@ impl RoutingTable {
     /// ceiling, and a config that reloads often would never enforce one.
     /// The observed quota is carried for the same reason in reverse:
     /// blanking it would make the console claim it knows nothing about a
-    /// seat that is, in fact, still exhausted.
+    /// seat that is, in fact, still exhausted. The dispatch balance is
+    /// carried because resetting it would flatten every key to zero and
+    /// hand the next `N` requests to whichever key sorted first.
     pub fn from_config_with(config: &Config, prev: Option<&Self>) -> Self {
         let breaker_config = BreakerConfig {
             failure_threshold: config.reliability.breaker.failure_threshold,
@@ -206,6 +269,17 @@ impl RoutingTable {
         let mut providers = BTreeMap::new();
         let mut catalog = BTreeMap::new();
         for (name, p) in &config.providers {
+            // What a key added by this edit starts its balance at. A
+            // genuinely new credential must not begin at zero next to a
+            // pool that has been serving for a month — `balanced_pick`
+            // would hand it every request until it caught up, which is a
+            // stampede onto the one key nobody has proven yet. Starting it
+            // level with the least-used existing key gives it a normal
+            // share from its first request.
+            let floor = prev
+                .and_then(|t| t.providers.get(name))
+                .and_then(|prev| prev.keys.iter().map(KeyRuntime::leases).min())
+                .unwrap_or(0);
             let keys: Vec<KeyRuntime> = p
                 .keys
                 .iter()
@@ -229,6 +303,14 @@ impl RoutingTable {
                     ),
                     quota: Mutex::new(
                         previous_key(prev, name, &k.name).and_then(KeyRuntime::quota),
+                    ),
+                    leases: AtomicU64::new(
+                        previous_key(prev, name, &k.name)
+                            .map(KeyRuntime::leases)
+                            .unwrap_or(floor),
+                    ),
+                    check: Mutex::new(
+                        previous_key(prev, name, &k.name).and_then(KeyRuntime::last_check),
                     ),
                 })
                 .collect();
@@ -467,14 +549,15 @@ impl ProviderRuntime {
             .copied()
             .filter(|k| k.breaker.looks_healthy(now_ms))
             .collect();
-        // Weighted pick among the healthy, skipping any key that is over
+        // Levelled pick among the healthy, skipping any key that is over
         // its own rate ceiling. A rate-limited key is not *unhealthy* —
         // its breaker is closed and it will serve again shortly — so it is
         // stepped over rather than recorded as a failure.
         let mut candidates = healthy;
         while !candidates.is_empty() {
-            let picked = weighted_pick(&candidates);
+            let picked = balanced_pick(&candidates);
             if picked.try_admit_request(now_ms) {
+                picked.take_lease();
                 return Some(KeyChoice {
                     key: Some(picked),
                     admission: Admission::Yes,
@@ -488,13 +571,18 @@ impl ProviderRuntime {
         // between the filter above and here answers `Yes` — take it.
         // Insisting on `Probe` here used to drop that seat on the floor
         // and report the whole pool exhausted.
-        for key in eligible {
+        // Least-used first here too, so a pool that is entirely open hands
+        // its probe slots out in the same order it would have served them.
+        let mut recovering = eligible;
+        recovering.sort_by(|a, b| share(a).total_cmp(&share(b)));
+        for key in recovering {
             match key.breaker.admit(now_ms) {
                 Admission::No => continue,
                 admission => {
                     if admission == Admission::Yes && !key.try_admit_request(now_ms) {
                         continue;
                     }
+                    key.take_lease();
                     return Some(KeyChoice {
                         key: Some(key),
                         admission,
@@ -607,6 +695,64 @@ fn weighted_pick_target(pool: &[WeightedTarget]) -> TargetModel {
         .expect("a validated group has a non-empty primary pool")
         .target
         .clone()
+}
+
+/// How far through its share a key is: dispatches per unit of weight.
+///
+/// Dividing by the weight is what keeps weighting meaningful — a key at
+/// weight 2 is level with a key at weight 1 when it has served twice as
+/// many requests, which is exactly the split the weights ask for.
+fn share(key: &KeyRuntime) -> f64 {
+    key.leases() as f64 / key.weight
+}
+
+/// Pick the candidate furthest behind its share.
+///
+/// [`weighted_pick`] draws independently per request, which is the right
+/// shape for a traffic *split* between providers but the wrong one for a
+/// pool of credentials. Over `K` requests across `N` equal seats an
+/// independent draw is multinomial, so each seat's share has relative
+/// spread around `sqrt(N / K)`: a pool of ninety seats stays visibly
+/// lumpy for tens of thousands of requests, and the seats it under-draws
+/// are ones whose plan quota then goes unspent while the over-drawn ones
+/// hit their ceiling early. Levelling instead makes the split exact —
+/// every candidate converges on the same dispatch count, scaled by
+/// weight — which is what a pool of subscription seats is for.
+///
+/// The balance is **cumulative**, not windowed, so a seat that has been
+/// out of the pool is preferred until it has caught up with the rest.
+/// That is deliberate: it is the same property that makes a seat which
+/// spent a day benched on its quota window come back and take its turn,
+/// rather than staying permanently behind. A key that is genuinely new
+/// does not start from zero and swamp the pool — see the seeding in
+/// [`RoutingTable::from_config_with`].
+///
+/// Ties break at random rather than by position: with a cold pool every
+/// candidate scores zero, and picking the first would send the opening
+/// run of requests to one seat.
+fn balanced_pick<'a>(keys: &[&'a KeyRuntime]) -> &'a KeyRuntime {
+    if keys.len() == 1 {
+        return keys[0];
+    }
+    let mut best = keys[0];
+    let mut best_share = share(best);
+    let mut tied = 1u32;
+    for key in &keys[1..] {
+        let share = share(key);
+        if share < best_share {
+            best = key;
+            best_share = share;
+            tied = 1;
+        } else if share == best_share {
+            // Reservoir sampling over the tied set: one pass, uniform,
+            // no allocation.
+            tied += 1;
+            if fastrand::u32(0..tied) == 0 {
+                best = key;
+            }
+        }
+    }
+    best
 }
 
 fn weighted_pick<'a>(keys: &[&'a KeyRuntime]) -> &'a KeyRuntime {
@@ -1006,6 +1152,120 @@ cooldown_secs = 1
         assert_eq!(second.admission, Admission::Probe);
         assert_ne!(first.key.unwrap().name, second.key.unwrap().name);
         assert!(r.provider.admit_key("m", 1500).is_none());
+    }
+
+    /// A pool of `n` equal seats, `toml` for a provider named `pool`.
+    fn pool(n: usize) -> String {
+        let keys: Vec<String> = (0..n)
+            .map(|i| format!("{{ name = \"k{i}\", value = \"sk-{i}\" }}"))
+            .collect();
+        format!("[providers.openai]\nkeys = [{}]\n", keys.join(", "))
+    }
+
+    #[test]
+    fn dispatch_is_level_across_the_pool() {
+        let t = table(&pool(20));
+        let r = t.resolve("openai/m").unwrap();
+
+        for _ in 0..2_000 {
+            r.provider.admit_key("m", 0).unwrap();
+        }
+
+        // Exactly level, not merely close: an independent weighted draw
+        // would leave a spread of roughly sqrt(20/2000) here, which is
+        // what made a pool of ninety seats burn some plans out while
+        // others sat unspent.
+        for key in &r.provider.keys {
+            assert_eq!(key.leases(), 100, "{} took {}", key.name, key.leases());
+        }
+    }
+
+    #[test]
+    fn levelling_still_honours_weight() {
+        let t = table(
+            r#"
+[providers.openai]
+keys = [
+  { name = "heavy", value = "sk-a", weight = 3 },
+  { name = "light", value = "sk-b", weight = 1 },
+]
+"#,
+        );
+        let r = t.resolve("openai/m").unwrap();
+        for _ in 0..400 {
+            r.provider.admit_key("m", 0).unwrap();
+        }
+        let leases = |name: &str| {
+            r.provider
+                .keys
+                .iter()
+                .find(|k| k.name == name)
+                .unwrap()
+                .leases()
+        };
+        assert_eq!(leases("heavy"), 300);
+        assert_eq!(leases("light"), 100);
+    }
+
+    #[test]
+    fn a_seat_that_rejoins_is_preferred_until_it_has_caught_up() {
+        let t = table(&pool(4));
+        let r = t.resolve("openai/m").unwrap();
+        let out = r.provider.keys.iter().find(|k| k.name == "k0").unwrap();
+
+        // `k0` is out of service while the other three serve 300.
+        out.breaker.record_failure(0);
+        out.breaker.record_failure(0);
+        out.breaker.record_failure(0);
+        out.breaker.record_failure(0);
+        out.breaker.record_failure(0);
+        for _ in 0..300 {
+            let choice = r.provider.admit_key("m", 10).unwrap();
+            assert_ne!(choice.key.unwrap().name, "k0");
+        }
+        assert_eq!(out.leases(), 0);
+
+        // It comes back. The next hundred requests are all its own, which
+        // is what levelling *means* for a pool of weekly quotas: the seat
+        // that spent nothing is the one with headroom to spend.
+        out.breaker.record_success(400);
+        for _ in 0..100 {
+            assert_eq!(
+                r.provider.admit_key("m", 400).unwrap().key.unwrap().name,
+                "k0"
+            );
+        }
+        // Level again — and it stops taking every request.
+        assert!(
+            (0..40)
+                .filter_map(|_| r.provider.admit_key("m", 400))
+                .any(|c| c.key.unwrap().name != "k0"),
+            "a caught-up seat rejoins the rotation"
+        );
+    }
+
+    #[test]
+    fn a_new_key_starts_level_with_the_least_used() {
+        let before = config(&pool(3));
+        let table = RoutingTable::from_config(&before);
+        let r = table.resolve("openai/m").unwrap();
+        for _ in 0..300 {
+            r.provider.admit_key("m", 0).unwrap();
+        }
+        drop(r);
+
+        let after = config(&pool(4));
+        let table = RoutingTable::from_config_with(&after, Some(&table));
+        let keys = &table.resolve("openai/m").unwrap().provider.keys;
+        let leases = |name: &str| keys.iter().find(|k| k.name == name).unwrap().leases();
+
+        // The three that were serving keep their balance across the edit,
+        // so a reload is not a way to reset the split…
+        assert_eq!(leases("k0"), 100);
+        // …and the one just added starts level with them rather than at
+        // zero, which would have handed it the next hundred requests in a
+        // row — a stampede onto the credential nobody has proven yet.
+        assert_eq!(leases("k3"), 100);
     }
 
     #[test]
