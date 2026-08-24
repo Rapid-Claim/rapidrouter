@@ -38,7 +38,21 @@ export type ProviderKey = {
     secondary: QuotaWindow | null;
   } | null;
   /** Subscription seats only; metered keys have no expiry to report. */
-  credential: { email?: string | null; expires_at_ms: number | null; can_refresh: boolean; expired: boolean } | null;
+  credential: {
+    email?: string | null;
+    /**
+     * The upstream account this seat signs in as, which is *not* the
+     * key's name. Two keys built from two credential files for one
+     * ChatGPT account are one account's quota wearing two names, and
+     * this is the only field that says so — the names differ and the
+     * emails may differ in case or be missing. Used to group duplicates;
+     * not shown as a column, because the grouping is the useful part.
+     */
+    account_id?: string | null;
+    expires_at_ms: number | null;
+    can_refresh: boolean;
+    expired: boolean;
+  } | null;
   /**
    * The last thing the provider said about this credential — from the
    * gateway's own sweep, an operator's check, or real traffic. Held
@@ -373,6 +387,12 @@ export const api = {
     request(`/providers/${encodeURIComponent(name)}/keys/${encodeURIComponent(key)}`, {
       method: "DELETE",
     }),
+  /** Remove many credentials in one config commit; see the handler. */
+  deleteProviderKeys: (name: string, keys: string[]) =>
+    request<{ removed: string[]; missing: string[] }>(
+      `/providers/${encodeURIComponent(name)}/keys/bulk`,
+      { method: "DELETE", body: JSON.stringify({ keys }) },
+    ),
   startDeviceLogin: (name: string, key: string) =>
     request<DeviceLogin>(
       `/providers/${encodeURIComponent(name)}/keys/${encodeURIComponent(key)}/device-login`,
