@@ -113,6 +113,38 @@ test("settings lives in the nav footer and exports the config", async ({ page })
   expect((await download).suggestedFilename()).toBe("rapid-router.toml");
 });
 
+test("a reload connects without ever claiming to be reconnecting", async ({ page }) => {
+  // The header used to be a boolean, so a page that had not finished its
+  // first handshake rendered "Reconnecting" — which made every reload of
+  // a perfectly healthy gateway look like a fault. A first connection is
+  // "Connecting", and it settles on "Live".
+  const reconnecting: string[] = [];
+  await page.exposeFunction("__sawReconnecting", (text: string) => reconnecting.push(text));
+  await page.addInitScript(() => {
+    // Catch it in the DOM as it happens: polling from the test side
+    // would miss a flash that lasts a frame.
+    new MutationObserver(() => {
+      const label = document.querySelector(".live-label")?.textContent ?? "";
+      if (label === "Reconnecting") (window as any).__sawReconnecting?.(label);
+    }).observe(document, { childList: true, subtree: true, characterData: true });
+  });
+
+  await page.reload();
+  await expect(page.locator(".live-label")).toHaveText("Live");
+  expect(reconnecting, "a healthy reload must never say Reconnecting").toEqual([]);
+});
+
+test("the range picker offers the long windows retention now covers", async ({ page }) => {
+  await page.getByRole("button", { name: "Time range" }).click();
+  for (const preset of ["Last 90 days", "Last 6 months", "Last year"]) {
+    await expect(page.getByRole("button", { name: preset })).toBeVisible();
+  }
+  await page.getByRole("button", { name: "Last year" }).click();
+  await expect(page.getByRole("button", { name: "Time range" })).toContainText("Last year");
+  // The whole point of the rollup tiers: a year is not a slow page.
+  await expect(page.getByRole("heading", { name: "Usage", exact: true, level: 1 })).toBeVisible();
+});
+
 test("keyboard shortcuts jump between pages and focus the filter", async ({ page }) => {
   await page.locator("body").press("g");
   await page.locator("body").press("k");

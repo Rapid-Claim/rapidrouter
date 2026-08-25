@@ -73,7 +73,8 @@ admin_keys = ["env.RAPID_ADMIN_KEY"]      # once admin credentials do
 session_ttl_secs = 43200
 
 [usage]
-retention_days = 30             # local partitions pruned by the binary
+retention_days = 365            # request metadata: what every chart is drawn from
+body_retention_days = 1         # captured payloads: far larger, kept far shorter
 flush_interval_secs = 10
 per_key_metrics = false         # bounded per-key metric labels
 

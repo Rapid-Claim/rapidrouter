@@ -165,6 +165,14 @@ impl StoreConfig {
 
 #[derive(Debug, Clone)]
 pub struct UsageConfig {
+    /// How long request *metadata* is kept — the rows every chart, total
+    /// and spend figure is drawn from.
+    ///
+    /// A year by default. That is affordable because it is metadata:
+    /// about a hundred compressed bytes a request, so a gateway serving
+    /// a million a day spends tens of gigabytes on a year of it, and
+    /// reads stay cheap because the console never walks these rows for
+    /// an aggregate — it reads the rollups.
     pub retention_days: u32,
     pub flush_interval: Duration,
     pub per_key_metrics: bool,
@@ -183,9 +191,20 @@ pub struct UsageConfig {
     /// rather than dropped: the head of a prompt identifies the request,
     /// and one pathological caller should not be able to fill the disk.
     pub body_limit_bytes: usize,
-    /// How long captured bodies live. Defaults to the same window as the
-    /// metadata they belong to, so a request that appears in the log can
-    /// always be opened.
+    /// How long captured bodies live.
+    ///
+    /// A day, deliberately far short of [`Self::retention_days`].
+    /// Bodies are the whole payload rather than a summary of it — two
+    /// orders of magnitude larger than the metadata — so a year of them
+    /// on a busy gateway is most of a terabyte, and almost none of it
+    /// would ever be read. What a body is *for* is opening a request you
+    /// are looking at now and asking what was actually sent, which is a
+    /// question people ask about recent traffic. Older than that, the
+    /// metadata still answers what happened, what it cost and how long
+    /// it took.
+    ///
+    /// Raise it if you need longer; the storage cost is roughly
+    /// `requests/day × average body size × days`.
     pub body_retention_days: u32,
 }
 
@@ -230,12 +249,12 @@ impl BodyCapture {
 impl Default for UsageConfig {
     fn default() -> Self {
         Self {
-            retention_days: 30,
+            retention_days: 365,
             flush_interval: Duration::from_secs(10),
             per_key_metrics: false,
             capture_bodies: BodyCapture::All,
             body_limit_bytes: 256 * 1024,
-            body_retention_days: 30,
+            body_retention_days: 1,
         }
     }
 }
