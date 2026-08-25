@@ -147,7 +147,13 @@ fn analytics_concurrency() -> usize {
 /// slow is the one thing this endpoint is not allowed to do. The
 /// semaphore is the other half of that promise: a handful of concurrent
 /// year-wide reads must not swallow the blocking pool either.
-async fn off_runtime<T, F>(work: F) -> Result<T, Response>
+///
+/// The error is boxed, as `enforce` and `config_document` box theirs: an
+/// unboxed `Response` is 128 bytes that every *successful* read would
+/// carry for nothing, and the successes here are pages of records. The
+/// two ways this fails — the queue closing during shutdown, and a read
+/// panicking — are both rare enough to pay an allocation for.
+async fn off_runtime<T, F>(work: F) -> Result<T, Box<Response>>
 where
     F: FnOnce() -> T + Send + 'static,
     T: Send + 'static,
@@ -157,17 +163,17 @@ where
     // Held across the join below: the permit is the queue, and releasing
     // it before the work finishes would make the bound meaningless.
     let _permit = SLOTS.acquire().await.map_err(|_| {
-        api_error(
+        Box::new(api_error(
             StatusCode::SERVICE_UNAVAILABLE,
             "analytics queue is shutting down",
-        )
+        ))
     })?;
     tokio::task::spawn_blocking(work).await.map_err(|err| {
         tracing::warn!(%err, "analytics read panicked");
-        api_error(
+        Box::new(api_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             "analytics read failed; see gateway logs",
-        )
+        ))
     })
 }
 
@@ -253,7 +259,7 @@ where
             Json(&*value).into_response()
         }
         Ok(Err(err)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -871,7 +877,7 @@ async fn requests(
             "next": next.map(|(ts, id)| format!("{ts}:{id}")),
         }))
         .into_response(),
-        Err(response) => response,
+        Err(response) => *response,
     }
 }
 
@@ -950,7 +956,7 @@ async fn request_bodies(
         let ts = query.ts;
         match off_runtime(move || usage.bodies_for(&id, ts)).await {
             Ok(found) => found,
-            Err(response) => return response,
+            Err(response) => return *response,
         }
     };
     match lookup {
