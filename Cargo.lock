@@ -3128,6 +3128,7 @@ dependencies = [
 name = "router-providers"
 version = "0.1.0"
 dependencies = [
+ "blake3",
  "bytes",
  "criterion",
  "hmac 0.12.1",

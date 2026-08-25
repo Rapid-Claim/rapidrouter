@@ -532,6 +532,94 @@ struct AggKey {
     vkey: Option<String>,
 }
 
+/// What to call a dimension the request never reached.
+///
+/// A request that failed before a provider was chosen has no model and
+/// no provider. It is still a request, and grouping it under an empty
+/// name would hide exactly the failures worth seeing.
+fn model_name(model: &str) -> &str {
+    if model.is_empty() { "(none)" } else { model }
+}
+
+/// Latency accumulated per model per bucket.
+///
+/// The one shape every source can produce — the minute aggregate, hourly
+/// rollups and raw records alike — and the only one an average composes
+/// from: means do not sum, but a count and a sum of milliseconds do, and
+/// the division happens once at the end.
+#[derive(Debug, Default)]
+struct LatencyGrid {
+    /// model -> bucket start (unix seconds) -> (requests, latency sum).
+    cells: BTreeMap<String, BTreeMap<u64, (u64, u64)>>,
+}
+
+impl LatencyGrid {
+    fn add(&mut self, model: &str, bucket: u64, requests: u64, latency_ms_sum: u64) {
+        let slot = self
+            .cells
+            .entry(model.to_owned())
+            .or_default()
+            .entry(bucket)
+            .or_insert((0, 0));
+        slot.0 += requests;
+        slot.1 += latency_ms_sum;
+    }
+
+    /// The busiest `limit` models, biggest first.
+    ///
+    /// Capped because this draws a line per model: a gateway serving
+    /// fifty of them produces a chart nobody can read, and the long tail
+    /// is what the per-model table underneath is for.
+    fn top(self, limit: usize) -> Vec<ModelLatency> {
+        let mut series: Vec<ModelLatency> = self
+            .cells
+            .into_iter()
+            .map(|(name, buckets)| ModelLatency {
+                name,
+                requests: buckets.values().map(|(requests, _)| requests).sum(),
+                points: buckets
+                    .into_iter()
+                    .map(|(ts, (requests, latency_ms_sum))| LatencyPoint {
+                        ts,
+                        requests,
+                        latency_ms_sum,
+                    })
+                    .collect(),
+            })
+            .collect();
+        series.sort_by(|a, b| {
+            b.requests
+                .cmp(&a.requests)
+                .then_with(|| a.name.cmp(&b.name))
+        });
+        series.truncate(limit);
+        series
+    }
+}
+
+/// How many models the per-model latency chart draws.
+const LATENCY_SERIES_CAP: usize = 6;
+
+/// One model's latency over time, as counts and sums rather than means.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct ModelLatency {
+    pub name: String,
+    /// Requests behind the whole series, which is what ranks it.
+    pub requests: u64,
+    pub points: Vec<LatencyPoint>,
+}
+
+/// One bucket of one model's latency.
+///
+/// The average is `latency_ms_sum / requests`, left to the reader so
+/// that a chart can re-bucket without averaging averages.
+#[derive(Debug, Default, Clone, serde::Serialize)]
+pub struct LatencyPoint {
+    pub ts: u64,
+    pub requests: u64,
+    pub latency_ms_sum: u64,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 struct AggCell {
     requests: u64,
@@ -584,20 +672,26 @@ impl Aggregator {
         Some(first.max((now_ms / 60_000).saturating_sub(MINUTES as u64 - 1)))
     }
 
-    /// Per-minute totals for a window, re-bucketed and filtered.
+    /// Per-minute totals for a window, re-bucketed and filtered, plus the
+    /// same traffic split by model for the latency chart.
     ///
     /// The only source with sub-hour resolution. Rollups are hourly by
     /// design — that is what makes a year affordable — so a chart of the
     /// last hour has to come from here or from raw records, and this
     /// costs a walk over sixty small maps.
+    ///
+    /// The per-model split comes back from the same walk because it is
+    /// the same maps: the cells are keyed by model already, so the only
+    /// alternative is walking them twice for one of the two answers.
     fn series(
         &self,
         since_ms: u64,
         until_ms: u64,
         bucket_secs: u64,
         filter: &HistoryFilter,
-    ) -> Vec<UsageBucket> {
+    ) -> (Vec<UsageBucket>, LatencyGrid) {
         let mut out: BTreeMap<u64, UsageBucket> = BTreeMap::new();
+        let mut grid = LatencyGrid::default();
         let bucket_secs = bucket_secs.max(60);
         for minute in (since_ms / 60_000)..=(until_ms / 60_000) {
             let slot = self.slots[(minute as usize) % MINUTES].lock().unwrap();
@@ -618,9 +712,16 @@ impl Aggregator {
                 point.input_tokens += cell.input_tokens;
                 point.output_tokens += cell.output_tokens;
                 point.cost_micro_usd += cell.cost_micro_usd;
+                point.latency_ms_sum += cell.latency_ms_sum;
+                grid.add(
+                    model_name(&key.model),
+                    bucket,
+                    cell.requests,
+                    cell.latency_ms_sum,
+                );
             }
         }
-        out.into_values().collect()
+        (out.into_values().collect(), grid)
     }
 
     fn record(&self, rec: &UsageRecord) {
@@ -1732,6 +1833,27 @@ pub struct DayBucket {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_micro_usd: u64,
+    /// Summed, not averaged, for the same reason the rollup row sums it:
+    /// means do not compose, so the mean is `latency_ms_sum / requests`
+    /// taken once by whoever draws it.
+    #[serde(default)]
+    pub latency_ms_sum: u64,
+}
+
+/// Daily series for a window, and the latency figures a day bucket
+/// cannot carry.
+///
+/// Percentiles do not sum, so there is no honest per-day p95 to put in a
+/// `DayBucket` that a reader could then total up. They are computed once
+/// over the same rows the buckets were folded from, and describe the
+/// whole window.
+#[derive(Debug, Default, Clone, Serialize)]
+pub struct History {
+    /// `by` -> series name -> days, where `by` is `""` (the total),
+    /// `"provider"`, `"model"` or `"key"`.
+    pub data: BTreeMap<String, BTreeMap<String, Vec<DayBucket>>>,
+    pub p50_latency_ms: u64,
+    pub p95_latency_ms: u64,
 }
 
 impl UsagePipeline {
@@ -2034,6 +2156,7 @@ impl UsagePipeline {
         filter: &HistoryFilter,
     ) -> BTreeMap<String, Vec<DayBucket>> {
         self.history_all(days, filter)
+            .data
             .remove(by)
             .unwrap_or_default()
     }
@@ -2048,15 +2171,11 @@ impl UsagePipeline {
     /// hand — the read is the expensive part, and it is the same read
     /// for all of them.
     ///
-    /// Returns `by` -> series -> days, where `by` is `""` (the total),
-    /// `"provider"`, `"model"` or `"key"`.
-    pub fn history_all(
-        &self,
-        days: u32,
-        filter: &HistoryFilter,
-    ) -> BTreeMap<String, BTreeMap<String, Vec<DayBucket>>> {
+    /// Returns the groupings plus the window's latency percentiles; see
+    /// [`History`].
+    pub fn history_all(&self, days: u32, filter: &HistoryFilter) -> History {
         if self.data_dir.is_none() {
-            return BTreeMap::new();
+            return History::default();
         }
         let now = vkey::unix_now_ms();
         let since = now.saturating_sub(days.max(1) as u64 * DAY_MS);
@@ -2064,10 +2183,16 @@ impl UsagePipeline {
 
         let mut out: BTreeMap<String, BTreeMap<String, BTreeMap<String, DayBucket>>> =
             BTreeMap::new();
+        let mut latency = LatencyHistogram::default();
+        let mut latency_sum = 0u64;
+        let mut requests = 0u64;
         for row in rows {
             if !filter.matches_dims(&row.provider, &row.model, row.vkey.as_deref()) {
                 continue;
             }
+            latency.merge(&row.latency);
+            latency_sum += row.latency_ms_sum;
+            requests += row.requests;
             let day = day_partition(row.hour_ms)
                 .trim_start_matches("dt=")
                 .to_owned();
@@ -2092,19 +2217,37 @@ impl UsagePipeline {
                 bucket.input_tokens += row.input_tokens;
                 bucket.output_tokens += row.output_tokens;
                 bucket.cost_micro_usd += row.cost_micro_usd;
+                bucket.latency_ms_sum += row.latency_ms_sum;
             }
         }
-        out.into_iter()
-            .map(|(by, groupings)| {
-                (
-                    by,
-                    groupings
-                        .into_iter()
-                        .map(|(series, days)| (series, days.into_values().collect()))
-                        .collect(),
-                )
-            })
-            .collect()
+        History {
+            data: out
+                .into_iter()
+                .map(|(by, groupings)| {
+                    (
+                        by,
+                        groupings
+                            .into_iter()
+                            .map(|(series, days)| (series, days.into_values().collect()))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            // Rows written before histograms existed carry only a sum,
+            // and the mean is the only percentile a sum can honestly
+            // supply — better than a confident zero for a window whose
+            // older half predates the upgrade.
+            p50_latency_ms: if latency.is_empty() {
+                latency_sum.checked_div(requests).unwrap_or(0)
+            } else {
+                latency.percentile(50)
+            },
+            p95_latency_ms: if latency.is_empty() {
+                latency_sum.checked_div(requests).unwrap_or(0)
+            } else {
+                latency.percentile(95)
+            },
+        }
     }
 }
 
@@ -2249,6 +2392,10 @@ pub struct UsageSummary {
     pub by_key: Vec<UsageSlice>,
     /// Bucket start (unix seconds) -> totals, for the trend charts.
     pub series: Vec<UsageBucket>,
+    /// The busiest few models' latency over the same buckets, so "which
+    /// model got slower" is one chart rather than a filter applied seven
+    /// times. Capped at [`LATENCY_SERIES_CAP`] series.
+    pub latency_by_model: Vec<ModelLatency>,
     /// Bucket width actually used, so the chart can label itself.
     pub bucket_secs: u64,
 }
@@ -2261,6 +2408,12 @@ pub struct UsageSlice {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_micro_usd: u64,
+    /// Summed; the mean is this over `requests`.
+    pub latency_ms_sum: u64,
+    /// Read from this slice's own histogram, which is why it is here and
+    /// not derived from the sum: a mean hides the tail that makes one
+    /// model feel slow.
+    pub p95_latency_ms: u64,
 }
 
 #[derive(Debug, Default, Clone, serde::Serialize)]
@@ -2271,6 +2424,48 @@ pub struct UsageBucket {
     pub input_tokens: u64,
     pub output_tokens: u64,
     pub cost_micro_usd: u64,
+    pub latency_ms_sum: u64,
+}
+
+/// Slices under construction: the numbers that sum, alongside the
+/// distribution that does not, kept apart because only the first is sent.
+type Slices = HashMap<String, (UsageSlice, LatencyHistogram)>;
+
+fn slot<'a>(map: &'a mut Slices, name: &str) -> &'a mut (UsageSlice, LatencyHistogram) {
+    map.entry(name.to_owned()).or_insert_with(|| {
+        (
+            UsageSlice {
+                name: name.to_owned(),
+                ..Default::default()
+            },
+            LatencyHistogram::default(),
+        )
+    })
+}
+
+/// Finish the slices: read each one's p95 off its histogram, then order
+/// them biggest first — the tables show a leaderboard, not an index.
+fn ranked(map: Slices) -> Vec<UsageSlice> {
+    let mut out: Vec<UsageSlice> = map
+        .into_values()
+        .map(|(mut slice, latency)| {
+            slice.p95_latency_ms = if latency.is_empty() {
+                slice
+                    .latency_ms_sum
+                    .checked_div(slice.requests)
+                    .unwrap_or(0)
+            } else {
+                latency.percentile(95)
+            };
+            slice
+        })
+        .collect();
+    out.sort_by(|a, b| {
+        b.requests
+            .cmp(&a.requests)
+            .then_with(|| a.name.cmp(&b.name))
+    });
+    out
 }
 
 /// Keep the chart under a few hundred points however wide the window is:
@@ -2331,10 +2526,11 @@ impl UsagePipeline {
         };
 
         let mut latencies: Vec<u64> = Vec::with_capacity(records.len().min(SUMMARY_SCAN_CAP));
-        let mut by_model: HashMap<String, UsageSlice> = HashMap::new();
-        let mut by_provider: HashMap<String, UsageSlice> = HashMap::new();
-        let mut by_key: HashMap<String, UsageSlice> = HashMap::new();
+        let mut by_model = Slices::new();
+        let mut by_provider = Slices::new();
+        let mut by_key = Slices::new();
         let mut series: BTreeMap<u64, UsageBucket> = BTreeMap::new();
+        let mut grid = LatencyGrid::default();
 
         for rec in records.iter().take(SUMMARY_SCAN_CAP) {
             out.requests += 1;
@@ -2347,38 +2543,20 @@ impl UsagePipeline {
             out.cost_micro_usd += rec.cost_micro_usd;
             latencies.push(rec.latency_ms);
 
-            // A request that never reached a provider has no model and no
-            // provider; it is still a request, and grouping it under an
-            // empty name would hide exactly the failures worth seeing.
-            let add = |map: &mut HashMap<String, UsageSlice>, name: &str| {
-                let slice = map.entry(name.to_owned()).or_insert_with(|| UsageSlice {
-                    name: name.to_owned(),
-                    ..Default::default()
-                });
+            let add = |map: &mut Slices, name: &str| {
+                let (slice, latency) = slot(map, name);
                 slice.requests += 1;
                 slice.failed += failed;
                 slice.input_tokens += rec.input_tokens;
                 slice.output_tokens += rec.output_tokens;
                 slice.cost_micro_usd += rec.cost_micro_usd;
+                slice.latency_ms_sum += rec.latency_ms;
+                latency.record(rec.latency_ms);
             };
-            let unset = "(none)";
-            add(
-                &mut by_model,
-                if rec.model.is_empty() {
-                    unset
-                } else {
-                    &rec.model
-                },
-            );
-            add(
-                &mut by_provider,
-                if rec.provider.is_empty() {
-                    unset
-                } else {
-                    &rec.provider
-                },
-            );
-            add(&mut by_key, rec.vkey.as_deref().unwrap_or(unset));
+            let model = model_name(&rec.model);
+            add(&mut by_model, model);
+            add(&mut by_provider, model_name(&rec.provider));
+            add(&mut by_key, rec.vkey.as_deref().unwrap_or("(none)"));
 
             let bucket = (rec.ts / 1000 / bucket_secs) * bucket_secs;
             let point = series.entry(bucket).or_insert(UsageBucket {
@@ -2390,26 +2568,19 @@ impl UsagePipeline {
             point.input_tokens += rec.input_tokens;
             point.output_tokens += rec.output_tokens;
             point.cost_micro_usd += rec.cost_micro_usd;
+            point.latency_ms_sum += rec.latency_ms;
+            grid.add(model, bucket, 1, rec.latency_ms);
         }
 
         latencies.sort_unstable();
         out.p50_latency_ms = percentile(&latencies, 50);
         out.p95_latency_ms = percentile(&latencies, 95);
 
-        // Biggest first: the tables show a leaderboard, not an index.
-        let ranked = |map: HashMap<String, UsageSlice>| {
-            let mut v: Vec<UsageSlice> = map.into_values().collect();
-            v.sort_by(|a, b| {
-                b.requests
-                    .cmp(&a.requests)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            v
-        };
         out.by_model = ranked(by_model);
         out.by_provider = ranked(by_provider);
         out.by_key = ranked(by_key);
         out.series = series.into_values().collect();
+        out.latency_by_model = grid.top(LATENCY_SERIES_CAP);
         out
     }
 
@@ -2444,11 +2615,17 @@ impl UsagePipeline {
         // `bucket_secs`, so the chart labels itself for what it actually
         // drew instead of implying detail it does not have.
         let now = vkey::unix_now_ms();
-        let minute_series = (bucket_secs < HOUR_MS / 1000)
+        let (minute_series, minute_grid) = match (bucket_secs < HOUR_MS / 1000)
             .then(|| self.agg.floor_minute(now))
             .flatten()
             .filter(|floor| since_ms / 60_000 >= *floor)
-            .map(|_| self.agg.series(since_ms, until_ms, bucket_secs, filter));
+        {
+            Some(_) => {
+                let (series, grid) = self.agg.series(since_ms, until_ms, bucket_secs, filter);
+                (Some(series), Some(grid))
+            }
+            None => (None, None),
+        };
 
         let mut out = UsageSummary {
             bucket_secs: match &minute_series {
@@ -2459,10 +2636,15 @@ impl UsagePipeline {
         };
         let mut latency = LatencyHistogram::default();
         let mut latency_sum = 0u64;
-        let mut by_model: HashMap<String, UsageSlice> = HashMap::new();
-        let mut by_provider: HashMap<String, UsageSlice> = HashMap::new();
-        let mut by_key: HashMap<String, UsageSlice> = HashMap::new();
+        let mut by_model = Slices::new();
+        let mut by_provider = Slices::new();
+        let mut by_key = Slices::new();
         let mut series: BTreeMap<u64, UsageBucket> = BTreeMap::new();
+        // Hourly rows when the minute aggregate is not drawing the
+        // series, and the aggregate's own per-model split when it is —
+        // the same choice the series itself makes, for the same reason:
+        // counting both would count the traffic twice.
+        let mut grid = minute_grid.unwrap_or_default();
 
         for row in &rows {
             if !filter.matches_dims(&row.provider, &row.model, row.vkey.as_deref()) {
@@ -2478,39 +2660,20 @@ impl UsagePipeline {
             latency.merge(&row.latency);
             latency_sum += row.latency_ms_sum;
 
-            // A request that never reached a provider has no model and
-            // no provider; it is still a request, and grouping it under
-            // an empty name would hide exactly the failures worth
-            // seeing.
-            let unset = "(none)";
-            let add = |map: &mut HashMap<String, UsageSlice>, name: &str| {
-                let slice = map.entry(name.to_owned()).or_insert_with(|| UsageSlice {
-                    name: name.to_owned(),
-                    ..Default::default()
-                });
+            let add = |map: &mut Slices, name: &str| {
+                let (slice, latency) = slot(map, name);
                 slice.requests += row.requests;
                 slice.failed += row.failed;
                 slice.input_tokens += row.input_tokens;
                 slice.output_tokens += row.output_tokens;
                 slice.cost_micro_usd += row.cost_micro_usd;
+                slice.latency_ms_sum += row.latency_ms_sum;
+                latency.merge(&row.latency);
             };
-            add(
-                &mut by_model,
-                if row.model.is_empty() {
-                    unset
-                } else {
-                    &row.model
-                },
-            );
-            add(
-                &mut by_provider,
-                if row.provider.is_empty() {
-                    unset
-                } else {
-                    &row.provider
-                },
-            );
-            add(&mut by_key, row.vkey.as_deref().unwrap_or(unset));
+            let model = model_name(&row.model);
+            add(&mut by_model, model);
+            add(&mut by_provider, model_name(&row.provider));
+            add(&mut by_key, row.vkey.as_deref().unwrap_or("(none)"));
 
             // Skipped when the minute aggregate is drawing the series:
             // the two would be the same traffic counted twice.
@@ -2527,6 +2690,8 @@ impl UsagePipeline {
             point.input_tokens += row.input_tokens;
             point.output_tokens += row.output_tokens;
             point.cost_micro_usd += row.cost_micro_usd;
+            point.latency_ms_sum += row.latency_ms_sum;
+            grid.add(model, bucket, row.requests, row.latency_ms_sum);
         }
 
         // Rows written before histograms existed carry only a sum. The
@@ -2544,19 +2709,11 @@ impl UsagePipeline {
             latency.percentile(95)
         };
 
-        let ranked = |map: HashMap<String, UsageSlice>| {
-            let mut v: Vec<UsageSlice> = map.into_values().collect();
-            v.sort_by(|a, b| {
-                b.requests
-                    .cmp(&a.requests)
-                    .then_with(|| a.name.cmp(&b.name))
-            });
-            v
-        };
         out.by_model = ranked(by_model);
         out.by_provider = ranked(by_provider);
         out.by_key = ranked(by_key);
         out.series = minute_series.unwrap_or_else(|| series.into_values().collect());
+        out.latency_by_model = grid.top(LATENCY_SERIES_CAP);
         out
     }
 }
@@ -3112,6 +3269,118 @@ mod usage_summary_tests {
         assert_eq!(rollup.by_model.len(), 2);
     }
 
+    /// Latency has to reach the console split by model, because "the
+    /// gateway got slower" and "one model got slower" are different
+    /// incidents and only the second one is actionable.
+    ///
+    /// Both paths are checked against the same corpus: a mean that
+    /// survives a rollup and a mean computed from records have to agree,
+    /// or the chart changes shape when the window crosses a day.
+    #[test]
+    fn latency_reaches_the_summary_split_by_model() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        // Two models with deliberately different latencies, so a chart
+        // that averaged them together would show neither.
+        let records: Vec<UsageRecord> = (0..600)
+            .map(|i| {
+                let slow = i % 2 == 0;
+                let mut rec = record(i, if slow { "slow-model" } else { "fast-model" }, 200);
+                rec.latency_ms = if slow { 1_000 } else { 100 };
+                rec
+            })
+            .collect();
+        for (batch, chunk) in records.chunks(200).enumerate() {
+            write_batch_for_test(dir.path(), "node-a", batch as u64, chunk);
+            write_rollups_for_test(dir.path(), "node-a", batch as u64, chunk);
+        }
+        let since = records.first().expect("records").ts;
+        let until = records.last().expect("records").ts;
+
+        let summary = pipeline.usage_summary(since, until, &HistoryFilter::default(), false);
+        let mean = |slice: &UsageSlice| slice.latency_ms_sum / slice.requests;
+        let by_name = |name: &str| {
+            summary
+                .by_model
+                .iter()
+                .find(|slice| slice.name == name)
+                .unwrap_or_else(|| panic!("{name} missing from by_model"))
+        };
+        assert_eq!(mean(by_name("slow-model")), 1_000);
+        assert_eq!(mean(by_name("fast-model")), 100);
+        // Every request in a slice took the same time, so its p95 is
+        // that time — modulo the histogram's ~19% bucket width.
+        assert!(
+            (1_000..=1_200).contains(&by_name("slow-model").p95_latency_ms),
+            "p95 came back as {}",
+            by_name("slow-model").p95_latency_ms,
+        );
+
+        let series = &summary.latency_by_model;
+        assert_eq!(series.len(), 2, "one series per model served");
+        for model in series {
+            let requests: u64 = model.points.iter().map(|p| p.requests).sum();
+            let latency: u64 = model.points.iter().map(|p| p.latency_ms_sum).sum();
+            assert_eq!(requests, 300, "{} lost requests", model.name);
+            assert_eq!(
+                latency / requests,
+                if model.name == "slow-model" {
+                    1_000
+                } else {
+                    100
+                },
+                "{} charted the wrong mean",
+                model.name,
+            );
+        }
+
+        // The buckets also have to total the window: a series drawn from
+        // a different denominator than the tiles above it is worse than
+        // no series at all.
+        let charted: u64 = series
+            .iter()
+            .flat_map(|m| &m.points)
+            .map(|p| p.requests)
+            .sum();
+        assert_eq!(charted, summary.requests);
+    }
+
+    /// A window wider than the live tail is read as day buckets, and
+    /// those have to carry latency too — otherwise the per-model chart
+    /// goes blank the moment somebody picks "Last 7 days".
+    #[test]
+    fn history_carries_latency_per_day_and_a_window_percentile() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        let now = vkey::unix_now_ms();
+        let records: Vec<UsageRecord> = (0..400)
+            .map(|i| {
+                let mut rec = record(i, "gpt-4o", 200);
+                rec.ts = now - (i % 4) * DAY_MS - HOUR_MS;
+                rec.latency_ms = 250;
+                rec
+            })
+            .collect();
+        write_rollups_for_test(dir.path(), "node-a", 0, &records);
+
+        let history = pipeline.history_all(30, &HistoryFilter::default());
+        let days = &history.data["model"]["gpt-4o"];
+        assert_eq!(days.len(), 4, "one bucket per day served");
+        for day in days {
+            assert_eq!(
+                day.latency_ms_sum / day.requests,
+                250,
+                "{} lost its latency",
+                day.day
+            );
+        }
+        assert!(
+            (250..=300).contains(&history.p95_latency_ms),
+            "window p95 came back as {}",
+            history.p95_latency_ms,
+        );
+    }
+
     /// The scan cap was the thing that made a wide window a lie. Past it,
     /// the old path silently stopped counting; the rollup path has no
     /// such ceiling because it never touches a record.
@@ -3189,10 +3458,10 @@ mod usage_summary_tests {
         let all = pipeline.history_all(30, &HistoryFilter::default());
         for by in ["", "provider", "model", "key"] {
             let one = pipeline.history(30, by, &HistoryFilter::default());
-            let from_all = all.get(by).cloned().unwrap_or_default();
+            let from_all = all.data.get(by).cloned().unwrap_or_default();
             assert_eq!(one, from_all, "grouping {by:?} disagreed");
         }
-        let total: u64 = all["model"]
+        let total: u64 = all.data["model"]
             .values()
             .flatten()
             .map(|bucket| bucket.requests)

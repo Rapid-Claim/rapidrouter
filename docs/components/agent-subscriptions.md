@@ -73,6 +73,18 @@ Hard-won details, all measured against the live backend:
   against `gpt-5.4`'s 2.1 s on the same single-turn extraction workload. They
   pin `reasoning.effort` and `text.verbosity` to `low` and let a caller raise
   the floor per request.
+- **`prompt_cache_key` is how a cache is found.** The backend caches a
+  request's prefix and routes on this key; two requests sharing a prefix only
+  share its cache if they carry the same key, and the CLI always sends one.
+  A gateway has no conversation id to send, so the key is derived instead —
+  from the model, the `instructions` and the tool names, and *deliberately
+  not* from `input`. Hashing the input too would mint a fresh key per chart
+  and per turn, which is the one shape guaranteed to miss. Two unrelated
+  conversations landing on one key is the mechanism, not a collision: they
+  share the prefix that key stands for. A caller keeping its own conversation
+  ids overrides it with `prompt_cache_key` in the request. Whether it is
+  working is observable — `input_tokens_details.cached_tokens` is carried
+  through to the usage record's cached-token column.
 - **Tool calls come from `response.output_item.done`**, not from the terminal
   `response.completed` — on this backend that final event carries an *empty*
   `output` array. Reading only `response.completed` yields a 200 with no tool

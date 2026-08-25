@@ -247,6 +247,9 @@ pub struct CodexRequest {
 ///   differs the same way.
 /// - **`store: false`.** Nothing is retained upstream, which is also what
 ///   makes a failed request safe to re-issue on another seat.
+/// - **A `prompt_cache_key`.** The backend caches prefixes and routes on
+///   this key; omitting it is what the CLI never does. See
+///   [`codex_cache_key`].
 /// - **The `json_object` "json" guard.** The backend refuses a
 ///   `json_object` request unless the word "json" appears in `input` — and
 ///   it checks `input` only, never `instructions`. A caller whose "return
@@ -272,14 +275,17 @@ pub fn codex_request(
         ensure_json_mentioned(&mut input);
     }
 
+    let instructions = instructions.unwrap_or_else(|| "You are Codex.".to_owned());
+
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
     body.insert("stream".into(), json!(true));
     body.insert("store".into(), json!(false));
     body.insert(
-        "instructions".into(),
-        json!(instructions.unwrap_or_else(|| "You are Codex.".to_owned())),
+        "prompt_cache_key".into(),
+        json!(codex_cache_key(req, model, &instructions)),
     );
+    body.insert("instructions".into(), json!(instructions));
     body.insert("input".into(), Value::Array(input));
 
     // `format` and `verbosity` share one `text` object; assigning it twice
@@ -336,11 +342,12 @@ pub fn codex_request(
     if req.stop.is_some() {
         dropped.push("stop".into());
     }
-    for (name, _) in req
-        .extra
-        .iter()
-        .filter(|(k, _)| !matches!(k.as_str(), "reasoning_effort" | "verbosity" | "metadata"))
-    {
+    for (name, _) in req.extra.iter().filter(|(k, _)| {
+        !matches!(
+            k.as_str(),
+            "reasoning_effort" | "verbosity" | "metadata" | "prompt_cache_key"
+        )
+    }) {
         dropped.push(name.clone());
     }
 
@@ -348,6 +355,52 @@ pub fn codex_request(
         body: Value::Object(body),
         dropped_params: dropped,
     })
+}
+
+/// The prompt-cache key for a Codex request.
+///
+/// The backend caches the prefix of a request and routes on this key:
+/// two requests that share a prefix only share its *cache* if they also
+/// carry the same key. Sending none — which is what this did until now,
+/// and what the CLI never does — leaves every request to find a cache by
+/// luck.
+///
+/// So the key has to name the **prefix**, not the request. It is derived
+/// from the parts of a Responses body that a conversation does not
+/// disturb as it grows — the model, the `instructions`, and the tool
+/// names — and deliberately *not* from `input`.
+///
+/// That exclusion is the whole design. Hashing the input too would mint a
+/// fresh key per chart and per turn, which is the one shape guaranteed to
+/// miss: every request would route somewhere new and re-pay for the
+/// system prompt it shares with every other request in the workload. Two
+/// unrelated conversations landing on one key is not a collision to avoid
+/// — it is the mechanism, and they share the prefix that key stands for.
+///
+/// Tool *schemas* are left out where the names are enough. A workload
+/// that edits a schema without renaming the tool keeps its key while its
+/// prefix moves, and pays one cold miss before the new prefix is cached
+/// under it. A key is a routing hint; a stale one costs a miss, never an
+/// answer.
+///
+/// A caller that keeps its own conversation ids knows better than any of
+/// this and says so with `prompt_cache_key`, which is passed through
+/// untouched.
+fn codex_cache_key(req: &ChatRequest, model: &str, instructions: &str) -> String {
+    if let Some(supplied) = request_choice(req, "prompt_cache_key") {
+        return supplied;
+    }
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(model.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(instructions.as_bytes());
+    for tool in req.tools.iter().flatten() {
+        hasher.update(b"\0");
+        hasher.update(tool.function.name.as_bytes());
+    }
+    // Half a blake3 digest: this names a cache bucket, not a secret, and
+    // 128 bits is past the point where a collision is worth a thought.
+    format!("rr-{}", &hasher.finalize().to_hex()[..32])
 }
 
 /// A caller-supplied enum knob carried in `extra` (the Chat Completions
@@ -726,6 +779,89 @@ mod tests {
         assert!(
             built.body.get("max_output_tokens").is_none(),
             "this backend 400s on max_output_tokens"
+        );
+    }
+
+    /// The `prompt_cache_key` of a request built from `messages`.
+    fn cache_key_of(messages: Vec<Message>) -> String {
+        let built =
+            codex_request(&request(messages), "gpt-5.5", &CodexSettings::default()).unwrap();
+        built.body["prompt_cache_key"]
+            .as_str()
+            .expect("every request carries one")
+            .to_owned()
+    }
+
+    #[test]
+    fn the_cache_key_survives_a_growing_conversation() {
+        let system = message("system", "You are a medical coder.");
+        let first = cache_key_of(vec![system.clone(), message("user", "chart one")]);
+        let later = cache_key_of(vec![
+            system.clone(),
+            message("user", "chart one"),
+            message("assistant", "99213"),
+            message("user", "and this one?"),
+        ]);
+        assert_eq!(
+            first, later,
+            "the key names the prefix, so a longer conversation keeps it"
+        );
+
+        // The same reason, the other way round: a second chart under the
+        // same system prompt shares the prefix, so it must share the key
+        // rather than routing somewhere with a cold cache.
+        let other_chart = cache_key_of(vec![system, message("user", "chart two")]);
+        assert_eq!(first, other_chart, "input must not enter the key");
+    }
+
+    #[test]
+    fn a_different_prefix_gets_a_different_cache_key() {
+        let mine = cache_key_of(vec![message("system", "You are a medical coder.")]);
+        let theirs = cache_key_of(vec![message("system", "You are a poet.")]);
+        assert_ne!(mine, theirs, "different instructions, different prefix");
+
+        let mut with_tools = request(vec![message("system", "You are a medical coder.")]);
+        with_tools.tools = Some(vec![Tool {
+            tool_type: "function".into(),
+            function: FunctionDef {
+                name: "lookup_icd".into(),
+                description: None,
+                parameters: None,
+                strict: None,
+            },
+        }]);
+        let built = codex_request(&with_tools, "gpt-5.5", &CodexSettings::default()).unwrap();
+        assert_ne!(
+            built.body["prompt_cache_key"].as_str().unwrap(),
+            mine,
+            "tools are part of the prefix too"
+        );
+
+        let same_prompt_other_model = codex_request(
+            &request(vec![message("system", "You are a medical coder.")]),
+            "gpt-5.5-codex",
+            &CodexSettings::default(),
+        )
+        .unwrap();
+        assert_ne!(
+            same_prompt_other_model.body["prompt_cache_key"]
+                .as_str()
+                .unwrap(),
+            mine,
+            "a cache is per-model, so the key is too"
+        );
+    }
+
+    #[test]
+    fn a_caller_can_supply_its_own_cache_key() {
+        let mut req = request(vec![message("user", "hi")]);
+        req.extra
+            .insert("prompt_cache_key".into(), json!("conversation-42"));
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
+        assert_eq!(built.body["prompt_cache_key"], "conversation-42");
+        assert!(
+            !built.dropped_params.iter().any(|p| p == "prompt_cache_key"),
+            "a knob we honour is not a dropped param"
         );
     }
 
