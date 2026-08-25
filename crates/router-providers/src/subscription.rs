@@ -718,7 +718,10 @@ mod tests {
         assert_eq!(built.body["instructions"], "You are helpful.");
         assert_eq!(built.body["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(built.body["input"][0]["content"][0]["text"], "hello");
-        assert_eq!(built.body["reasoning"]["effort"], "xhigh");
+        // Both floors are low. The backend's own per-model defaults cost
+        // a multiple of this in latency for reasoning nobody asked for,
+        // and a caller who wants it raises the floor per request.
+        assert_eq!(built.body["reasoning"]["effort"], "low");
         assert_eq!(built.body["text"]["verbosity"], "low");
         assert!(
             built.body.get("max_output_tokens").is_none(),
