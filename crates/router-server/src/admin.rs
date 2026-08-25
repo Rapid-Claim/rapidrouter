@@ -37,7 +37,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             put(update_provider).delete(delete_provider),
         )
         .route("/providers/{name}/keys", post(add_provider_key))
-        .route("/providers/{name}/keys/bulk", post(add_provider_keys))
+        .route(
+            "/providers/{name}/keys/bulk",
+            post(add_provider_keys).delete(delete_provider_keys),
+        )
         .route("/providers/{name}/probe", post(probe_provider))
         .route("/providers/{name}/models", post(add_model))
         .route(
@@ -2043,6 +2046,80 @@ async fn delete_provider_key(
 }
 
 #[derive(Deserialize)]
+struct KeyNames {
+    keys: Vec<String>,
+}
+
+/// Remove many credentials from a provider in a single config commit.
+///
+/// The counterpart to [`add_provider_keys`], and one commit for the same
+/// reason: a commit is a full read-modify-write of the store document, so
+/// removing fifteen duplicate seats one request at a time would rebuild
+/// the routing table fifteen times and hand every other writer fifteen
+/// chances to collide. It would also fail *partway* — leaving a caller
+/// with no way to say which half of its intent had landed.
+///
+/// Names that are not on the provider are reported rather than refused.
+/// The set an operator selects in the console is a snapshot, and a key
+/// that a colleague removed in between is the outcome that was wanted;
+/// failing the whole batch over it would be the surprising answer.
+/// A batch matching nothing at all commits nothing.
+async fn delete_provider_keys(
+    State(state): State<Arc<AppState>>,
+    Path(name): Path<String>,
+    Json(input): Json<KeyNames>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(keys) = doc
+        .get_mut("providers")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|p| p.get_mut(&name))
+        .and_then(|p| p.get_mut("keys"))
+        .and_then(|k| k.as_array_mut())
+    else {
+        return api_error(StatusCode::NOT_FOUND, format!("no keys on `{name}`"));
+    };
+
+    let wanted: std::collections::BTreeSet<&str> = input.keys.iter().map(String::as_str).collect();
+    let removed: Vec<String> = keys
+        .iter()
+        .filter_map(|entry| entry.as_inline_table())
+        .filter_map(|t| t.get("name").and_then(|v| v.as_str()))
+        .filter(|found| wanted.contains(found))
+        .map(str::to_owned)
+        .collect();
+    let missing: Vec<String> = input
+        .keys
+        .iter()
+        .filter(|asked| !removed.iter().any(|found| found == *asked))
+        .cloned()
+        .collect();
+
+    if removed.is_empty() {
+        return Json(json!({ "removed": removed, "missing": missing })).into_response();
+    }
+    keys.retain(|entry| {
+        !entry
+            .as_inline_table()
+            .and_then(|t| t.get("name"))
+            .and_then(|v| v.as_str())
+            .is_some_and(|found| wanted.contains(found))
+    });
+
+    let response = commit_document(&state, version, doc).await;
+    if !response.status().is_success() {
+        return response;
+    }
+    Json(json!({ "removed": removed, "missing": missing })).into_response()
+}
+
+#[derive(Deserialize)]
 struct ModelWrite {
     id: String,
 }
@@ -2464,6 +2541,19 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                         // an opaque token carries no readable expiry.
                         "credential": seat.as_ref().map(|s| json!({
                             "email": s.email,
+                            // The upstream account this seat signs in as,
+                            // which is *not* the same thing as the key's
+                            // name. Two keys built from two files that
+                            // hold credentials for one ChatGPT account
+                            // are one account's worth of quota wearing
+                            // two names, and nothing else in this payload
+                            // says so: the names differ, the emails may
+                            // differ in case or be absent, and the quota
+                            // windows move together in a way that looks
+                            // like coincidence. Reported so the console
+                            // can group them instead of an operator
+                            // decoding id_tokens by hand.
+                            "account_id": s.account_id,
                             "expires_at_ms": s.expires_at_ms,
                             "can_refresh": s.refresh_token.is_some(),
                             "expired": s.is_expired(now_unix),

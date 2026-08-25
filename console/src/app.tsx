@@ -21,6 +21,7 @@ import {
   UserRound,
   Users,
   Save,
+  Search,
   Server,
   Settings as SettingsIcon,
   Stethoscope,
@@ -205,7 +206,11 @@ export function App() {
   const onKey = (event: KeyboardEvent) => {
     if (event.metaKey || event.ctrlKey || event.altKey || isTyping(event.target)) return;
     if (event.key === "/") {
-      const filter = document.querySelector<HTMLElement>("[data-filter]");
+      // A filter inside an open drawer wins: the page's own filter is
+      // behind it, and focusing something invisible reads as the key
+      // having done nothing at all.
+      const filter = document.querySelector<HTMLElement>(".drawer [data-filter]")
+        ?? document.querySelector<HTMLElement>("[data-filter]");
       if (filter) {
         event.preventDefault();
         filter.focus();
@@ -497,14 +502,7 @@ function Providers(props: { refresh: () => number }) {
     return needle ? all.filter((p) => `${p.name} ${p.kind}`.toLowerCase().includes(needle)) : all;
   });
 
-  // The drawer opens on the seats with the most room left, because the
-  // question it is opened to answer is almost always "which of these
-  // can take traffic right now". Any column can take over from there.
-  const [sort, setSort] = createSignal<CredSort>({ column: "headroom", dir: "desc" });
   const [loggingIn, setLoggingIn] = createSignal<{ provider: string; key: string; email: string | null } | null>(null);
-  const sortBy = (column: CredColumn) => setSort((prev) => prev.column === column
-    ? { column, dir: prev.dir === "asc" ? "desc" : "asc" }
-    : { column, dir: CRED_SORT_DIR[column] });
 
   // A check is a real request per credential, so the page says which one
   // is in flight ("*" for all) and keeps each result until the next run.
@@ -526,17 +524,6 @@ function Providers(props: { refresh: () => number }) {
     } finally {
       setChecking(null);
     }
-  };
-  const probeSummary = () => {
-    const entries = Object.values(probes());
-    if (!entries.length) return "";
-    const ok = entries.filter((e) => e.status === "ok").length;
-    const limited = entries.filter((e) => e.status === "rate_limited").length;
-    const bad = entries.length - ok - limited;
-    return `Last check: ${ok} ready`
-      + (limited ? `, ${limited} rate limited` : "")
-      + (bad ? `, ${bad} failing` : "")
-      + ".";
   };
 
   return <div class="stack-lg">
@@ -591,67 +578,26 @@ function Providers(props: { refresh: () => number }) {
         catch (err) { setError(err instanceof Error ? err.message : "Delete failed"); }
       }}><Trash2 size={14} />Remove</button>}
     >
-      <Show when={current()} keyed>{(provider) => <>
-        <BaseUrlEditor provider={provider} onDone={refetch} onError={setError} />
-        <div class="drawer-section">
-          <SectionTitle
-            title="Credentials"
-            subtitle={provider.subscription ? "Seats, and the plan windows the provider reports" : "Keys, and the ceilings configured for them"}
-            action={
-              <button
-                class="button outline"
-                disabled={!provider.keys.length || Boolean(checking())}
-                onClick={() => runProbe(provider.name)}
-              >
-                <Show when={checking() === "*"} fallback={<Stethoscope size={14} />}><RefreshCw size={14} class="spin" /></Show>
-                {checking() === "*" ? "Checking…" : "Check all"}
-              </button>
-            }
-          />
-          <Show when={probeSummary()}>
-            <p class="muted">{probeSummary()}</p>
-          </Show>
-          <Show when={provider.keys.length} fallback={<Empty title="No credentials" action="A keyless provider needs none; anything else needs a key." />}>
-            <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
-              <table class="dense">
-                <thead><tr>
-                  <SortHeader label="Credential" column="credential" sort={sort()} onSort={sortBy} />
-                  <SortHeader
-                    label={provider.subscription ? "Plan windows" : "Limits"}
-                    column="headroom"
-                    sort={sort()}
-                    onSort={sortBy}
-                  />
-                  <SortHeader label="Token" column="token" sort={sort()} onSort={sortBy} />
-                  <SortHeader label="Health" column="health" sort={sort()} onSort={sortBy} />
-                  <th><span class="sr-only">Actions</span></th>
-                </tr></thead>
-                <tbody><For each={sortCredentials(provider.keys, sort(), provider.subscription)}>{(key) => (
-                  <CredentialRow
-                    providerKey={key}
-                    kind={provider.kind}
-                    subscription={provider.subscription}
-                    checking={checking() === "*" || checking() === key.name}
-                    probe={probes()[key.name] ?? null}
-                    onCheck={() => runProbe(provider.name, key.name)}
-                    onLogin={() => setLoggingIn({
-                      provider: provider.name,
-                      key: key.name,
-                      email: key.credential?.email ?? null,
-                    })}
-                    onRemove={async () => {
-                      setError("");
-                      try { await api.deleteProviderKey(provider.name, key.name); await refetch(); }
-                      catch (err) { setError(err instanceof Error ? err.message : "Remove failed"); }
-                    }}
-                  />
-                )}</For></tbody>
-              </table>
-            </div>
-          </Show>
-        </div>
-        <AddCredential provider={provider} onDone={refetch} onError={setError} />
-      </>}</Show>
+      {/* Keyed on the provider *name*, not the provider object. The page
+          refetches whenever the gateway reports an event, and a block
+          keyed on the object would be torn down and rebuilt on every one
+          of those — taking the search box's focus and the operator's
+          selection with it, mid-task. */}
+      <Show when={current() ? selected() : ""} keyed>{(name) => (
+        <ProviderAccounts
+          provider={current()!}
+          probes={probes()}
+          checking={checking()}
+          onCheck={runProbe}
+          onLogin={(key) => setLoggingIn({
+            provider: name,
+            key: key.name,
+            email: key.credential?.email ?? null,
+          })}
+          onDone={refetch}
+          onError={setError}
+        />
+      )}</Show>
     </Drawer>
 
     <Show when={loggingIn()} keyed>{(target) => (
@@ -673,6 +619,408 @@ function Providers(props: { refresh: () => number }) {
         onClose={() => setAdding(false)}
         onDone={async () => { setAdding(false); await refetch(); }}
       />
+    </Show>
+  </div>;
+}
+
+/// The seats of one provider, and the tools to find one among eighty.
+///
+/// Three things a pool of this size needs that a short list does not: a
+/// count that answers "how many of these am I looking at", a way to cut
+/// the pool down, and a way to see that two rows are secretly the same
+/// upstream account. The last one is not a nicety — a duplicate seat is
+/// one account's quota counted twice, so a pool that looks like eighty
+/// seats can be sixty-five, and nothing on an ungrouped row says so.
+function ProviderAccounts(props: {
+  provider: Provider;
+  probes: Record<string, { status: string; detail: string }>;
+  checking: string | null;
+  onCheck: (provider: string, key?: string) => Promise<void>;
+  onLogin: (key: ProviderKey) => void;
+  onDone: () => void;
+  onError: (message: string) => void;
+}) {
+  const provider = () => props.provider;
+  const keys = () => provider().keys;
+  const noun = (n: number) => (n === 1 ? "account" : "accounts");
+
+  // The drawer opens on the seats with the most room left, because the
+  // question it is opened to answer is almost always "which of these
+  // can take traffic right now". Any column can take over from there.
+  const [sort, setSort] = createSignal<CredSort>({ column: "headroom", dir: "desc" });
+  const sortBy = (column: CredColumn) => setSort((prev) => prev.column === column
+    ? { column, dir: prev.dir === "asc" ? "desc" : "asc" }
+    : { column, dir: CRED_SORT_DIR[column] });
+
+  const [search, setSearch] = createSignal("");
+  const [domain, setDomain] = createSignal("");
+  const [dupesOnly, setDupesOnly] = createSignal(false);
+  const [picked, setPicked] = createSignal<string[]>([]);
+  const [busy, setBusy] = createSignal<"" | "check" | "remove">("");
+  const [progress, setProgress] = createSignal("");
+
+  // Seats by the account they sign in as, each group freshest-first so
+  // the one worth keeping is the one on top.
+  const accounts = createMemo(() => {
+    const groups = new Map<string, ProviderKey[]>();
+    for (const key of keys()) {
+      const id = seatAccount(key);
+      if (!id) continue;
+      const group = groups.get(id);
+      if (group) group.push(key);
+      else groups.set(id, [key]);
+    }
+    for (const group of groups.values()) group.sort(byFreshness);
+    return groups;
+  });
+  const duplicated = createMemo(
+    () => new Set([...accounts()].filter(([, group]) => group.length > 1).map(([id]) => id)),
+  );
+  const isDuplicate = (key: ProviderKey) => {
+    const id = seatAccount(key);
+    return Boolean(id && duplicated().has(id));
+  };
+  /// Seats standing behind another: every member of a group past the
+  /// freshest. This is the number an operator means by "how many
+  /// duplicates" — three names on one account is two seats too many, not
+  /// three.
+  const redundant = createMemo(() => [...accounts().values()]
+    .filter((group) => group.length > 1)
+    .reduce((total, group) => total + group.length - 1, 0));
+
+  const domains = createMemo(() => {
+    const counts = new Map<string, number>();
+    for (const key of keys()) {
+      const domain = seatDomain(key);
+      if (domain) counts.set(domain, (counts.get(domain) ?? 0) + 1);
+    }
+    return [...counts]
+      .sort((a, b) => b[1] - a[1] || a[0].localeCompare(b[0]))
+      .map(([value, count]) => ({ value, label: value, hint: `${count} ${noun(count)}` }));
+  });
+
+  const matching = createMemo(() => {
+    const needle = search().trim().toLowerCase();
+    const wanted = domain();
+    const onlyDupes = dupesOnly();
+    return keys().filter((key) => {
+      if (wanted && seatDomain(key) !== wanted) return false;
+      if (onlyDupes && !isDuplicate(key)) return false;
+      return !needle || seatHaystack(key).includes(needle);
+    });
+  });
+
+  /// The rows in the chosen order — except that the seats of one account
+  /// are pulled together behind whichever of them the sort placed first.
+  ///
+  /// Without this, sorting by headroom scatters a duplicate group down the
+  /// table and the duplication goes back to being invisible, which is the
+  /// problem the grouping exists to solve. Members not passing the current
+  /// filter stay out: a group is drawn from what is on screen, so its
+  /// "2 of 3" always counts rows the operator can see.
+  const rows = createMemo(() => {
+    const sorted = sortCredentials(matching(), sort(), provider().subscription);
+    const shown = new Set(sorted.map((key) => key.name));
+    const out: ProviderKey[] = [];
+    const placed = new Set<string>();
+    for (const key of sorted) {
+      if (placed.has(key.name)) continue;
+      const id = seatAccount(key);
+      const group = id && duplicated().has(id)
+        ? accounts().get(id)!.filter((member) => shown.has(member.name))
+        : [key];
+      for (const member of group) {
+        out.push(member);
+        placed.add(member.name);
+      }
+    }
+    return out;
+  });
+
+  /// Where each row sits in its account's group, for the badge and the
+  /// rail down the side. Seats that are the only one on their account —
+  /// the ordinary case — are absent, and get no decoration.
+  ///
+  /// Built once per render rather than looked up per row: a scan of the
+  /// table for every row in it is quadratic, and this table is opened
+  /// precisely when the pool is too big to read.
+  const groups = createMemo(() => {
+    const counted = new Map<string, ProviderKey[]>();
+    for (const key of rows()) {
+      const id = seatAccount(key);
+      if (!id || !duplicated().has(id)) continue;
+      const group = counted.get(id);
+      if (group) group.push(key);
+      else counted.set(id, [key]);
+    }
+    const placing = new Map<string, { size: number; index: number; first: boolean; last: boolean }>();
+    for (const group of counted.values()) {
+      // A filter can leave one member of a pair on screen. The badge
+      // counts rows the operator can actually see, so a lone survivor is
+      // not called a duplicate — the pool-wide count above still is.
+      if (group.length < 2) continue;
+      group.forEach((key, index) => placing.set(key.name, {
+        size: group.length,
+        index,
+        first: index === 0,
+        last: index === group.length - 1,
+      }));
+    }
+    return placing;
+  });
+
+  // The selection is held by name and survives a refetch, so it can name a
+  // seat that has since been removed. Resolved against what is actually on
+  // screen at the moment it is acted on, rather than trusted.
+  const selected = createMemo(() => {
+    const names = new Set(picked());
+    return rows().filter((key) => names.has(key.name));
+  });
+  const allShown = () => rows().length > 0 && selected().length === rows().length;
+  // "Some but not all" is a third state the `checked` attribute cannot
+  // express, and it is the one an operator is in for most of a selection.
+  const [pickAll, setPickAll] = createSignal<HTMLInputElement>();
+  createEffect(() => {
+    const box = pickAll();
+    if (box) box.indeterminate = selected().length > 0 && !allShown();
+  });
+  const toggle = (name: string) => setPicked((prev) =>
+    prev.includes(name) ? prev.filter((held) => held !== name) : [...prev, name]);
+
+  // Removing the last duplicate while the duplicates-only view is on
+  // leaves an empty table whose only escape — the toggle that set it —
+  // has disappeared along with the thing it counted. Stand it down.
+  createEffect(() => {
+    if (dupesOnly() && !redundant()) setDupesOnly(false);
+  });
+
+  const filtering = () => Boolean(search().trim() || domain() || dupesOnly());
+  const clearFilters = () => { setSearch(""); setDomain(""); setDupesOnly(false); };
+
+  const probeSummary = () => {
+    const entries = Object.values(props.probes);
+    if (!entries.length) return "";
+    const ok = entries.filter((e) => e.status === "ok").length;
+    const limited = entries.filter((e) => e.status === "rate_limited").length;
+    const bad = entries.length - ok - limited;
+    return `Last check: ${ok} ready`
+      + (limited ? `, ${limited} rate limited` : "")
+      + (bad ? `, ${bad} failing` : "")
+      + ".";
+  };
+
+  /// Check the selected seats, one at a time.
+  ///
+  /// Sequential on purpose. A check is a real request per credential, and
+  /// the provider-wide endpoint caps its own fan-out precisely so that
+  /// eighty seats do not fire at one provider at once; issuing N
+  /// single-key checks concurrently from here would walk straight around
+  /// that cap and rate-limit the pool we are trying to measure.
+  const checkSelected = async () => {
+    const names = selected().map((key) => key.name);
+    if (!names.length) return;
+    setBusy("check");
+    try {
+      for (const [index, name] of names.entries()) {
+        setProgress(`${index + 1} of ${names.length}`);
+        await props.onCheck(provider().name, name);
+      }
+    } finally {
+      setBusy("");
+      setProgress("");
+    }
+  };
+
+  const removeSelected = async () => {
+    const names = selected().map((key) => key.name);
+    if (!names.length) return;
+    const what = names.length === 1 ? `account ${names[0]}` : `${names.length} accounts`;
+    if (!confirm(
+      `Remove ${what} from ${provider().name}?\n\n`
+      + "Routing stops using them immediately. The credential files on disk are left alone, "
+      + "so this can be undone by adding them back.",
+    )) return;
+    setBusy("remove");
+    props.onError("");
+    try {
+      const result = await api.deleteProviderKeys(provider().name, names);
+      setPicked([]);
+      // Some of the batch already being gone is the outcome that was
+      // wanted, so it is only worth saying when *none* of it was there.
+      if (!result.removed.length) {
+        props.onError("Nothing to remove — those accounts were already gone.");
+      }
+      props.onDone();
+    } catch (err) {
+      props.onError(err instanceof Error ? err.message : "Remove failed");
+    } finally {
+      setBusy("");
+    }
+  };
+
+  return <div class="seat-pane">
+    <BaseUrlEditor provider={provider()} onDone={props.onDone} onError={props.onError} />
+    <div class="drawer-section">
+      <div class="seat-summary">
+        <div class="seat-count">
+          <strong>{rows().length}</strong>
+          <span>
+            <Show when={filtering()} fallback={noun(rows().length)}>
+              of {keys().length} {noun(keys().length)}
+            </Show>
+          </span>
+        </div>
+        <Show when={redundant()}>
+          <button
+            type="button"
+            class="seat-dupe-toggle"
+            classList={{ on: dupesOnly() }}
+            aria-pressed={dupesOnly()}
+            title="Seats sharing an upstream account with another seat. One account's quota, counted twice."
+            onClick={() => setDupesOnly((on) => !on)}
+          >
+            <Copy size={13} aria-hidden="true" />
+            {redundant()} duplicate{redundant() === 1 ? "" : "s"}
+          </button>
+        </Show>
+        <button
+          class="button outline seat-check-all"
+          disabled={!keys().length || Boolean(props.checking) || Boolean(busy())}
+          onClick={() => void props.onCheck(provider().name)}
+        >
+          <Show when={props.checking === "*"} fallback={<Stethoscope size={14} />}><RefreshCw size={14} class="spin" /></Show>
+          {props.checking === "*" ? "Checking…" : "Check all"}
+        </button>
+      </div>
+
+      <Show when={keys().length > 1}>
+        <div class="seat-filters">
+          <div class="search-field">
+            <Search size={14} aria-hidden="true" />
+            <input
+              data-filter
+              value={search()}
+              placeholder={provider().subscription
+                ? "Search accounts — email, seat name, domain (press /)"
+                : "Search keys — name, domain (press /)"}
+              aria-label="Search accounts"
+              onInput={(e) => setSearch(e.currentTarget.value)}
+            />
+            <Show when={search()}>
+              <button type="button" aria-label="Clear search" onClick={() => setSearch("")}>
+                <X size={13} />
+              </button>
+            </Show>
+          </div>
+          {/* A single-domain pool has nothing to choose between, so the
+              control only appears once there is a cut to make. */}
+          <Show when={domains().length > 1}>
+            <Combobox
+              value={domain()}
+              options={domains()}
+              onSelect={setDomain}
+              label="Domain"
+              placeholder="Any domain"
+              allowEmpty
+            />
+          </Show>
+          <Show when={filtering()}>
+            <button type="button" class="button ghost" onClick={clearFilters}>Clear filters</button>
+          </Show>
+        </div>
+      </Show>
+
+      <Show when={probeSummary()}>
+        <p class="muted">{probeSummary()}</p>
+      </Show>
+
+      <Show
+        when={keys().length}
+        fallback={<Empty title="No credentials" action="A keyless provider needs none; anything else needs a key." />}
+      >
+        <Show
+          when={rows().length}
+          fallback={<Empty
+            title="No accounts match"
+            action="Widen the search, or clear the filters to see the whole pool."
+          />}
+        >
+          <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+            <table class="dense seats" classList={{ picking: selected().length > 0 }}>
+              <thead><tr>
+                <th class="seat-pick">
+                  <input
+                    ref={setPickAll}
+                    type="checkbox"
+                    aria-label={allShown() ? "Deselect all shown accounts" : "Select all shown accounts"}
+                    checked={allShown()}
+                    onChange={(e) => setPicked(e.currentTarget.checked ? rows().map((key) => key.name) : [])}
+                  />
+                </th>
+                <SortHeader label="Credential" column="credential" sort={sort()} onSort={sortBy} />
+                <SortHeader
+                  label={provider().subscription ? "Plan windows" : "Limits"}
+                  column="headroom"
+                  sort={sort()}
+                  onSort={sortBy}
+                />
+                <SortHeader label="Token" column="token" sort={sort()} onSort={sortBy} />
+                <SortHeader label="Health" column="health" sort={sort()} onSort={sortBy} />
+                <th><span class="sr-only">Actions</span></th>
+              </tr></thead>
+              <tbody><For each={rows()}>{(key) => (
+                <CredentialRow
+                  providerKey={key}
+                  kind={provider().kind}
+                  subscription={provider().subscription}
+                  checking={props.checking === "*" || props.checking === key.name}
+                  probe={props.probes[key.name] ?? null}
+                  group={groups().get(key.name) ?? null}
+                  picked={picked().includes(key.name)}
+                  onPick={() => toggle(key.name)}
+                  onCheck={() => void props.onCheck(provider().name, key.name)}
+                  onLogin={() => props.onLogin(key)}
+                  onRemove={async () => {
+                    props.onError("");
+                    try {
+                      await api.deleteProviderKey(provider().name, key.name);
+                      props.onDone();
+                    } catch (err) {
+                      props.onError(err instanceof Error ? err.message : "Remove failed");
+                    }
+                  }}
+                />
+              )}</For></tbody>
+            </table>
+          </div>
+        </Show>
+      </Show>
+    </div>
+
+    <AddCredential provider={provider()} onDone={props.onDone} onError={props.onError} />
+
+    {/* Sticky to the bottom of the drawer's own scroll area rather than
+        the viewport, so it belongs to the table it acts on and cannot
+        outlive the drawer that opened it. */}
+    <Show when={selected().length}>
+      <div class="seat-bar" role="group" aria-label="Actions for the selected accounts">
+        <strong>{selected().length} selected</strong>
+        <Show when={progress()}><span class="muted">{progress()}</span></Show>
+        <div class="seat-bar-actions">
+          <button class="button outline" disabled={Boolean(busy())} onClick={() => void checkSelected()}>
+            <Show when={busy() === "check"} fallback={<Stethoscope size={14} />}><RefreshCw size={14} class="spin" /></Show>
+            {busy() === "check" ? "Checking…" : "Check health"}
+          </button>
+          <button class="button danger" disabled={Boolean(busy())} onClick={() => void removeSelected()}>
+            <Trash2 size={14} />
+            {/* Not just "Remove": the drawer header carries a Remove that
+                deletes the whole provider, and two identical verbs one
+                dialog apart is how the wrong one gets clicked. */}
+            {busy() === "remove" ? "Removing…" : "Remove selected"}
+          </button>
+          <button class="button ghost" disabled={Boolean(busy())} onClick={() => setPicked([])}>Clear</button>
+        </div>
+      </div>
     </Show>
   </div>;
 }
@@ -1144,6 +1492,78 @@ function sortCredentials(keys: ProviderKey[], sort: CredSort, subscription: bool
   });
 }
 
+/// The domain half of a seat's account email, lowercased.
+///
+/// A pool is assembled per organisation, so the domain is the coarsest
+/// useful cut through it — "the seats on the corporate tenant, not the
+/// personal one somebody added to unblock a demo". Metered keys have no
+/// email and so no domain; they get `null` rather than a bucket.
+function seatDomain(key: ProviderKey): string | null {
+  const email = key.credential?.email;
+  if (!email) return null;
+  const at = email.lastIndexOf("@");
+  return at < 0 ? null : email.slice(at + 1).toLowerCase();
+}
+
+/// Which upstream account a seat *is*, as opposed to what it is called.
+///
+/// This is the whole point of grouping. A key's name is a file name,
+/// chosen by whoever imported the credential, so two files holding
+/// credentials for one ChatGPT account are one account's quota wearing
+/// two names — and nothing else on the row says so. `account_id` is
+/// authoritative; the email is the fallback for a credential shape that
+/// carries no account claim, lowercased because one mailbox written two
+/// ways is still one mailbox.
+function seatAccount(key: ProviderKey): string | null {
+  const cred = key.credential;
+  if (!cred) return null;
+  if (cred.account_id) return cred.account_id;
+  return cred.email ? `email:${cred.email.toLowerCase()}` : null;
+}
+
+/// How much a seat is worth keeping when two of them are one account,
+/// most significant first: a credential that can renew itself outlives
+/// one that cannot; a later expiry means a more recently refreshed
+/// document; then the seat the provider spoke to most recently, and the
+/// one that has actually served traffic.
+function seatFreshness(key: ProviderKey): number[] {
+  const cred = key.credential;
+  return [
+    cred?.can_refresh ? 1 : 0,
+    cred?.expires_at_ms ?? 0,
+    key.last_check?.checked_at_ms ?? 0,
+    key.leases ?? 0,
+  ];
+}
+
+/// Freshest first, ties broken by name so a group of identical seats does
+/// not reshuffle under the cursor between polls.
+function byFreshness(a: ProviderKey, b: ProviderKey): number {
+  const left = seatFreshness(a);
+  const right = seatFreshness(b);
+  for (let i = 0; i < left.length; i += 1) {
+    if (left[i] !== right[i]) return right[i] - left[i];
+  }
+  return a.name.localeCompare(b.name);
+}
+
+/// Everything about a seat worth matching a typed query against.
+///
+/// The account id is in here without being on screen: an operator holding
+/// one from a provider dashboard can paste it and get its seats, which is
+/// the lookup that otherwise means decoding tokens by hand.
+function seatHaystack(key: ProviderKey): string {
+  return [
+    key.name,
+    key.credential?.email ?? "",
+    key.credential?.account_id ?? "",
+    seatDomain(key) ?? "",
+    key.source_path ?? "",
+  ]
+    .join(" ")
+    .toLowerCase();
+}
+
 function SortHeader(props: {
   label: string;
   column: CredColumn;
@@ -1301,8 +1721,13 @@ function CredentialRow(props: {
   onRemove: () => void;
   onCheck: () => void;
   onLogin: () => void;
+  onPick: () => void;
+  picked: boolean;
   checking?: boolean;
   probe?: { status: string; detail: string } | null;
+  /// Where this seat sits among the others on its account, when there are
+  /// others. `null` for the ordinary case of one seat, one account.
+  group: { size: number; index: number; first: boolean; last: boolean } | null;
 }) {
   const key = () => props.providerKey;
   // Two different ways a seat asks to be signed in again, and neither is
@@ -1379,9 +1804,51 @@ function CredentialRow(props: {
     </div>;
   };
 
-  return <tr>
+  return <tr
+    classList={{
+      picked: props.picked,
+      "seat-grouped": Boolean(props.group),
+      "seat-group-first": Boolean(props.group?.first),
+      "seat-group-last": Boolean(props.group?.last),
+    }}
+  >
+    <td class="seat-pick">
+      <input
+        type="checkbox"
+        checked={props.picked}
+        aria-label={`Select ${key().credential?.email ?? key().name}`}
+        onChange={props.onPick}
+      />
+    </td>
     <td>
       <strong>{key().credential?.email ?? key().name}</strong>
+      {/* The seat name is the *file* the credential came from, and it is
+          what the config entry is keyed by — so it is what an operator
+          needs in hand to remove the right one of two rows reading the
+          same email. Shown only when it is not already the headline. */}
+      <Show when={key().credential?.email && key().credential!.email !== key().name}>
+        <small class="mono muted">{key().name}</small>
+      </Show>
+      <Show when={props.group} keyed>
+        {(group) => (
+          <span
+            class="seat-dupe"
+            classList={{ keep: group.first }}
+            title={
+              (key().credential?.account_id
+                ? `Upstream account ${key().credential!.account_id}. `
+                : "")
+              + `${group.size} seats on this one account — its quota is shared between them, `
+              + "not multiplied."
+            }
+          >
+            <Copy size={11} aria-hidden="true" />
+            {group.first
+              ? `freshest of ${group.size} on this account`
+              : `duplicate ${group.index + 1} of ${group.size}`}
+          </span>
+        )}
+      </Show>
     </td>
     <td>
       <Show when={props.subscription} fallback={

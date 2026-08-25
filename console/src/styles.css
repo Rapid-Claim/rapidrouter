@@ -1087,6 +1087,125 @@ kbd {
 .drawer-section { margin-bottom: 22px; }
 .drawer-section:last-child { margin-bottom: 0; }
 
+/* ------------------------------------------------- a provider's accounts */
+
+/* The count leads, because the first question asked of a pool of eighty
+   is how many of them the filters have left. */
+.seat-summary {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-bottom: 12px;
+}
+.seat-count { display: flex; align-items: baseline; gap: 6px; }
+.seat-count strong {
+  font-size: 22px;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: -0.02em;
+}
+.seat-count span { color: var(--muted); font-size: 12px; }
+.seat-check-all { margin-left: auto; }
+
+/* A count that is also the filter for what it counts. Warning-toned
+   rather than danger: a duplicate seat is waste, not breakage. */
+.seat-dupe-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  height: 24px;
+  padding: 0 9px;
+  border: 1px solid var(--warning);
+  border-radius: 999px;
+  background: var(--warning-soft);
+  color: var(--warning);
+  font-size: 11.5px;
+  font-weight: 500;
+  cursor: pointer;
+}
+.seat-dupe-toggle:hover { background: var(--hover-strong); }
+.seat-dupe-toggle.on { background: var(--warning); color: var(--bg); }
+
+.seat-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
+.seat-filters .search-field { flex: 1 1 260px; }
+
+/* The checkbox column stays out of the way until it is wanted: hovering
+   a row, focusing the box, a row already picked, or any selection at all
+   in progress. Reserved width either way, so revealing one does not
+   shunt the whole table sideways. */
+.seats td.seat-pick, .seats th.seat-pick { width: 28px; padding-right: 0; }
+.seat-pick input {
+  width: 14px;
+  height: 14px;
+  margin: 0;
+  accent-color: var(--accent);
+  cursor: pointer;
+  opacity: 0;
+  transition: opacity 90ms ease-out;
+}
+.seats tr:hover .seat-pick input,
+.seat-pick input:focus-visible,
+.seat-pick input:checked,
+.seats.picking .seat-pick input { opacity: 1; }
+@media (prefers-reduced-motion: reduce) { .seat-pick input { transition: none; } }
+.seats tr.picked td { background: var(--accent-soft); }
+
+/* Seats of one account are drawn as one block: a rail down the side ties
+   the rows together, which is what turns two lines reading the same email
+   into a visible fact rather than a coincidence. */
+.seats tr.seat-grouped td:first-child { box-shadow: inset 2px 0 0 var(--warning); }
+.seats tr.seat-group-first td { border-top: 1px solid var(--warning); }
+.seats tr.seat-group-last td { border-bottom: 1px solid var(--warning); }
+
+.seat-dupe {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  margin-top: 3px;
+  color: var(--warning);
+  font-size: 10.5px;
+  font-weight: 500;
+  cursor: help;
+}
+.seat-dupe.keep { color: var(--accent); }
+
+/* A column as tall as the drawer, so the selection bar has somewhere to
+   be pushed to. `position: sticky` alone cannot do this: it holds an
+   element up as content scrolls past, but never moves one *down* below
+   where it naturally sits — so on a short table the bar would sit under
+   the last row with empty drawer beneath it. */
+.seat-pane { display: flex; flex-direction: column; min-height: 100%; }
+
+/* Bottom of the drawer's own scroll area, not the viewport: the bar acts
+   on the table above it and should not outlive the drawer.
+   `margin-top: auto` puts it at the foot of a short table; on a long one
+   there is no free space to absorb, so it goes flush and the rows scroll
+   under it. Negative side margins let it span the drawer's full width by
+   cancelling the body's padding. */
+.seat-bar {
+  position: sticky;
+  bottom: 0;
+  z-index: 1;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: wrap;
+  margin: auto -18px 0;
+  padding: 12px 18px;
+  background: var(--surface-2);
+  border-top: 1px solid var(--border);
+}
+.seat-bar strong { font-size: 12.5px; font-variant-numeric: tabular-nums; }
+.seat-bar .muted { font-size: 11.5px; font-variant-numeric: tabular-nums; }
+.seat-bar-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
+
+/* Bulk removal is the one destructive control here, and it should read
+   that way before it is clicked rather than only in the confirm. */
+.button.danger { border-color: var(--danger); color: var(--danger); }
+.button.danger:hover:not(:disabled) { background: var(--danger-soft); }
+
+
 @media (max-width: 820px) {
   .drawer, .drawer.drawer-wide { width: 100%; min-width: 0; max-width: none; }
   .filter-bar { flex-wrap: wrap; }
