@@ -17,3 +17,6 @@ console/tsconfig.tsbuildinfo
 
 # macOS finder droppings
 .DS_Store
+
+# Working notes and generated artifacts, not part of the project
+/.context/

@@ -439,11 +439,20 @@ export type ResolvedRange = {
   detail: string;
 };
 
+/// The windows the picker offers.
+///
+/// The long ones are only usable because nothing here scans raw records
+/// any more: a year is read from monthly rollups, which is about twelve
+/// files whatever the traffic was. Retention is a year by default, so
+/// every preset below has data behind it.
 export const RANGE_PRESETS: Array<{ label: string; seconds: number }> = [
   { label: "Last hour", seconds: 3600 },
   { label: "Last 24 hours", seconds: 86400 },
   { label: "Last 7 days", seconds: 7 * 86400 },
   { label: "Last 30 days", seconds: 30 * 86400 },
+  { label: "Last 90 days", seconds: 90 * 86400 },
+  { label: "Last 6 months", seconds: 182 * 86400 },
+  { label: "Last year", seconds: 365 * 86400 },
 ];
 
 const DAY_MS = 86_400_000;

@@ -160,6 +160,24 @@ const TRAFFIC_REFRESH_MS = 5_000;
 /// Rows per page in the request log.
 const PAGE_SIZE = 100;
 
+/// The state of the console's live connection to the gateway.
+///
+/// "connecting" is the one that was missing: a page that has not finished
+/// its first handshake has not lost anything, and saying so is the
+/// difference between a console that looks broken on every reload and one
+/// that doesn't.
+type LinkState = "connecting" | "live" | "reconnecting" | "expired";
+
+/// How often a dropped stream may ask the gateway *why* it dropped.
+const DIAGNOSE_INTERVAL_MS = 5_000;
+
+const LINK_STATES: Record<LinkState, { label: string; tone: string; title: string }> = {
+  connecting: { label: "Connecting", tone: "pending", title: "Opening the live update stream" },
+  live: { label: "Live", tone: "online", title: "Streaming live updates" },
+  reconnecting: { label: "Reconnecting", tone: "offline", title: "The live update stream dropped; retrying" },
+  expired: { label: "Signed out", tone: "offline", title: "This session expired; sign in again" },
+};
+
 export function App() {
   const savedTheme = localStorage.getItem("rapid-theme");
   if (savedTheme === "light" || savedTheme === "dark") {
@@ -171,7 +189,11 @@ export function App() {
     navigation.filter((item) => !item.adminOnly || me()?.is_admin !== false));
   const [page, setPage] = createSignal<Page>(routeFromHash());
   const [refresh, setRefresh] = createSignal(0);
-  const [live, setLive] = createSignal(false);
+  // Four states, not a boolean. A boolean has to call the first moments
+  // of a page load something, and calling them "Reconnecting" made every
+  // single reload look like a fault — the most common thing the header
+  // said was that something was wrong, when nothing was.
+  const [link, setLink] = createSignal<LinkState>("connecting");
   const [collapsed, setCollapsed] = createSignal(localStorage.getItem("rapid-rail") === "collapsed");
   const toggleRail = () => {
     const next = !collapsed();
@@ -212,9 +234,43 @@ export function App() {
   });
   createEffect(() => {
     if (!authenticated()) return;
+    setLink("connecting");
     const events = new EventSource("/admin/api/events");
-    events.onopen = () => setLive(true);
-    events.onerror = () => setLive(false);
+    // Distinguishing "the gateway is down" from "this session is no
+    // longer valid" matters, because they need opposite things from the
+    // operator: wait, or sign in. EventSource cannot report a status
+    // code, so ask.
+    // EventSource retries on its own every second, so `onerror` fires
+    // about that often while a gateway is down. Probing on each one
+    // would turn an outage into a request flood against the thing that
+    // is already struggling.
+    let probing = false;
+    let probedAt = 0;
+    const diagnose = async () => {
+      if (probing || Date.now() - probedAt < DIAGNOSE_INTERVAL_MS) return;
+      probing = true;
+      probedAt = Date.now();
+      try {
+        await api.me();
+        setLink("reconnecting");
+      } catch {
+        // A restarted gateway used to land here permanently: the token
+        // in sessionStorage looked fine to this tab, the stream 401'd
+        // forever, and the header just said "Reconnecting". Signed
+        // tokens make that rare, but when the session really is gone,
+        // say so and show the login screen.
+        clearSession();
+        setLink("expired");
+        setAuthenticated(false);
+      } finally {
+        probing = false;
+      }
+    };
+    events.onopen = () => setLink("live");
+    events.onerror = () => {
+      setLink((current) => (current === "live" ? "reconnecting" : current));
+      void diagnose();
+    };
     // The gateway emits an event per *request*, not just per config
     // change. Refetching everything on each one turns one busy second
     // into a hundred admin queries — the console DoSing its own gateway,
@@ -242,6 +298,13 @@ export function App() {
         type = JSON.parse(event.data)?.type ?? "";
       } catch {
         // An unparseable event still means something happened.
+      }
+      // The gateway's greeting. It carries no news, so it must not
+      // trigger a refetch — otherwise every reconnect would reload every
+      // page on screen.
+      if (type === "hello") {
+        setLink("live");
+        return;
       }
       if (type === "request") scheduleTraffic();
       else setRefresh((value) => value + 1);
@@ -307,9 +370,9 @@ export function App() {
             <h1>{current().label}</h1>
           </div>
           <div class="page-header-right">
-            <div class="live-state" title={live() ? "Streaming live updates" : "Reconnecting to the gateway"}>
-              <span class="dot" classList={{ online: live() }} />
-              <span class="live-label">{live() ? "Live" : "Reconnecting"}</span>
+            <div class="live-state" title={LINK_STATES[link()].title}>
+              <span class="dot" classList={{ [LINK_STATES[link()].tone]: true }} />
+              <span class="live-label">{LINK_STATES[link()].label}</span>
             </div>
             <button class="icon-button" title="Refresh data" aria-label="Refresh data" onClick={() => setRefresh((value) => value + 1)}><RefreshCw size={16} /></button>
           </div>
@@ -2422,21 +2485,21 @@ function useTelemetry(
       key: f.key || undefined,
     });
   });
-  const historyFor = (by: string) => {
-    const [res] = createResource(dep, () => {
-      const r = resolveRange(range());
-      const f = filters();
-      return r.live ? undefined : api.history(r.days, by, {
-        provider: f.provider || undefined,
-        model: f.model || undefined,
-        key: f.key || undefined,
-      });
+  // One request for every grouping this page draws. It used to be three
+  // — by model, by key, by provider — which were three identical walks
+  // of the same window, fired together on load and again on every
+  // refresh. The gateway has all three dimensions on each row, so the
+  // split is arithmetic it can do once.
+  const [history] = createResource(dep, () => {
+    const r = resolveRange(range());
+    const f = filters();
+    return r.live ? undefined : api.historyAll(r.days, {
+      provider: f.provider || undefined,
+      model: f.model || undefined,
+      key: f.key || undefined,
     });
-    return res;
-  };
-  const byModelRes = historyFor("model");
-  const byKeyRes = historyFor("key");
-  const byProviderRes = historyFor("provider");
+  });
+  const grouping = (by: string) => history()?.data?.[by];
 
   const sliceDays = (series: Record<string, DayBucket[]> | undefined) => {
     if (!series) return {};
@@ -2473,13 +2536,13 @@ function useTelemetry(
 
   const byModel = createMemo<Slice[]>(() => resolved().live
     ? liveSlices((s) => s.by_model)
-    : slicesOf(sliceDays(byModelRes()?.data)));
+    : slicesOf(sliceDays(grouping("model"))));
   const byKey = createMemo<Slice[]>(() => resolved().live
     ? liveSlices((s) => s.by_key)
-    : slicesOf(sliceDays(byKeyRes()?.data)));
+    : slicesOf(sliceDays(grouping("key"))));
   const byProvider = createMemo<Slice[]>(() => resolved().live
     ? liveSlices((s) => s.by_provider)
-    : slicesOf(sliceDays(byProviderRes()?.data)));
+    : slicesOf(sliceDays(grouping("provider"))));
 
   /// Time series for the charts: minute buckets from the tail, or day
   /// buckets from history, projected by `value`.
@@ -2496,7 +2559,10 @@ function useTelemetry(
         })] as TrendPoint);
       }
       const perDay = new Map<string, { requests: number; failed: number; input: number; output: number; cost: number }>();
-      for (const buckets of Object.values(sliceDays(byModelRes()?.data))) {
+      // The total, not a sum over the model split: a request that never
+      // reached a provider has no model, and summing the split would
+      // quietly drop exactly the failures worth charting.
+      for (const buckets of Object.values(sliceDays(grouping("")))) {
         for (const bucket of buckets) {
           const b = perDay.get(bucket.day) ?? { requests: 0, failed: 0, input: 0, output: 0, cost: 0 };
           b.requests += bucket.requests;
@@ -2517,7 +2583,7 @@ function useTelemetry(
   // empty state shown during the first read is the wrong one.
   const loading = createMemo(() => resolved().live
     ? live.loading && !live()
-    : byModelRes.loading && !byModelRes());
+    : history.loading && !history());
   return { resolved, byModel, byKey, byProvider, trend, truncated, loading, live };
 }
 
@@ -3054,15 +3120,46 @@ function routeLabel(record: UsageRecord): string {
   return model ? `${record.provider}/${model}` : record.provider;
 }
 
+/// Bodies already fetched, keyed by request id.
+///
+/// Bodies are immutable once written, so this never goes stale — a
+/// request's transcript is what it was. Bounded because a long session
+/// of scrolling the log would otherwise accumulate every row hovered.
+type Bodies = Awaited<ReturnType<typeof api.requestBodies>>;
+const bodyCache = new Map<string, Promise<Bodies>>();
+const BODY_CACHE_CAP = 200;
+
+function fetchBodies(record: UsageRecord): Promise<Bodies> {
+  const hit = bodyCache.get(record.request_id);
+  if (hit) return hit;
+  const pending = api.requestBodies(record.request_id, record.ts);
+  // A failure must not be cached as an answer: the next open should try
+  // again rather than re-serving the error forever.
+  pending.catch(() => bodyCache.delete(record.request_id));
+  if (bodyCache.size >= BODY_CACHE_CAP) {
+    const oldest = bodyCache.keys().next().value;
+    if (oldest !== undefined) bodyCache.delete(oldest);
+  }
+  bodyCache.set(record.request_id, pending);
+  return pending;
+}
+
+/// Start the fetch and ignore the result — the cache is the point.
+function prefetchBodies(record: UsageRecord): void {
+  void fetchBodies(record).catch(() => {});
+}
+
 /// One request, opened: what was sent, what came back, and the metadata
 /// that describes the trip.
 ///
-/// Bodies are fetched on open rather than listed: a page of a hundred
-/// requests would otherwise carry megabytes nobody reads.
+/// Bodies are fetched per request rather than listed with the page: a
+/// page of a hundred would otherwise carry megabytes nobody reads. They
+/// are fetched on *hover* rather than on click, so the round trip
+/// happens while the operator is still deciding.
 function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void }) {
   const [bodies] = createResource(
     () => props.record,
-    (record) => api.requestBodies(record.request_id, record.ts),
+    (record) => fetchBodies(record),
   );
   const [tab, setTab] = createSignal<"input" | "output">("input");
   // Rendered by default, because the parsed transcript is what the drawer
@@ -3196,6 +3293,13 @@ function RequestRows(props: {
           <tbody><For each={props.records}>{(record) => <tr
             classList={{ clickable: Boolean(props.onOpen) }}
             onClick={() => props.onOpen?.(record)}
+            // Fetched on intent rather than on click. Pointing at a row
+            // is a reliable signal that it is about to be opened, and it
+            // buys the round trip back — by the time the drawer has
+            // finished animating the transcript is already in hand,
+            // instead of the panel opening empty and filling in.
+            onPointerEnter={() => props.onOpen && prefetchBodies(record)}
+            onFocusIn={() => props.onOpen && prefetchBodies(record)}
           >
             <td class="mono nowrap">{new Date(record.ts).toLocaleTimeString()}</td>
             {/* One line, not two: the alias and the resolved route were
@@ -3776,12 +3880,16 @@ function Settings(props: { refresh: () => number }) {
     <section class="panel">
       <SectionTitle title="Usage retention" subtitle="Local partitions are pruned by the gateway itself" />
       <dl class="facts">
-        <Fact label="Retention" value={`${setting("retention_days")} days`} />
+        <Fact label="Request history" value={`${setting("retention_days")} days`} />
+        <Fact label="Captured bodies" value={`${setting("body_retention_days")} days`} />
         <Fact label="Flush interval" value={`${setting("flush_interval_secs")} s`} />
         <Fact label="Per-key metrics" value={setting("per_key_metrics") === "true" ? "On" : "Off"} />
       </dl>
       <p class="muted">
-        Change these under <code>[usage]</code> in the configuration document.
+        History is metadata — volume, tokens, spend, latency and errors — and is what every
+        chart and total is drawn from. Bodies are the request and response payloads behind
+        the log drawer; they are far larger, so they are kept for a much shorter window.
+        Change either under <code>[usage]</code> in the configuration document.
       </p>
     </section>
     <section class="panel">

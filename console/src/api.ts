@@ -239,7 +239,33 @@ export function clearSession(): void {
   sessionStorage.removeItem(TOKEN_KEY);
 }
 
+/// GETs that are already on the wire, keyed by path.
+///
+/// Several pages ask for the same thing at once — the provider list and
+/// the key list are each built by four or five components, and every one
+/// of them refetches when the refresh signal moves. They all fire in the
+/// same tick, so nothing here goes stale: an identical GET that is
+/// *currently in flight* is the same answer, and waiting for it costs
+/// nothing. The entry is dropped as soon as it settles, so this never
+/// serves a cached response — an edit followed by a reload still reads
+/// the gateway.
+const inFlight = new Map<string, Promise<unknown>>();
+
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
+  const shareable = !init?.method || init.method === "GET";
+  if (shareable) {
+    const existing = inFlight.get(path);
+    if (existing) return existing as Promise<T>;
+  }
+  const pending = send<T>(path, init);
+  if (shareable) {
+    inFlight.set(path, pending);
+    void pending.catch(() => {}).finally(() => inFlight.delete(path));
+  }
+  return pending;
+}
+
+async function send<T>(path: string, init?: RequestInit): Promise<T> {
   const headers = new Headers(init?.headers);
   if (sessionToken()) headers.set("authorization", `Bearer ${sessionToken()}`);
   if (init?.body && !headers.has("content-type")) headers.set("content-type", "application/json");
@@ -438,5 +464,15 @@ export const api = {
     if (filters?.model) params.set("model", filters.model);
     if (filters?.key) params.set("key", filters.key);
     return request<{ data: Record<string, DayBucket[]> }>(`/history?${params}`);
+  },
+  /** Every grouping at once — one walk of the rollups instead of three.
+   * Keyed by grouping (`""` for the total, then `provider` / `model` /
+   * `key`), then by series name. */
+  historyAll: (days = 30, filters?: { provider?: string; model?: string; key?: string }) => {
+    const params = new URLSearchParams({ days: String(days), by: "all" });
+    if (filters?.provider) params.set("provider", filters.provider);
+    if (filters?.model) params.set("model", filters.model);
+    if (filters?.key) params.set("key", filters.key);
+    return request<{ data: Record<string, Record<string, DayBucket[]>> }>(`/history?${params}`);
   },
 };

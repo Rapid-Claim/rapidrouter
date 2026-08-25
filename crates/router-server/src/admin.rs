@@ -1,6 +1,8 @@
 //! Embedded control-plane HTTP API used by the console and CLI.
 
+use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use axum::extract::{Path, Query, Request, State};
 use axum::http::StatusCode;
@@ -125,6 +127,136 @@ fn commit_error(err: ControlPlaneError) -> Response {
     api_error(status, err.to_string())
 }
 
+/// How many analytics reads may be in flight at once.
+///
+/// Queueing is a better answer than thrashing: past a point, more
+/// concurrent scans only trade cache lines with each other and every one
+/// of them gets slower. Half the cores, never fewer than two.
+fn analytics_concurrency() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| (n.get() / 2).max(2))
+        .unwrap_or(2)
+}
+
+/// Run a disk-reading query away from the async runtime.
+///
+/// Every analytics read decompresses partitions and parses JSON. Doing
+/// that on a runtime worker parks a thread that is also proxying
+/// completions, so a wide window opened in the console shows up as
+/// latency on somebody else's request — the console making the gateway
+/// slow is the one thing this endpoint is not allowed to do. The
+/// semaphore is the other half of that promise: a handful of concurrent
+/// year-wide reads must not swallow the blocking pool either.
+async fn off_runtime<T, F>(work: F) -> Result<T, Response>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    static SLOTS: std::sync::LazyLock<tokio::sync::Semaphore> =
+        std::sync::LazyLock::new(|| tokio::sync::Semaphore::new(analytics_concurrency()));
+    // Held across the join below: the permit is the queue, and releasing
+    // it before the work finishes would make the bound meaningless.
+    let _permit = SLOTS.acquire().await.map_err(|_| {
+        api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "analytics queue is shutting down",
+        )
+    })?;
+    tokio::task::spawn_blocking(work).await.map_err(|err| {
+        tracing::warn!(%err, "analytics read panicked");
+        api_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "analytics read failed; see gateway logs",
+        )
+    })
+}
+
+/// A short-lived memo of analytics answers, keyed by the exact question.
+///
+/// Live traffic nudges the console to refetch every few seconds, and it
+/// asks the same question each time — often from several pages and
+/// several tabs at once. Recomputing a window that has not moved is pure
+/// waste, and for a window that ended in the past it is waste that can
+/// never pay off, because those days are immutable.
+///
+/// Two TTLs for that reason: seconds for a window ending "now", minutes
+/// for one that ended before today started. Neither is long enough to
+/// show an operator something they would call stale — the flusher's own
+/// interval is ten seconds, so a figure is never fresher than that
+/// anyway.
+struct AnalyticsMemo {
+    /// Keyed by question; the instant is when the answer stops counting.
+    entries: std::sync::Mutex<HashMap<String, (std::time::Instant, Arc<Value>)>>,
+}
+
+const MEMO_TTL_LIVE: Duration = Duration::from_secs(3);
+const MEMO_TTL_CLOSED: Duration = Duration::from_secs(300);
+/// Enough for every page and range a handful of operators can have open.
+const MEMO_CAP: usize = 512;
+
+static ANALYTICS_MEMO: std::sync::LazyLock<AnalyticsMemo> =
+    std::sync::LazyLock::new(|| AnalyticsMemo {
+        entries: std::sync::Mutex::new(HashMap::new()),
+    });
+
+impl AnalyticsMemo {
+    fn get(&self, key: &str) -> Option<Arc<Value>> {
+        let now = std::time::Instant::now();
+        let entries = self.entries.lock().ok()?;
+        let (expires, value) = entries.get(key)?;
+        (*expires > now).then(|| value.clone())
+    }
+
+    fn put(&self, key: String, ttl: Duration, value: Arc<Value>) {
+        let Ok(mut entries) = self.entries.lock() else {
+            return;
+        };
+        let now = std::time::Instant::now();
+        entries.retain(|_, (expires, _)| *expires > now);
+        // A cap this far above the number of distinct questions a
+        // console can ask means reaching it is a leak, not a workload —
+        // so start over rather than evicting one at a time.
+        if entries.len() >= MEMO_CAP {
+            entries.clear();
+        }
+        entries.insert(key, (now + ttl, value));
+    }
+}
+
+/// How long an answer about this window stays true enough to reuse.
+///
+/// A window that ended before today began covers only closed partitions,
+/// and closed partitions do not change.
+fn memo_ttl(until_ms: u64, now_ms: u64) -> Duration {
+    if until_ms < now_ms - (now_ms % 86_400_000) {
+        MEMO_TTL_CLOSED
+    } else {
+        MEMO_TTL_LIVE
+    }
+}
+
+/// Run an analytics read off the runtime, memoised.
+///
+/// The memo is checked before the queue is joined, so a cached answer
+/// does not wait behind an uncached one.
+async fn memoised<F>(key: String, ttl: Duration, work: F) -> Response
+where
+    F: FnOnce() -> Result<Value, serde_json::Error> + Send + 'static,
+{
+    if let Some(hit) = ANALYTICS_MEMO.get(&key) {
+        return Json(&*hit).into_response();
+    }
+    match off_runtime(work).await {
+        Ok(Ok(value)) => {
+            let value = Arc::new(value);
+            ANALYTICS_MEMO.put(key, ttl, value.clone());
+            Json(&*value).into_response()
+        }
+        Ok(Err(err)) => api_error(StatusCode::INTERNAL_SERVER_ERROR, err.to_string()),
+        Err(response) => response,
+    }
+}
+
 #[derive(Deserialize)]
 struct SessionRequest {
     #[serde(default)]
@@ -176,9 +308,12 @@ async fn create_session(
             );
         }
     };
-    let token = format!("cs_{}{}", uuid::Uuid::now_v7().simple(), fastrand::u64(..));
     let expires_ms =
         vkey::unix_now_ms() + config.console.session_ttl.as_millis().min(u64::MAX as u128) as u64;
+    // Signed rather than random: the map below is a cache that a restart
+    // is allowed to lose, and the token itself is what proves the
+    // session. See `crate::session`.
+    let token = state.session_signer.mint(&principal, expires_ms);
     state.sessions.lock().unwrap().insert(
         token.clone(),
         crate::Session {
@@ -231,9 +366,27 @@ async fn admin_auth(State(state): State<Arc<AppState>>, request: Request, next: 
         Some(crate::Principal::AdminKey)
     } else {
         bearer.or(cookie).and_then(|token| {
-            let mut sessions = state.sessions.lock().unwrap();
-            sessions.retain(|_, session| session.expires_ms >= now);
-            sessions.get(token).map(|session| session.principal.clone())
+            {
+                let mut sessions = state.sessions.lock().unwrap();
+                sessions.retain(|_, session| session.expires_ms >= now);
+                if let Some(session) = sessions.get(token) {
+                    return Some(session.principal.clone());
+                }
+            }
+            // Not in the cache. Either this node never minted it — which
+            // is the normal case in a fleet — or the process restarted
+            // and forgot. The token proves its own claims either way, so
+            // rehydrate rather than answering 401 and making a deploy
+            // look like a network fault.
+            let (principal, expires_ms) = state.session_signer.verify(token, now)?;
+            state.sessions.lock().unwrap().insert(
+                token.to_owned(),
+                crate::Session {
+                    expires_ms,
+                    principal: principal.clone(),
+                },
+            );
+            Some(principal)
         })
     };
     let Some(principal) = principal else {
@@ -665,6 +818,27 @@ fn default_limit() -> usize {
     100
 }
 
+impl RequestsQuery {
+    /// Everything that changes the answer, and nothing that does not.
+    ///
+    /// The resolved window rather than the submitted one: the console
+    /// sends `since_ms`/`until_ms` computed from `Date.now()`, so two
+    /// refreshes a second apart are different strings for the same
+    /// question. Rounding to the second is what lets them share an
+    /// answer; anything finer would memoise nothing.
+    fn memo_key(&self, since_ms: u64, until_ms: u64) -> String {
+        format!(
+            "{}-{}-{}-{}-{}-{}",
+            since_ms / 1000,
+            until_ms / 1000,
+            self.provider.as_deref().unwrap_or(""),
+            self.model.as_deref().unwrap_or(""),
+            self.key.as_deref().unwrap_or(""),
+            self.errors,
+        )
+    }
+}
+
 async fn requests(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RequestsQuery>,
@@ -684,19 +858,21 @@ async fn requests(
         let (ts, id) = cursor.split_once(':')?;
         Some((ts.parse::<u64>().ok()?, id.to_owned()))
     });
-    let (data, next) = state.usage.page_from_disk(
-        query.limit.clamp(1, 1_000),
-        since,
-        query.until_ms.unwrap_or(now),
-        &filter,
-        query.errors,
-        after,
-    );
-    Json(json!({
-        "data": data,
-        "next": next.map(|(ts, id)| format!("{ts}:{id}")),
-    }))
-    .into_response()
+    let usage = state.usage.clone();
+    let limit = query.limit.clamp(1, 1_000);
+    let until = query.until_ms.unwrap_or(now);
+    let errors = query.errors;
+    let read =
+        off_runtime(move || usage.page_from_disk(limit, since, until, &filter, errors, after))
+            .await;
+    match read {
+        Ok((data, next)) => Json(json!({
+            "data": data,
+            "next": next.map(|(ts, id)| format!("{ts}:{id}")),
+        }))
+        .into_response(),
+        Err(response) => response,
+    }
 }
 
 /// Totals for the whole window, so the console header describes the
@@ -717,10 +893,15 @@ async fn requests_summary(
         model: query.model.clone().filter(|v| !v.is_empty()),
         vkey: query.key.clone().filter(|v| !v.is_empty()),
     };
-    let summary = state
-        .usage
-        .summary(since, query.until_ms.unwrap_or(now), &filter, query.errors);
-    Json(summary).into_response()
+    let usage = state.usage.clone();
+    let until = query.until_ms.unwrap_or(now);
+    let errors = query.errors;
+    memoised(
+        format!("requests/summary?{}", query.memo_key(since, until)),
+        memo_ttl(until, now),
+        move || serde_json::to_value(usage.summary(since, until, &filter, errors)),
+    )
+    .await
 }
 
 /// Everything the Usage page needs for a window, in one request.
@@ -740,11 +921,15 @@ async fn usage_summary(
         model: query.model.clone().filter(|v| !v.is_empty()),
         vkey: query.key.clone().filter(|v| !v.is_empty()),
     };
-    let summary =
-        state
-            .usage
-            .usage_summary(since, query.until_ms.unwrap_or(now), &filter, query.errors);
-    Json(summary).into_response()
+    let usage = state.usage.clone();
+    let until = query.until_ms.unwrap_or(now);
+    let errors = query.errors;
+    memoised(
+        format!("usage/summary?{}", query.memo_key(since, until)),
+        memo_ttl(until, now),
+        move || serde_json::to_value(usage.usage_summary(since, until, &filter, errors)),
+    )
+    .await
 }
 
 #[derive(Deserialize)]
@@ -759,7 +944,16 @@ async fn request_bodies(
     Path(id): Path<String>,
     Query(query): Query<BodiesQuery>,
 ) -> Response {
-    match state.usage.bodies_for(&id, query.ts) {
+    let usage = state.usage.clone();
+    let lookup = {
+        let id = id.clone();
+        let ts = query.ts;
+        match off_runtime(move || usage.bodies_for(&id, ts)).await {
+            Ok(found) => found,
+            Err(response) => return response,
+        }
+    };
+    match lookup {
         Some(bodies) => Json(json!({
             "request_id": bodies.request_id,
             "input": bodies.input,
@@ -2212,6 +2406,14 @@ fn default_days() -> u32 {
     30
 }
 
+/// The widest history read this endpoint will serve.
+///
+/// Above a year, not at it: the console asks for
+/// `ceil(seconds / 86400) + 1` days so a "Last year" preset lands on 366,
+/// and a clamp of exactly 365 would silently return a range one day
+/// narrower than the one the picker says it selected.
+const MAX_HISTORY_DAYS: u32 = 400;
+
 /// Daily spend and volume for the Usage page's time ramp.
 ///
 /// The in-memory aggregate only spans 24 hours, so anything longer is
@@ -2223,6 +2425,10 @@ async fn history(
     Query(query): Query<HistoryQuery>,
 ) -> Response {
     let by = query.by.as_deref().unwrap_or("");
+    // `all` returns every grouping from one read. The console asks for
+    // it because it draws all of them at once, and three separate calls
+    // were three identical walks of the same window.
+    let every = by == "all";
     let by = if matches!(by, "provider" | "model" | "key") {
         by
     } else {
@@ -2233,8 +2439,28 @@ async fn history(
         model: query.model.filter(|v| !v.is_empty()),
         vkey: query.key.filter(|v| !v.is_empty()),
     };
-    Json(json!({ "data": state.usage.history(query.days.clamp(1, 365), by, &filter) }))
-        .into_response()
+    let usage = state.usage.clone();
+    let by = by.to_owned();
+    let days = query.days.clamp(1, MAX_HISTORY_DAYS);
+    let key = format!(
+        "history?{days}-{}-{}-{}-{}-{}",
+        if every { "all" } else { by.as_str() },
+        filter.provider.as_deref().unwrap_or(""),
+        filter.model.as_deref().unwrap_or(""),
+        filter.vkey.as_deref().unwrap_or(""),
+        // History always runs to now, so it re-reads today's partition;
+        // only the live TTL applies.
+        "live",
+    );
+    memoised(key, MEMO_TTL_LIVE, move || {
+        let data = if every {
+            serde_json::to_value(usage.history_all(days, &filter))?
+        } else {
+            serde_json::to_value(usage.history(days, &by, &filter))?
+        };
+        Ok(json!({ "data": data }))
+    })
+    .await
 }
 
 /// Per-provider, per-credential state for the console's Providers page.
@@ -2459,7 +2685,24 @@ async fn events(
     State(state): State<Arc<AppState>>,
 ) -> Sse<impl futures_util::Stream<Item = Result<Event, std::convert::Infallible>>> {
     let receiver = state.events.subscribe();
-    let stream = futures_util::stream::unfold(receiver, |mut receiver| async move {
+    // A `hello` before anything else, for two reasons. The obvious one:
+    // the stream is otherwise silent until traffic happens, so on a quiet
+    // gateway there is nothing to distinguish "connected" from "still
+    // connecting" — which is how the console came to render
+    // "Reconnecting" on every reload. The subtler one: it forces the
+    // response head out now rather than at the first event, so the
+    // browser's `onopen` fires on connect instead of on the first
+    // request somebody else makes.
+    let hello = futures_util::stream::once(async {
+        Ok(Event::default()
+            // Tell the browser to come back in a second rather than
+            // using its own ~3s default: a dropped stream should not be
+            // visible for longer than it takes to re-establish.
+            .retry(Duration::from_secs(1))
+            .json_data(json!({ "type": "hello" }))
+            .unwrap_or_default())
+    });
+    let updates = futures_util::stream::unfold(receiver, |mut receiver| async move {
         loop {
             match receiver.recv().await {
                 Ok(value) => {
@@ -2471,7 +2714,7 @@ async fn events(
             }
         }
     });
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    Sse::new(futures_util::StreamExt::chain(hello, updates)).keep_alive(KeepAlive::default())
 }
 
 #[allow(dead_code)]

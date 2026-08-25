@@ -208,6 +208,19 @@ h2 { font-size: 13.5px; line-height: 1.3; color: var(--title); }
 }
 .live-state .dot, .status > span { width: 7px; height: 7px; flex: none; border-radius: 50%; background: var(--faint); }
 .live-state .dot.online { background: var(--success); }
+.live-state .dot.offline { background: var(--danger); }
+/* Connecting is neither good news nor bad, and should not read as
+   either: a soft pulse says "working on it" without the alarm of red. */
+.live-state .dot.pending { background: var(--muted); animation: dot-pulse 1.4s ease-in-out infinite; }
+
+@keyframes dot-pulse {
+  0%, 100% { opacity: 0.35; }
+  50% { opacity: 1; }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .live-state .dot.pending { animation: none; opacity: 0.6; }
+}
 
 /* The working surface: a rounded card floated off the background, with
    breathing room above, below and to the right. It owns its scrolling —

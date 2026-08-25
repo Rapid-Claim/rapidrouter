@@ -132,7 +132,19 @@ one ring-buffer write on the hot path, batched flush off it. Then:
 
 - **Cluster-wide views**: the console scatter-gathers summaries from every
   peer over the cluster port and merges — no shared storage involved.
-- **Retention**: `usage.retention_days` pruned locally by the binary.
+- **Retention**: `usage.retention_days` (a year by default) pruned locally
+  by the binary. Captured request/response bodies have their own, much
+  shorter window — `usage.body_retention_days`, a day by default — because
+  they are the payloads rather than a summary of them and are two orders of
+  magnitude larger.
+- **Reads never scan records.** Every aggregate the console draws comes
+  from hourly rollups written from the same batch as the records, folded
+  into per-day and per-month cache files by the flusher's maintenance
+  tick. Read cost is proportional to the window's *resolution*, never to
+  the traffic inside it: a year at daily resolution is about a dozen
+  files whether the gateway served a thousand requests or a billion. The
+  hours still being written are held in memory, so the current day costs
+  no reads at all.
 - **Optional sinks**: `usage_sink = "s3://…"` (any S3-compatible store)
   ships partitions out for long-term warehouse queries. Optional, additive.
 

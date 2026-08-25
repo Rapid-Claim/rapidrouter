@@ -189,10 +189,10 @@ pub struct RawUsage {
 impl Default for RawUsage {
     fn default() -> Self {
         Self {
-            retention_days: 30,
+            retention_days: 365,
             capture_bodies: "all".into(),
             body_limit_bytes: 256 * 1024,
-            body_retention_days: 30,
+            body_retention_days: 1,
             flush_interval_secs: 10,
             per_key_metrics: false,
         }
