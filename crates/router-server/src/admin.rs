@@ -2459,12 +2459,13 @@ async fn history(
         "live",
     );
     memoised(key, MEMO_TTL_LIVE, move || {
-        let data = if every {
-            serde_json::to_value(usage.history_all(days, &filter))?
-        } else {
-            serde_json::to_value(usage.history(days, &by, &filter))?
-        };
-        Ok(json!({ "data": data }))
+        // `all` carries the window's latency percentiles alongside the
+        // groupings, which a day bucket cannot: percentiles do not sum,
+        // so there is nothing per-day to hand back and add up.
+        if every {
+            return serde_json::to_value(usage.history_all(days, &filter));
+        }
+        Ok(json!({ "data": serde_json::to_value(usage.history(days, &by, &filter))? }))
     })
     .await
 }

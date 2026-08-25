@@ -58,6 +58,15 @@ import {
   type TimeRange,
 } from "./ui";
 import {
+  hashPath,
+  setHashPath,
+  urlFilters,
+  urlParam,
+  urlRange,
+  urlSearch,
+  type DimFilters,
+} from "./route";
+import {
   api,
   clearSession,
   login,
@@ -134,11 +143,12 @@ const jumps: Record<string, Page> = {
   ",": "settings",
 };
 
+/// Which page the hash names, ignoring the filters hanging off it.
 function routeFromHash(): Page {
-  if (location.hash.slice(1) === "cluster") return "settings";
-  const candidate = location.hash.slice(1) as Page;
+  const path = hashPath();
+  if (path === "cluster") return "settings";
   const known = [...navigation, settingsNav];
-  return known.some((item) => item.id === candidate) ? candidate : "usage";
+  return known.some((item) => item.id === path) ? (path as Page) : "usage";
 }
 
 /// Typing in a field must never be swallowed by a shortcut.
@@ -187,7 +197,16 @@ export function App() {
   const [me] = createResource(authenticated, (ok) => (ok ? api.me().catch(() => undefined) : undefined));
   const visibleNav = createMemo(() =>
     navigation.filter((item) => !item.adminOnly || me()?.is_admin !== false));
-  const [page, setPage] = createSignal<Page>(routeFromHash());
+  // Derived, not stored: the hash is the state, and a signal alongside
+  // it is a second copy to keep in step.
+  const page = createMemo(routeFromHash);
+  // Filters are written back to the hash, so it has to name the page
+  // they belong to — an empty hash or the `cluster` alias would leave
+  // `?model=…` attached to a path that resolves somewhere else on the
+  // next reload.
+  createEffect(() => {
+    if (hashPath() !== page()) setHashPath(page());
+  });
   const [refresh, setRefresh] = createSignal(0);
   // Four states, not a boolean. A boolean has to call the first moments
   // of a page load something, and calling them "Reconnecting" made every
@@ -201,7 +220,6 @@ export function App() {
     localStorage.setItem("rapid-rail", next ? "collapsed" : "expanded");
   };
 
-  const onHash = () => setPage(routeFromHash());
   let pendingJump = false;
   const onKey = (event: KeyboardEvent) => {
     if (event.metaKey || event.ctrlKey || event.altKey || isTyping(event.target)) return;
@@ -228,10 +246,7 @@ export function App() {
     }
     if (event.key.toLowerCase() === "g") pendingJump = true;
   };
-  onMount(() => {
-    addEventListener("hashchange", onHash);
-    addEventListener("keydown", onKey);
-  });
+  onMount(() => addEventListener("keydown", onKey));
   createEffect(() => {
     if (!authenticated()) return;
     setLink("connecting");
@@ -314,10 +329,7 @@ export function App() {
       events.close();
     });
   });
-  onCleanup(() => {
-    removeEventListener("hashchange", onHash);
-    removeEventListener("keydown", onKey);
-  });
+  onCleanup(() => removeEventListener("keydown", onKey));
 
   const current = createMemo(
     () => [...navigation, settingsNav].find((item) => item.id === page())!,
@@ -2461,7 +2473,6 @@ function KeyRow(props: { key: VirtualKey; reload: () => Promise<void>; reveal: (
   return <tr><td><strong>{props.key.name}</strong><small class="mono">{props.key.id}</small></td><td>{props.key.models.length ? props.key.models.join(", ") : "All models"}</td><td>{props.key.rate?.rpm ? `${props.key.rate.rpm} RPM` : "Unlimited"}</td><td>{props.key.budget ? `${formatUsd(props.key.budget.usd)} / ${props.key.budget.period}` : "None"}</td><td><Status text={props.key.enabled ? "Active" : "Revoked"} tone={props.key.enabled ? "success" : "muted"} /></td><td class="actions"><button class="icon-button" title={`Rotate ${props.key.name}`} aria-label={`Rotate ${props.key.name}`} onClick={async () => { const result = await api.rotateKey(props.key.id); props.reveal(result.key); await props.reload(); }}><RefreshCw size={16} /></button><button class="icon-button danger" title={`Delete ${props.key.name}`} aria-label={`Delete ${props.key.name}`} onClick={async () => { if (confirm(`Delete ${props.key.name}?`)) { await api.deleteKey(props.key.id); await props.reload(); } }}><Trash2 size={16} /></button></td></tr>;
 }
 
-type DimFilters = { provider: string; model: string; key: string };
 type TrendPoint = [number, number];
 type Slice = {
   name: string;
@@ -2470,7 +2481,13 @@ type Slice = {
   input: number;
   output: number;
   cost: number;
+  /// Total milliseconds, not a mean: a mean cannot be re-totalled, and
+  /// this is summed across days before anything divides it.
+  latency: number;
 };
+
+/// One model's average latency over time, ready for the chart.
+type LatencySeries = { name: string; points: TrendPoint[] };
 
 /// One loader for both observability pages.
 ///
@@ -2545,6 +2562,7 @@ function useTelemetry(
       input: buckets.reduce((n, b) => n + b.input_tokens, 0),
       output: buckets.reduce((n, b) => n + b.output_tokens, 0),
       cost: buckets.reduce((n, b) => n + b.cost_micro_usd, 0) / 1e6,
+      latency: buckets.reduce((n, b) => n + (b.latency_ms_sum ?? 0), 0),
     }));
 
   const liveSlices = (pick: (s: UsageSummary) => UsageSlice[]): Slice[] =>
@@ -2555,6 +2573,7 @@ function useTelemetry(
       input: s.input_tokens,
       output: s.output_tokens,
       cost: s.cost_micro_usd / 1e6,
+      latency: s.latency_ms_sum ?? 0,
     }));
 
   const byModel = createMemo<Slice[]>(() => resolved().live
@@ -2569,7 +2588,8 @@ function useTelemetry(
 
   /// Time series for the charts: minute buckets from the tail, or day
   /// buckets from history, projected by `value`.
-  const trend = (value: (b: { requests: number; failed: number; input: number; output: number; cost: number }) => number) =>
+  type Totals = { requests: number; failed: number; input: number; output: number; cost: number; latency: number };
+  const trend = (value: (b: Totals) => number) =>
     createMemo<TrendPoint[]>(() => {
       const r = resolved();
       if (r.live) {
@@ -2579,20 +2599,22 @@ function useTelemetry(
           input: b.input_tokens,
           output: b.output_tokens,
           cost: b.cost_micro_usd / 1e6,
+          latency: b.latency_ms_sum ?? 0,
         })] as TrendPoint);
       }
-      const perDay = new Map<string, { requests: number; failed: number; input: number; output: number; cost: number }>();
+      const perDay = new Map<string, Totals>();
       // The total, not a sum over the model split: a request that never
       // reached a provider has no model, and summing the split would
       // quietly drop exactly the failures worth charting.
       for (const buckets of Object.values(sliceDays(grouping("")))) {
         for (const bucket of buckets) {
-          const b = perDay.get(bucket.day) ?? { requests: 0, failed: 0, input: 0, output: 0, cost: 0 };
+          const b = perDay.get(bucket.day) ?? { requests: 0, failed: 0, input: 0, output: 0, cost: 0, latency: 0 };
           b.requests += bucket.requests;
           b.failed += bucket.failed;
           b.input += bucket.input_tokens;
           b.output += bucket.output_tokens;
           b.cost += bucket.cost_micro_usd / 1e6;
+          b.latency += bucket.latency_ms_sum ?? 0;
           perDay.set(bucket.day, b);
         }
       }
@@ -2601,14 +2623,67 @@ function useTelemetry(
         .map(([day, b]) => [Date.parse(`${day}T00:00:00`) / 1000, value(b)]);
     });
 
+  /// The window's latency, as the three figures that answer different
+  /// questions: what a typical request cost, what the slow tail cost,
+  /// and what the window cost on average.
+  ///
+  /// The percentiles come from the gateway either way — a p95 cannot be
+  /// derived from a mean, and averaging per-day means would weight a
+  /// quiet Sunday the same as a busy Monday. The mean is a total over a
+  /// count for the same reason.
+  const latency = createMemo(() => {
+    const source = resolved().live ? live() : history();
+    const total = byModel().reduce(
+      (acc, s) => ({ requests: acc.requests + s.requests, ms: acc.ms + s.latency }),
+      { requests: 0, ms: 0 },
+    );
+    return {
+      p50: source?.p50_latency_ms ?? 0,
+      p95: source?.p95_latency_ms ?? 0,
+      avg: total.requests ? total.ms / total.requests : 0,
+    };
+  });
+
+  /// Average latency per model over time, capped at the few busiest so
+  /// the chart stays readable. The gateway caps the live path; the
+  /// history path is capped here, over the same rule.
+  const latencyByModel = createMemo<LatencySeries[]>(() => {
+    if (resolved().live) {
+      return (live()?.latency_by_model ?? []).map((series) => ({
+        name: series.name,
+        points: series.points
+          .filter((p) => p.requests)
+          .map((p) => [p.ts, p.latency_ms_sum / p.requests] as TrendPoint),
+      }));
+    }
+    return Object.entries(sliceDays(grouping("model")))
+      .map(([name, buckets]) => ({
+        name,
+        requests: buckets.reduce((n, b) => n + b.requests, 0),
+        points: buckets
+          .filter((b) => b.requests)
+          .map((b) => [
+            Date.parse(`${b.day}T00:00:00`) / 1000,
+            (b.latency_ms_sum ?? 0) / b.requests,
+          ] as TrendPoint),
+      }))
+      .sort((a, b) => b.requests - a.requests || (a.name < b.name ? -1 : 1))
+      .slice(0, LATENCY_SERIES_CAP)
+      .map(({ name, points }) => ({ name, points }));
+  });
+
   const truncated = createMemo(() => resolved().live && Boolean(live()?.capped));
   // "Still fetching" and "nothing to show" are different answers, and an
   // empty state shown during the first read is the wrong one.
   const loading = createMemo(() => resolved().live
     ? live.loading && !live()
     : history.loading && !history());
-  return { resolved, byModel, byKey, byProvider, trend, truncated, loading, live };
+  return { resolved, byModel, byKey, byProvider, trend, latency, latencyByModel, truncated, loading, live };
 }
+
+/// How many models the per-model latency chart draws — the palette's
+/// length, and about where a line chart stops being readable.
+const LATENCY_SERIES_CAP = 6;
 
 /// Shared filter row for the observability pages.
 function TelemetryFilters(props: {
@@ -2663,7 +2738,10 @@ function TelemetryFilters(props: {
 function TrendChart(props: {
   series: Array<{ name: string; points: TrendPoint[] }>;
   span: { startMs: number; endMs: number };
-  money?: boolean;
+  /// What the y axis counts. Drives the tick labels and the gutter they
+  /// need — uPlot sizes that from a default rather than from the
+  /// formatter, so a wider label has to be declared here or it clips.
+  unit?: "count" | "usd" | "ms";
   loading?: boolean;
 }) {
   let element!: HTMLDivElement;
@@ -2696,9 +2774,11 @@ function TrendChart(props: {
           // Wide enough for the longest label this axis can produce:
           // uPlot reserves the gutter from a default, not from the
           // formatter, so "$80.00" was being clipped at the left edge.
-          size: props.money ? 68 : 56,
+          size: props.unit === "usd" ? 68 : props.unit === "ms" ? 64 : 56,
           values: (_u, splits) => splits.map((v) =>
-            props.money ? `$${Number(v).toFixed(v < 10 ? 2 : 0)}` : formatNumber(Number(v))),
+            props.unit === "usd" ? `$${Number(v).toFixed(v < 10 ? 2 : 0)}`
+            : props.unit === "ms" ? formatLatency(Number(v))
+            : formatNumber(Number(v))),
         },
       ],
       series: [
@@ -2732,8 +2812,8 @@ function TrendChart(props: {
 
 /// Usage: what the providers meter — volume and tokens.
 function Usage(props: { refresh: () => number }) {
-  const [range, setRange] = createSignal<TimeRange>({ kind: "relative", seconds: 86400, label: "Last 24 hours" });
-  const [filters, setFilters] = createSignal<DimFilters>({ provider: "", model: "", key: "" });
+  const [range, setRange] = urlRange({ kind: "relative", seconds: 86400, label: "Last 24 hours" });
+  const [filters, setFilters] = urlFilters();
   const t = useTelemetry(props.refresh, range, filters);
   const totals = createMemo(() => t.byModel().reduce((acc, s) => ({
     requests: acc.requests + s.requests, failed: acc.failed + s.failed,
@@ -2743,6 +2823,9 @@ function Usage(props: { refresh: () => number }) {
   const outputTrend = t.trend((b) => b.output);
   const requestTrend = t.trend((b) => b.requests);
   const failedTrend = t.trend((b) => b.failed);
+  // Per bucket, not per window: dividing the window's total by the
+  // window's requests and drawing that flat line would say nothing.
+  const latencyTrend = t.trend((b) => (b.requests ? b.latency / b.requests : 0));
 
   return <div class="stack-lg">
     <TelemetryFilters filters={filters()} onChange={setFilters} range={range()} onRange={setRange} refresh={props.refresh} />
@@ -2754,6 +2837,23 @@ function Usage(props: { refresh: () => number }) {
       <div class="stat"><span>Output tokens</span><strong>{formatNumber(totals().output)}</strong></div>
       <div class="stat"><span>Total tokens</span><strong>{formatNumber(totals().input + totals().output)}</strong></div>
       <div class="stat"><span>Tokens / request</span><strong>{totals().requests ? formatNumber((totals().input + totals().output) / totals().requests) : "—"}</strong></div>
+    </section>
+    <section class="stat-row" aria-label="Latency">
+      <div class="stat">
+        <span>Median latency</span>
+        <strong>{totals().requests ? formatLatency(t.latency().p50) : "—"}</strong>
+        <small>half of requests were faster</small>
+      </div>
+      <div class="stat">
+        <span>p95 latency</span>
+        <strong>{totals().requests ? formatLatency(t.latency().p95) : "—"}</strong>
+        <small>the slow twentieth</small>
+      </div>
+      <div class="stat">
+        <span>Average latency</span>
+        <strong>{totals().requests ? formatLatency(t.latency().avg) : "—"}</strong>
+        <small>end to end, including the provider</small>
+      </div>
     </section>
     </Loading>
     <Show when={t.truncated()}>
@@ -2779,6 +2879,29 @@ function Usage(props: { refresh: () => number }) {
     </div>
     <div class="two-up">
       <section class="flat-section">
+        <header><h2>Latency over time</h2><span class="muted">mean per bucket</span></header>
+        <TrendChart
+          series={[{ name: "Latency", points: latencyTrend() }]}
+          span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }}
+          unit="ms"
+          loading={t.loading()}
+        />
+      </section>
+      <section class="flat-section">
+        {/* Split out because the combined line cannot answer "which one
+            got slower": one slow model is invisible inside a mean that a
+            fast model serving ten times the traffic dominates. */}
+        <header><h2>Latency per model</h2><span class="muted">busiest {LATENCY_SERIES_CAP}, mean</span></header>
+        <TrendChart
+          series={t.latencyByModel()}
+          span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }}
+          unit="ms"
+          loading={t.loading()}
+        />
+      </section>
+    </div>
+    <div class="two-up">
+      <section class="flat-section">
         <header><h2>Per model</h2><span class="muted">by tokens</span></header>
         <TokenTable slices={t.byModel()} label="Model" loading={t.loading()} />
       </section>
@@ -2793,8 +2916,8 @@ function Usage(props: { refresh: () => number }) {
 /// Cost: what the pricing produces — spend, efficiency, and where the
 /// money concentrates.
 function Cost(props: { refresh: () => number }) {
-  const [range, setRange] = createSignal<TimeRange>({ kind: "relative", seconds: 7 * 86400, label: "Last 7 days" });
-  const [filters, setFilters] = createSignal<DimFilters>({ provider: "", model: "", key: "" });
+  const [range, setRange] = urlRange({ kind: "relative", seconds: 7 * 86400, label: "Last 7 days" });
+  const [filters, setFilters] = urlFilters();
   const t = useTelemetry(props.refresh, range, filters);
   const totals = createMemo(() => t.byModel().reduce((acc, s) => ({
     requests: acc.requests + s.requests,
@@ -2827,11 +2950,11 @@ function Cost(props: { refresh: () => number }) {
     <div class="two-up">
       <section class="flat-section">
         <header><h2>Spend over time</h2><span class="muted">{t.resolved().label}</span></header>
-        <TrendChart series={[{ name: "Spend", points: spendTrend() }]} span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }} money loading={t.loading()} />
+        <TrendChart series={[{ name: "Spend", points: spendTrend() }]} span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }} unit="usd" loading={t.loading()} />
       </section>
       <section class="flat-section">
         <header><h2>Cumulative spend</h2><span class="muted">running total</span></header>
-        <TrendChart series={[{ name: "Cumulative", points: cumulative() }]} span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }} money loading={t.loading()} />
+        <TrendChart series={[{ name: "Cumulative", points: cumulative() }]} span={{ startMs: t.resolved().startMs, endMs: t.resolved().endMs }} unit="usd" loading={t.loading()} />
       </section>
     </div>
     <section class="flat-section">
@@ -2857,13 +2980,14 @@ function TokenTable(props: { slices: Slice[]; label: string; loading?: boolean }
   return <Loading when={Boolean(props.loading)} skeleton="table"><Show when={rows().length} fallback={<Empty title="No traffic" action="Nothing served in this range." />}>
     <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
       <table class="dense">
-        <thead><tr><th>{props.label}</th><th class="num">Requests</th><th class="num">Input</th><th class="num">Output</th><th class="num">Tok / req</th><th class="share-col"><span class="sr-only">Share</span></th></tr></thead>
+        <thead><tr><th>{props.label}</th><th class="num">Requests</th><th class="num">Input</th><th class="num">Output</th><th class="num">Tok / req</th><th class="num">Avg latency</th><th class="share-col"><span class="sr-only">Share</span></th></tr></thead>
         <tbody><For each={rows().slice(0, 8)}>{(row) => <tr>
           <td class="strong mono">{row.name}</td>
           <td class="num">{formatNumber(row.requests)}</td>
           <td class="num">{formatNumber(row.input)}</td>
           <td class="num">{formatNumber(row.output)}</td>
           <td class="num">{row.requests ? formatNumber((row.input + row.output) / row.requests) : "—"}</td>
+          <td class="num">{row.requests ? formatLatency(row.latency / row.requests) : "—"}</td>
           <td class="share-col"><div class="meter"><i style={{ width: `${max() ? Math.round(((row.input + row.output) / max()) * 100) : 0}%` }} /></div></td>
         </tr>}</For></tbody>
       </table>
@@ -2926,12 +3050,12 @@ function rowsFromHistory(series: Record<string, DayBucket[]>): ModelRow[] {
 }
 
 function Requests(props: { refresh: () => number }) {
-  const [search, setSearch] = createSignal("");
-  const [range, setRange] = createSignal<TimeRange>({ kind: "relative", seconds: 3600, label: "Last hour" });
-  const [status, setStatus] = createSignal("");
-  const [provider, setProvider] = createSignal("");
-  const [model, setModel] = createSignal("");
-  const [vkey, setVkey] = createSignal("");
+  const [search, setSearch] = urlSearch();
+  const [range, setRange] = urlRange({ kind: "relative", seconds: 3600, label: "Last hour" });
+  const [status, setStatus] = urlParam("status");
+  const [provider, setProvider] = urlParam("provider");
+  const [model, setModel] = urlParam("model");
+  const [vkey, setVkey] = urlParam("key");
   // The window is sent to the gateway rather than filtered here: the
   // in-memory tail is ~90 seconds at a million requests a day, so
   // anything older has to be read from the flushed partitions, and only
@@ -4012,14 +4136,14 @@ function DailySpendChart(props: { series: Record<string, DayBucket[]> }) {
 /// questions the Usage page answers in aggregate, split per model so a
 /// single model's change is visible rather than averaged away.
 function ModelActivity(props: { refresh: () => number }) {
-  const [range, setRange] = createSignal<TimeRange>({ kind: "relative", seconds: 7 * 86400, label: "Last 7 days" });
+  const [range, setRange] = urlRange({ kind: "relative", seconds: 7 * 86400, label: "Last 7 days" });
   const resolved = createMemo(() => resolveRange(range()));
   const [history] = createResource(
     () => [props.refresh(), range()] as const,
     () => api.history(resolveRange(range()).days, "model"),
   );
-  const [measure, setMeasure] = createSignal<"cost" | "requests" | "tokens">("cost");
-  const [search, setSearch] = createSignal("");
+  const [measure, setMeasure] = urlParam("measure", "cost");
+  const [search, setSearch] = urlSearch();
 
   const sliced = createMemo(() => {
     const source = history()?.data ?? {};
@@ -4062,7 +4186,7 @@ function ModelActivity(props: { refresh: () => number }) {
         id: "measure",
         label: "Measure",
         value: measure(),
-        onChange: (value) => setMeasure((value || "cost") as "cost" | "requests" | "tokens"),
+        onChange: (value) => setMeasure(value || "cost"),
         options: [
           { value: "cost", label: "Cost" },
           { value: "requests", label: "Requests" },
@@ -4232,6 +4356,12 @@ function AddModelDialog(props: {
 // for that locale and useless for a dollar-denominated API where every
 // price is quoted per million. Thousands/millions/billions it is.
 const NUMBER = new Intl.NumberFormat("en-US", { notation: "compact", maximumFractionDigits: 1 });
+/// Durations are not counts. `formatNumber` is compact notation, which
+/// renders 1,240 ms as "1.2K ms" — correct, and not how anybody reads a
+/// latency. Whole milliseconds throughout, including on an axis, so the
+/// unit never changes between one tick and the next.
+const MILLISECONDS = new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 });
 const USD = new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", minimumFractionDigits: 2, maximumFractionDigits: 4 });
 function formatNumber(value: number | undefined) { return NUMBER.format(value ?? 0); }
 function formatUsd(value: number | undefined) { return USD.format(value ?? 0); }
+function formatLatency(value: number | undefined) { return `${MILLISECONDS.format(Math.max(0, value ?? 0))} ms`; }

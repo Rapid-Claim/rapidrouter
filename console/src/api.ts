@@ -149,6 +149,9 @@ export type DayBucket = {
   input_tokens: number;
   output_tokens: number;
   cost_micro_usd: number;
+  /** Summed, not averaged — means do not compose across buckets. Divide
+   * by `requests` at the point of drawing. */
+  latency_ms_sum: number;
 };
 
 export type UsageRecord = {
@@ -183,6 +186,10 @@ export type UsageSlice = {
   input_tokens: number;
   output_tokens: number;
   cost_micro_usd: number;
+  latency_ms_sum: number;
+  /** Read from this slice's own distribution, so it is a real tail
+   * rather than something derived from the mean. */
+  p95_latency_ms: number;
 };
 
 export type UsageBucket = {
@@ -192,7 +199,14 @@ export type UsageBucket = {
   input_tokens: number;
   output_tokens: number;
   cost_micro_usd: number;
+  latency_ms_sum: number;
 };
+
+/** One bucket of one model's latency, as a count and a sum. */
+export type LatencyPoint = { ts: number; requests: number; latency_ms_sum: number };
+
+/** One model's latency over the window's buckets. */
+export type ModelLatency = { name: string; requests: number; points: LatencyPoint[] };
 
 /** Everything the Usage page needs for a window, from one server-side scan. */
 export type UsageSummary = {
@@ -210,6 +224,9 @@ export type UsageSummary = {
   by_provider: UsageSlice[];
   by_key: UsageSlice[];
   series: UsageBucket[];
+  /** The busiest few models' latency over the same buckets. Capped
+   * server-side, so this is a leaderboard and not every model served. */
+  latency_by_model: ModelLatency[];
   bucket_secs: number;
 };
 
@@ -467,12 +484,18 @@ export const api = {
   },
   /** Every grouping at once — one walk of the rollups instead of three.
    * Keyed by grouping (`""` for the total, then `provider` / `model` /
-   * `key`), then by series name. */
+   * `key`), then by series name. The latency percentiles describe the
+   * whole window: percentiles do not sum, so there is no honest per-day
+   * one to put in a bucket. */
   historyAll: (days = 30, filters?: { provider?: string; model?: string; key?: string }) => {
     const params = new URLSearchParams({ days: String(days), by: "all" });
     if (filters?.provider) params.set("provider", filters.provider);
     if (filters?.model) params.set("model", filters.model);
     if (filters?.key) params.set("key", filters.key);
-    return request<{ data: Record<string, Record<string, DayBucket[]>> }>(`/history?${params}`);
+    return request<{
+      data: Record<string, Record<string, DayBucket[]>>;
+      p50_latency_ms: number;
+      p95_latency_ms: number;
+    }>(`/history?${params}`);
   },
 };
