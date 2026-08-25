@@ -1857,13 +1857,6 @@ function CredentialRow(props: {
     </td>
     <td>
       <strong>{key().credential?.email ?? key().name}</strong>
-      {/* The seat name is the *file* the credential came from, and it is
-          what the config entry is keyed by — so it is what an operator
-          needs in hand to remove the right one of two rows reading the
-          same email. Shown only when it is not already the headline. */}
-      <Show when={key().credential?.email && key().credential!.email !== key().name}>
-        <small class="mono muted">{key().name}</small>
-      </Show>
       <Show when={props.group} keyed>
         {(group) => (
           <span
