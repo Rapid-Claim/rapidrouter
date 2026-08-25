@@ -1146,7 +1146,10 @@ kbd {
 .seat-dupe-toggle.on { background: var(--warning); color: var(--bg); }
 
 .seat-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-.seat-filters .search-field { flex: 1 1 260px; }
+/* Wide enough for the longest address it has to show, and no wider. A
+   grow factor here let it eat every spare pixel of a wide drawer, which
+   put a 900px box around a 30-character query. */
+.seat-filters .search-field { flex: 0 1 400px; }
 
 /* The checkbox column stays out of the way until it is wanted: hovering
    a row, focusing the box, a row already picked, or any selection at all

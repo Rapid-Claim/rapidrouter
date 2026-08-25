@@ -911,8 +911,8 @@ function ProviderAccounts(props: {
               spellcheck={false}
               value={search()}
               placeholder={provider().subscription
-                ? `Search ${keys().length} accounts — address, seat or domain (press /)`
-                : "Search keys — name or domain (press /)"}
+                ? "Search accounts, seats or domains (press /)"
+                : "Search keys or domains (press /)"}
               aria-label="Search accounts"
               onInput={(e) => setSearch(e.currentTarget.value)}
             />
