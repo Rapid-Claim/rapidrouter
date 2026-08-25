@@ -206,7 +206,10 @@ async fn a_batch_of_seats_is_removed_in_one_commit() {
     let version_before = before["version"].as_u64().unwrap();
 
     let response = admin
-        .delete(format!("{}/admin/api/providers/codex/keys/bulk", gateway.url))
+        .delete(format!(
+            "{}/admin/api/providers/codex/keys/bulk",
+            gateway.url
+        ))
         .json(&json!({ "keys": ["seat-dupe", "seat-c"] }))
         .send()
         .await
@@ -245,7 +248,10 @@ async fn names_that_are_already_gone_are_reported_not_refused() {
 
     // One live name, one that was never there: the live one still goes.
     let result: Value = admin
-        .delete(format!("{}/admin/api/providers/codex/keys/bulk", gateway.url))
+        .delete(format!(
+            "{}/admin/api/providers/codex/keys/bulk",
+            gateway.url
+        ))
         .json(&json!({ "keys": ["seat-b", "seat-never"] }))
         .send()
         .await
@@ -273,7 +279,10 @@ async fn names_that_are_already_gone_are_reported_not_refused() {
         .unwrap();
 
     let result: Value = admin
-        .delete(format!("{}/admin/api/providers/codex/keys/bulk", gateway.url))
+        .delete(format!(
+            "{}/admin/api/providers/codex/keys/bulk",
+            gateway.url
+        ))
         .json(&json!({ "keys": ["seat-never", "seat-also-never"] }))
         .send()
         .await
