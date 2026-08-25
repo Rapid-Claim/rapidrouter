@@ -882,6 +882,15 @@ kbd {
   flex: 1;
   color: var(--text);
 }
+/* No ring on this one at all. It is focused the instant the popup opens,
+   so the global `:focus-visible` shadow drew a hard rounded box inside a
+   panel that already has a frame and a divider — decoration for a state
+   the reader cannot be in any other way. The caret says where the typing
+   goes, and there is nowhere else in here to type. */
+.combobox-search input:focus-visible {
+  box-shadow: none;
+  border-color: transparent !important;
+}
 
 /* The popup's max-height is computed from the space actually available
    below (or above) the trigger; the list takes whatever is left after the
