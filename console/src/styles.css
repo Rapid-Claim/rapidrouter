@@ -1021,6 +1021,24 @@ kbd {
   min-width: 0;
   color: var(--text);
 }
+/* The ring belongs to the field, not to the input inside it.
+   The global `:focus-visible` rule paints a 2px shadow on whatever has
+   focus — and since focus lands on the bare input sitting *inside* this
+   wrapper's border, that read as two nested rounded rectangles. Suppress
+   it there and put one ring around the whole control. */
+.search-field input:focus-visible {
+  box-shadow: none;
+  border-color: transparent !important;
+}
+.search-field:focus-within {
+  border-color: var(--focus);
+  box-shadow: 0 0 0 2px color-mix(in srgb, var(--focus) 65%, transparent);
+}
+/* `type="search"` is what stops the browser offering saved postal
+   addresses in a box that searches seats. Its native clear affordance is
+   redundant next to the one this field already draws. */
+.search-field input::-webkit-search-cancel-button,
+.search-field input::-webkit-search-decoration { appearance: none; display: none; }
 .search-field button {
   display: grid;
   place-items: center;
@@ -1128,7 +1146,10 @@ kbd {
 .seat-dupe-toggle.on { background: var(--warning); color: var(--bg); }
 
 .seat-filters { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 12px; }
-.seat-filters .search-field { flex: 1 1 260px; }
+/* Wide enough for the longest address it has to show, and no wider. A
+   grow factor here let it eat every spare pixel of a wide drawer, which
+   put a 900px box around a 30-character query. */
+.seat-filters .search-field { flex: 0 1 400px; }
 
 /* The checkbox column stays out of the way until it is wanted: hovering
    a row, focusing the box, a row already picked, or any selection at all
@@ -1177,33 +1198,42 @@ kbd {
    the last row with empty drawer beneath it. */
 .seat-pane { display: flex; flex-direction: column; min-height: 100%; }
 
-/* Bottom of the drawer's own scroll area, not the viewport: the bar acts
-   on the table above it and should not outlive the drawer.
-   `margin-top: auto` puts it at the foot of a short table; on a long one
-   there is no free space to absorb, so it goes flush and the rows scroll
-   under it. Negative side margins let it span the drawer's full width by
-   cancelling the body's padding. */
+/* A pill that floats over the table rather than a bar that walls it off.
+   Full width with a top border read as a page footer and hid the row
+   behind it; sized to its contents it covers three columns of one row and
+   stays obviously temporary. `margin-top: auto` drops it to the foot of a
+   short table, and sticky holds it there once the table is long enough to
+   scroll. */
 .seat-bar {
   position: sticky;
-  bottom: 0;
+  bottom: 4px;
   z-index: 1;
+  align-self: center;
   display: flex;
   align-items: center;
-  gap: 10px;
-  flex-wrap: wrap;
-  margin: auto -18px 0;
-  padding: 12px 18px;
+  gap: 8px;
+  width: fit-content;
+  max-width: 100%;
+  margin: auto 0 0;
+  padding: 6px 8px 6px 14px;
   background: var(--surface-2);
-  border-top: 1px solid var(--border);
+  border: 1px solid var(--border);
+  border-radius: 999px;
+  box-shadow: var(--shadow-pop);
 }
-.seat-bar strong { font-size: 12.5px; font-variant-numeric: tabular-nums; }
-.seat-bar .muted { font-size: 11.5px; font-variant-numeric: tabular-nums; }
-.seat-bar-actions { display: flex; align-items: center; gap: 6px; margin-left: auto; }
-
-/* Bulk removal is the one destructive control here, and it should read
-   that way before it is clicked rather than only in the confirm. */
-.button.danger { border-color: var(--danger); color: var(--danger); }
-.button.danger:hover:not(:disabled) { background: var(--danger-soft); }
+.seat-bar strong { font-size: 12.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.seat-bar .muted { font-size: 11.5px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.seat-bar-actions { display: flex; align-items: center; gap: 2px; }
+/* Divider rather than a gap: it separates the two icon actions from the
+   count they act on without spending width on emptiness. */
+.seat-bar-actions::before {
+  content: "";
+  width: 1px;
+  height: 18px;
+  margin: 0 4px;
+  background: var(--border);
+}
+.seat-bar .button.ghost { height: 26px; padding: 0 10px; border-radius: 999px; }
 
 
 @media (max-width: 820px) {

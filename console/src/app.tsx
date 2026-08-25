@@ -897,12 +897,22 @@ function ProviderAccounts(props: {
         <div class="seat-filters">
           <div class="search-field">
             <Search size={14} aria-hidden="true" />
+            {/* `type="search"` and `autocomplete="off"` together are what
+                keep the browser from offering the operator's own saved
+                addresses here — Chrome reads a field as an address field
+                from its surroundings, and a box that mentioned "email"
+                got a dropdown of the reader's contact details over the
+                table they were trying to read. The placeholder names what
+                it matches without using the word. */}
             <input
               data-filter
+              type="search"
+              autocomplete="off"
+              spellcheck={false}
               value={search()}
               placeholder={provider().subscription
-                ? "Search accounts — email, seat name, domain (press /)"
-                : "Search keys — name, domain (press /)"}
+                ? "Search accounts, seats or domains (press /)"
+                : "Search keys or domains (press /)"}
               aria-label="Search accounts"
               onInput={(e) => setSearch(e.currentTarget.value)}
             />
@@ -1006,20 +1016,33 @@ function ProviderAccounts(props: {
       <div class="seat-bar" role="group" aria-label="Actions for the selected accounts">
         <strong>{selected().length} selected</strong>
         <Show when={progress()}><span class="muted">{progress()}</span></Show>
+        {/* Icons, not words. The two verbs are ordinary table actions and
+            already have this exact icon on every row, so the pill stays
+            narrow enough to float. Each carries the count in its label,
+            because an icon-only control that destroys twelve things has
+            to say twelve somewhere a screen reader will reach — and
+            removal still asks before it does anything. */}
         <div class="seat-bar-actions">
-          <button class="button outline" disabled={Boolean(busy())} onClick={() => void checkSelected()}>
-            <Show when={busy() === "check"} fallback={<Stethoscope size={14} />}><RefreshCw size={14} class="spin" /></Show>
-            {busy() === "check" ? "Checking…" : "Check health"}
+          <button
+            class="icon-button"
+            disabled={Boolean(busy())}
+            title={`Check the health of ${selected().length} selected`}
+            aria-label={`Check the health of ${selected().length} selected accounts`}
+            onClick={() => void checkSelected()}
+          >
+            <Show when={busy() === "check"} fallback={<Stethoscope size={15} />}><RefreshCw size={15} class="spin" /></Show>
           </button>
-          <button class="button danger" disabled={Boolean(busy())} onClick={() => void removeSelected()}>
-            <Trash2 size={14} />
-            {/* Not just "Remove": the drawer header carries a Remove that
-                deletes the whole provider, and two identical verbs one
-                dialog apart is how the wrong one gets clicked. */}
-            {busy() === "remove" ? "Removing…" : "Remove selected"}
+          <button
+            class="icon-button danger"
+            disabled={Boolean(busy())}
+            title={`Remove ${selected().length} selected`}
+            aria-label={`Remove ${selected().length} selected accounts`}
+            onClick={() => void removeSelected()}
+          >
+            <Show when={busy() === "remove"} fallback={<Trash2 size={15} />}><RefreshCw size={15} class="spin" /></Show>
           </button>
-          <button class="button ghost" disabled={Boolean(busy())} onClick={() => setPicked([])}>Clear</button>
         </div>
+        <button class="button ghost" disabled={Boolean(busy())} onClick={() => setPicked([])}>Clear</button>
       </div>
     </Show>
   </div>;
