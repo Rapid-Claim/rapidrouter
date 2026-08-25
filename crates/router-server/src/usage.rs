@@ -9,6 +9,8 @@
 //! flush interval, the documented cost of "no database."
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
+
+use crate::histogram::LatencyHistogram;
 use std::io::Write as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -549,6 +551,18 @@ struct MinuteSlot {
 
 pub struct Aggregator {
     slots: Vec<Mutex<MinuteSlot>>,
+    /// The earliest minute this aggregator can speak for.
+    ///
+    /// Needed to tell "no traffic in that window" from "this process was
+    /// not running then" — an empty slot looks identical either way, and
+    /// answering the second with the first is how a restarted gateway
+    /// would draw a flat zero across the morning and call it a chart.
+    ///
+    /// Starts at the minute it was built, since from then on it was
+    /// watching and an empty slot really does mean no traffic. Lowered
+    /// by any record older than that, which is how a backfilled or
+    /// out-of-order record widens what it can answer for.
+    since_minute: AtomicU64,
 }
 
 impl Aggregator {
@@ -557,11 +571,61 @@ impl Aggregator {
             slots: (0..MINUTES)
                 .map(|_| Mutex::new(MinuteSlot::default()))
                 .collect(),
+            since_minute: AtomicU64::new(vkey::unix_now_ms() / 60_000),
         }
+    }
+
+    /// The earliest minute this can answer for.
+    ///
+    /// Bounded below by when it started *and* by the ring's length: a
+    /// process up for a week still only holds the last day.
+    fn floor_minute(&self, now_ms: u64) -> Option<u64> {
+        let first = self.since_minute.load(Ordering::Relaxed);
+        Some(first.max((now_ms / 60_000).saturating_sub(MINUTES as u64 - 1)))
+    }
+
+    /// Per-minute totals for a window, re-bucketed and filtered.
+    ///
+    /// The only source with sub-hour resolution. Rollups are hourly by
+    /// design — that is what makes a year affordable — so a chart of the
+    /// last hour has to come from here or from raw records, and this
+    /// costs a walk over sixty small maps.
+    fn series(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+        bucket_secs: u64,
+        filter: &HistoryFilter,
+    ) -> Vec<UsageBucket> {
+        let mut out: BTreeMap<u64, UsageBucket> = BTreeMap::new();
+        let bucket_secs = bucket_secs.max(60);
+        for minute in (since_ms / 60_000)..=(until_ms / 60_000) {
+            let slot = self.slots[(minute as usize) % MINUTES].lock().unwrap();
+            if slot.minute != minute {
+                continue;
+            }
+            for (key, cell) in &slot.cells {
+                if !filter.matches_dims(&key.provider, &key.model, key.vkey.as_deref()) {
+                    continue;
+                }
+                let bucket = (minute * 60 / bucket_secs) * bucket_secs;
+                let point = out.entry(bucket).or_insert(UsageBucket {
+                    ts: bucket,
+                    ..Default::default()
+                });
+                point.requests += cell.requests;
+                point.failed += cell.errors;
+                point.input_tokens += cell.input_tokens;
+                point.output_tokens += cell.output_tokens;
+                point.cost_micro_usd += cell.cost_micro_usd;
+            }
+        }
+        out.into_values().collect()
     }
 
     fn record(&self, rec: &UsageRecord) {
         let minute = rec.ts / 60_000;
+        self.since_minute.fetch_min(minute, Ordering::Relaxed);
         let mut slot = self.slots[(minute as usize) % MINUTES].lock().unwrap();
         if slot.minute != minute {
             slot.minute = minute;
@@ -673,6 +737,43 @@ impl Aggregator {
 /// Recent-request ring for the console's Requests page (metadata only).
 const RECENT_CAP: usize = 1000;
 
+/// How many requests' bodies are kept in memory for the drawer.
+///
+/// Matched to the metadata ring above, because they answer the same
+/// question: a row the operator can see is a row they may click. Past
+/// that the index takes over, which is one file read rather than none.
+const HOT_BODIES_CAP: usize = RECENT_CAP;
+
+/// The bodies of the most recent requests, evicted oldest-first.
+///
+/// Bounded by *count* rather than bytes, and safe to be: each body is
+/// already capped at `body_limit_bytes` (256 KiB by default) before it
+/// reaches here, so the ceiling is that times the cap.
+#[derive(Default)]
+struct HotBodies {
+    by_id: HashMap<String, RequestBodies>,
+    order: VecDeque<String>,
+}
+
+impl HotBodies {
+    fn get(&self, request_id: &str) -> Option<&RequestBodies> {
+        self.by_id.get(request_id)
+    }
+
+    fn insert(&mut self, bodies: RequestBodies) {
+        if self.by_id.contains_key(&bodies.request_id) {
+            return;
+        }
+        while self.order.len() >= HOT_BODIES_CAP {
+            if let Some(oldest) = self.order.pop_front() {
+                self.by_id.remove(&oldest);
+            }
+        }
+        self.order.push_back(bodies.request_id.clone());
+        self.by_id.insert(bodies.request_id.clone(), bodies);
+    }
+}
+
 pub struct UsagePipeline {
     /// Where the flusher writes, so history can be read back. `None` when
     /// there is no data dir and aggregation is in-memory only.
@@ -686,6 +787,12 @@ pub struct UsagePipeline {
     /// Other nodes' rollup rows, refreshed by the shipper. Empty on a
     /// single-node gateway, which is why history works without a store.
     fleet: Mutex<Vec<RollupRow>>,
+    /// Hourly rollups for the partitions still being written to, so the
+    /// charts never have to open today's thousands of delta files.
+    recent_rollups: Arc<Mutex<RecentRollups>>,
+    /// The most recently captured bodies, so opening a request from the
+    /// live log tail touches no disk at all.
+    hot_bodies: Mutex<HotBodies>,
     body_tx: Mutex<Option<mpsc::SyncSender<RequestBodies>>>,
     capture: BodyCapture,
     body_limit: usize,
@@ -698,6 +805,8 @@ impl UsagePipeline {
     pub fn start(data_dir: Option<PathBuf>, cfg: &UsageConfig, node_id: &str) -> Arc<Self> {
         let history_dir = data_dir.clone();
         let mut body_tx = None;
+        let recent_rollups: Arc<Mutex<RecentRollups>> = Arc::default();
+        let flusher_recent = recent_rollups.clone();
         let tx = data_dir.map(|dir| {
             let (tx, rx) = mpsc::sync_channel::<UsageRecord>(8192);
             // A shallower queue than the metadata one: bodies are large,
@@ -706,23 +815,16 @@ impl UsagePipeline {
             // cost money accounting.
             let (btx, brx) = mpsc::sync_channel::<RequestBodies>(1024);
             body_tx = Some(btx);
-            let flush_interval = cfg.flush_interval;
-            let retention_days = cfg.retention_days;
-            let body_retention_days = cfg.body_retention_days;
-            let node = node_id.to_owned();
+            let settings = FlushSettings {
+                dir,
+                node: node_id.to_owned(),
+                interval: cfg.flush_interval,
+                retention_days: cfg.retention_days,
+                body_retention_days: cfg.body_retention_days,
+            };
             std::thread::Builder::new()
                 .name("rapid-usage-flush".into())
-                .spawn(move || {
-                    flusher(
-                        dir,
-                        rx,
-                        brx,
-                        flush_interval,
-                        retention_days,
-                        body_retention_days,
-                        node,
-                    )
-                })
+                .spawn(move || flusher(settings, rx, brx, flusher_recent))
                 .expect("spawn usage flusher");
             tx
         });
@@ -735,6 +837,8 @@ impl UsagePipeline {
             agg: Aggregator::new(),
             recent: Mutex::new(VecDeque::with_capacity(RECENT_CAP)),
             fleet: Mutex::new(Vec::new()),
+            recent_rollups,
+            hot_bodies: Mutex::new(HotBodies::default()),
             dropped: AtomicU64::new(0),
             per_key_metrics: cfg.per_key_metrics,
             key_label_cap: 100,
@@ -761,54 +865,74 @@ impl UsagePipeline {
         if !self.capture.wants(status) {
             return;
         }
+        let (input, cut_in) = cap_body(input, self.body_limit);
+        let (output, cut_out) = cap_body(output, self.body_limit);
+        let bodies = RequestBodies {
+            request_id: request_id.to_owned(),
+            ts,
+            input,
+            output,
+            truncated: cut_in || cut_out,
+        };
+        // Held in memory first, and whether or not there is anywhere to
+        // write it. Readable immediately rather than a flush interval
+        // from now — ten seconds is exactly the window in which somebody
+        // watching a live log clicks the row that just appeared — and on
+        // a gateway with no data directory this is the only copy there
+        // will ever be, which is better than none.
+        if let Ok(mut hot) = self.hot_bodies.lock() {
+            hot.insert(bodies.clone());
+        }
         let Ok(guard) = self.body_tx.lock() else {
             return;
         };
         let Some(tx) = guard.as_ref() else {
             return;
         };
-        let (input, cut_in) = cap_body(input, self.body_limit);
-        let (output, cut_out) = cap_body(output, self.body_limit);
-        let _ = tx.try_send(RequestBodies {
-            request_id: request_id.to_owned(),
-            ts,
-            input,
-            output,
-            truncated: cut_in || cut_out,
-        });
+        let _ = tx.try_send(bodies);
     }
 
     /// The stored bodies for one request, if they were captured and are
     /// still inside their retention window.
+    ///
+    /// Three ways to answer, and the first two are the ones that matter,
+    /// because the question is nearly always about a request the
+    /// operator can see on screen right now:
+    ///
+    /// 1. **The hot cache**, holding the bodies most recently written.
+    ///    Anything visible in a live log tail is a memory read.
+    /// 2. **The day's index**, which says which file holds an id. One
+    ///    small read, then one file.
+    /// 3. **A scan of the day**, for partitions written before the index
+    ///    existed. This is what every lookup used to do: open every body
+    ///    file in the partition and decompress it looking for a
+    ///    substring — thousands of files and hundreds of megabytes to
+    ///    return one record, which is why the drawer took seconds to
+    ///    open.
     pub fn bodies_for(&self, request_id: &str, ts: u64) -> Option<RequestBodies> {
+        if let Ok(hot) = self.hot_bodies.lock()
+            && let Some(bodies) = hot.get(request_id)
+        {
+            return Some(bodies.clone());
+        }
         let dir = self
             .data_dir
             .as_ref()?
             .join("bodies")
             .join(day_partition(ts));
+        if let Some(file) = bodies_index_lookup(&dir, request_id)
+            && let Some(found) = scan_bodies_file(&dir.join(file), request_id)
+        {
+            return Some(found);
+        }
         let files = std::fs::read_dir(dir).ok()?;
         for file in files.flatten() {
             let path = file.path();
             if path.extension().and_then(|e| e.to_str()) != Some("zst") {
                 continue;
             }
-            let Ok(handle) = std::fs::File::open(&path) else {
-                continue;
-            };
-            let Ok(decoder) = zstd::Decoder::new(handle) else {
-                continue;
-            };
-            for line in
-                std::io::BufRead::lines(std::io::BufReader::new(decoder)).map_while(Result::ok)
-            {
-                if !line.contains(request_id) {
-                    continue;
-                }
-                if let Ok(bodies) = serde_json::from_str::<RequestBodies>(&line)
-                    && bodies.request_id == request_id
-                {
-                    return Some(bodies);
-                }
+            if let Some(found) = scan_bodies_file(&path, request_id) {
+                return Some(found);
             }
         }
         None
@@ -1124,7 +1248,7 @@ impl Drop for MeteredBody {
 // Disk: flusher thread, partitions, retention, boot-time scans
 // ---------------------------------------------------------------------------
 
-fn day_partition(ts_ms: u64) -> String {
+pub(crate) fn day_partition(ts_ms: u64) -> String {
     let days = ts_ms / 86_400_000;
     let (y, m, d) = civil(days as i64);
     format!("dt={y:04}-{m:02}-{d:02}")
@@ -1143,6 +1267,79 @@ fn civil(z: i64) -> (i64, u32, u32) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
+const DAY_MS: u64 = 86_400_000;
+
+/// Midnight on the oldest day this gateway has anything for.
+///
+/// Two directory listings, so a window that reaches back before the
+/// gateway existed costs two syscalls rather than a step per day of the
+/// interval. `None` when there is nothing on disk at all.
+fn earliest_partition_ms(data_dir: &std::path::Path) -> Option<u64> {
+    let mut oldest: Option<String> = None;
+    for kind in ["rollup", "usage"] {
+        let Ok(entries) = std::fs::read_dir(data_dir.join(kind)) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if !name.starts_with("dt=") {
+                continue;
+            }
+            if oldest.as_ref().is_none_or(|current| &name < current) {
+                oldest = Some(name);
+            }
+        }
+    }
+    day_start_ms(&oldest?)
+}
+
+/// `dt=YYYY-MM-DD` back to midnight, unix milliseconds.
+///
+/// The inverse of [`day_partition`], by search rather than by arithmetic:
+/// the forward direction is already written and correct about leap
+/// years, and a binary search over 65,536 days costs sixteen calls to it.
+fn day_start_ms(day: &str) -> Option<u64> {
+    if !day.starts_with("dt=") {
+        return None;
+    }
+    let (mut low, mut high) = (0u64, 65_536u64);
+    while low < high {
+        let mid = (low + high) / 2;
+        if day_partition(mid * DAY_MS).as_str() < day {
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    (day_partition(low * DAY_MS) == day).then_some(low * DAY_MS)
+}
+
+/// Midnight on the first of the month containing `ts_ms`.
+fn month_start_ms(ts_ms: u64) -> u64 {
+    let day = ts_ms / DAY_MS;
+    let (_, _, d) = civil(day as i64);
+    (day - u64::from(d - 1)) * DAY_MS
+}
+
+/// Midnight on the first of the *following* month — the exclusive end,
+/// so month spans tile without overlapping.
+///
+/// Walked a day at a time rather than computed. Calendar arithmetic that
+/// has to be right about February is worth thirty-one comparisons
+/// against zero file reads.
+fn month_end_ms(ts_ms: u64) -> u64 {
+    let start = month_start_ms(ts_ms);
+    let (year, month, _) = civil((start / DAY_MS) as i64);
+    let mut cursor = start + 28 * DAY_MS;
+    loop {
+        let (y, m, _) = civil((cursor / DAY_MS) as i64);
+        if (y, m) != (year, month) {
+            return cursor - (cursor % DAY_MS);
+        }
+        cursor += DAY_MS;
+    }
+}
+
 /// One hour of traffic for one (provider, model, key) combination.
 ///
 /// A fact row at hour granularity with every dimension present, rather
@@ -1155,7 +1352,7 @@ fn civil(z: i64) -> (i64, u32, u32) {
 /// The row count is bounded by combinations actually served, not by
 /// traffic: a million requests an hour across twenty models and fifty
 /// keys is at most a thousand rows, and in practice far fewer.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RollupRow {
     /// Start of the hour, unix milliseconds.
     pub hour_ms: u64,
@@ -1172,12 +1369,85 @@ pub struct RollupRow {
     /// Summed, not averaged: averages do not compose across rows, and
     /// the console divides by `requests` at read time.
     pub latency_ms_sum: u64,
+    /// Upstream calls made to serve these requests. Exceeds `requests`
+    /// when retries or failover ran, and the gap is the cost of
+    /// unhealthy seats — which is a thing an operator looks back on, so
+    /// it belongs in the aggregate and not only in the raw records.
+    #[serde(default)]
+    pub attempts: u64,
+    /// The latency distribution, so a window wider than the live tail
+    /// can still report a p95. `latency_ms_sum` stays for the mean and
+    /// for rows written before this existed.
+    #[serde(default, skip_serializing_if = "LatencyHistogram::is_empty")]
+    pub latency: LatencyHistogram,
+}
+
+impl RollupRow {
+    /// The key two rows must share to be foldable into one.
+    fn key(&self) -> (u64, String, String, Option<String>) {
+        (
+            self.hour_ms,
+            self.provider.clone(),
+            self.model.clone(),
+            self.vkey.clone(),
+        )
+    }
+
+    /// Fold another row for the same key into this one.
+    fn absorb(&mut self, other: &RollupRow) {
+        self.requests += other.requests;
+        self.failed += other.failed;
+        self.input_tokens += other.input_tokens;
+        self.output_tokens += other.output_tokens;
+        self.cached_tokens += other.cached_tokens;
+        self.cost_micro_usd += other.cost_micro_usd;
+        self.latency_ms_sum += other.latency_ms_sum;
+        self.attempts += other.attempts;
+        self.latency.merge(&other.latency);
+    }
+
+    fn empty(hour_ms: u64, provider: &str, model: &str, vkey: Option<&str>) -> Self {
+        Self {
+            hour_ms,
+            provider: provider.to_owned(),
+            model: model.to_owned(),
+            vkey: vkey.map(str::to_owned),
+            requests: 0,
+            failed: 0,
+            input_tokens: 0,
+            output_tokens: 0,
+            cached_tokens: 0,
+            cost_micro_usd: 0,
+            latency_ms_sum: 0,
+            attempts: 0,
+            latency: LatencyHistogram::default(),
+        }
+    }
+}
+
+/// Fold rows onto their keys, in a stable order.
+///
+/// The one operation compaction, the monthly tier and the summary
+/// endpoints all perform, written once. Rows are pure sums, so folding
+/// is associative and the order files are read in cannot change the
+/// answer.
+pub(crate) fn fold_rows(rows: impl IntoIterator<Item = RollupRow>) -> Vec<RollupRow> {
+    let mut merged: BTreeMap<(u64, String, String, Option<String>), RollupRow> = BTreeMap::new();
+    for row in rows {
+        match merged.entry(row.key()) {
+            std::collections::btree_map::Entry::Occupied(mut slot) => slot.get_mut().absorb(&row),
+            std::collections::btree_map::Entry::Vacant(slot) => {
+                slot.insert(row);
+            }
+        }
+    }
+    merged.into_values().collect()
 }
 
 const HOUR_MS: u64 = 3_600_000;
 
 /// Fold a batch of records into hour rows.
-fn roll_up(batch: &[UsageRecord]) -> Vec<RollupRow> {
+pub(crate) fn roll_up(batch: &[UsageRecord]) -> Vec<RollupRow> {
     let mut rows: BTreeMap<(u64, String, String, Option<String>), RollupRow> = BTreeMap::new();
     for rec in batch {
         let hour_ms = rec.ts - (rec.ts % HOUR_MS);
@@ -1187,18 +1457,8 @@ fn roll_up(batch: &[UsageRecord]) -> Vec<RollupRow> {
             rec.model.clone(),
             rec.vkey.clone(),
         );
-        let row = rows.entry(key).or_insert_with(|| RollupRow {
-            hour_ms,
-            provider: rec.provider.clone(),
-            model: rec.model.clone(),
-            vkey: rec.vkey.clone(),
-            requests: 0,
-            failed: 0,
-            input_tokens: 0,
-            output_tokens: 0,
-            cached_tokens: 0,
-            cost_micro_usd: 0,
-            latency_ms_sum: 0,
+        let row = rows.entry(key).or_insert_with(|| {
+            RollupRow::empty(hour_ms, &rec.provider, &rec.model, rec.vkey.as_deref())
         });
         row.requests += 1;
         if rec.status >= 400 {
@@ -1209,6 +1469,8 @@ fn roll_up(batch: &[UsageRecord]) -> Vec<RollupRow> {
         row.cached_tokens += rec.cached_tokens;
         row.cost_micro_usd += rec.cost_micro_usd;
         row.latency_ms_sum += rec.latency_ms;
+        row.attempts += u64::from(rec.attempts);
+        row.latency.record(rec.latency_ms);
     }
     rows.into_values().collect()
 }
@@ -1251,17 +1513,37 @@ fn write_rollups(
     Ok(())
 }
 
-fn flusher(
+/// Everything the flusher thread needs that is not a channel: where to
+/// write, under what name, and how long to keep it.
+struct FlushSettings {
     dir: PathBuf,
-    rx: mpsc::Receiver<UsageRecord>,
-    bodies_rx: mpsc::Receiver<RequestBodies>,
+    node: String,
     interval: Duration,
     retention_days: u32,
     body_retention_days: u32,
-    node: String,
+}
+
+fn flusher(
+    settings: FlushSettings,
+    rx: mpsc::Receiver<UsageRecord>,
+    bodies_rx: mpsc::Receiver<RequestBodies>,
+    recent: Arc<Mutex<RecentRollups>>,
 ) {
+    let FlushSettings {
+        dir,
+        node,
+        interval,
+        retention_days,
+        body_retention_days,
+    } = settings;
     let mut seq: u64 = 0;
-    let mut last_prune = std::time::Instant::now() - Duration::from_secs(3600);
+    // Far enough in the past that the first loop runs maintenance
+    // immediately: a gateway that has just restarted is exactly when the
+    // caches are most likely to be stale.
+    let mut last_maintenance = std::time::Instant::now() - MAINTENANCE_INTERVAL;
+    // What this process inherited on disk. Read once, here rather than in
+    // `start`, so booting is not delayed by it.
+    seed_recent_rollups(&dir, &recent);
     loop {
         // Block for the first record, then drain whatever accumulated
         // during the flush interval.
@@ -1284,7 +1566,14 @@ fn flusher(
             }
             // Rollups are written from the same batch, so the aggregate
             // can never drift from the records it summarises.
-            if let Err(err) = write_rollups(&dir, &node, seq, &roll_up(&batch)) {
+            let rows = roll_up(&batch);
+            // Kept before they are written, not after: a failed write
+            // costs durability, and serving the charts from memory
+            // anyway is strictly better than also losing the reading.
+            if let Ok(mut recent) = recent.lock() {
+                recent.absorb(&rows);
+            }
+            if let Err(err) = write_rollups(&dir, &node, seq, &rows) {
                 tracing::warn!(%err, "usage rollup failed; charts will fall back to a raw scan");
             }
             // Bodies ride the same beat but their own stream, so a log
@@ -1303,10 +1592,107 @@ fn flusher(
             }
             seq += 1;
         }
-        if last_prune.elapsed() > Duration::from_secs(3600) {
-            last_prune = std::time::Instant::now();
+        if last_maintenance.elapsed() >= MAINTENANCE_INTERVAL {
+            last_maintenance = std::time::Instant::now();
+            let now = vkey::unix_now_ms();
             prune(&dir, retention_days, body_retention_days);
+            // Built here, on the flusher's own thread, and never on a
+            // request: a console page load must be able to *find* a
+            // cache, never to pay for building one.
+            crate::rollup_cache::refresh(&dir, &day_partition(now), &month_partition(now));
+            if let Ok(mut recent) = recent.lock() {
+                recent.evict_before(now.saturating_sub(RECENT_ROLLUP_SPAN_MS));
+            }
         }
+    }
+}
+
+/// How often the flusher prunes retention and rebuilds the read caches.
+const MAINTENANCE_INTERVAL: Duration = Duration::from_secs(300);
+
+/// Read back the hours this process did not record itself.
+///
+/// A restart leaves today's rollups on disk and nothing in memory, so
+/// without this the first five minutes of every deploy would report a
+/// day that started when the process did. Two day partitions at most,
+/// and it happens once.
+fn seed_recent_rollups(dir: &std::path::Path, recent: &Mutex<RecentRollups>) {
+    let now = vkey::unix_now_ms();
+    let mut rows = Vec::new();
+    for back in 0..=1 {
+        let day = day_partition(now.saturating_sub(back * 86_400_000));
+        rows.extend(crate::rollup_cache::hourly_rows(dir, &day));
+    }
+    if let Ok(mut recent) = recent.lock() {
+        // Absorb rather than replace: the flusher may already have
+        // written a batch of its own while this was reading.
+        recent.absorb(&rows);
+        recent.evict_before(now.saturating_sub(RECENT_ROLLUP_SPAN_MS));
+        recent.seeded = true;
+    }
+}
+
+/// `ym=YYYY-MM` for a timestamp, matching the monthly cache partitions.
+fn month_partition(ts_ms: u64) -> String {
+    let day = day_partition(ts_ms);
+    format!("ym={}", &day.trim_start_matches("dt=")[..7])
+}
+
+/// Hourly rollup rows for the recent past, held in memory.
+///
+/// The tail the on-disk caches cannot cover. Today's partition is still
+/// being appended to, so it has no cache, and reading it means opening
+/// every delta written since midnight — up to 8,640 files, which is
+/// exactly the cost the caches exist to remove. The flusher already has
+/// these rows in hand as it writes them, so rather than reading them
+/// back it simply keeps them.
+///
+/// Bounded by hours, not by traffic: two days of hours times the
+/// provider/model/key combinations actually served. A gateway with a
+/// pathological number of distinct keys is bounded by the same
+/// cardinality cap the aggregator applies, since both are fed from the
+/// same records.
+#[derive(Default)]
+pub(crate) struct RecentRollups {
+    rows: BTreeMap<(u64, String, String, Option<String>), RollupRow>,
+    /// True once the flusher has read back whatever was on disk before
+    /// this process started. Until then these rows are only what *this*
+    /// process recorded, and a reader must not mistake that for the
+    /// whole of today.
+    seeded: bool,
+}
+
+/// How far back the in-memory tail reaches.
+///
+/// Two days, so "today" is covered however close to midnight the
+/// question is asked, and yesterday stays available for the window
+/// between midnight and the maintenance tick that caches it.
+const RECENT_ROLLUP_SPAN_MS: u64 = 2 * 86_400_000;
+
+impl RecentRollups {
+    fn absorb(&mut self, rows: &[RollupRow]) {
+        for row in rows {
+            match self.rows.entry(row.key()) {
+                std::collections::btree_map::Entry::Occupied(mut slot) => {
+                    slot.get_mut().absorb(row)
+                }
+                std::collections::btree_map::Entry::Vacant(slot) => {
+                    slot.insert(row.clone());
+                }
+            }
+        }
+    }
+
+    /// Drop hours that the on-disk caches now cover.
+    fn evict_before(&mut self, floor_ms: u64) {
+        self.rows.retain(|(hour_ms, ..), _| *hour_ms >= floor_ms);
+    }
+
+    /// The earliest hour these rows can answer for, or `None` when they
+    /// cannot be trusted as complete yet.
+    fn floor_ms(&self, now_ms: u64) -> Option<u64> {
+        self.seeded
+            .then(|| now_ms.saturating_sub(RECENT_ROLLUP_SPAN_MS))
     }
 }
 
@@ -1338,7 +1724,7 @@ impl HistoryFilter {
 }
 
 /// One day's totals, optionally split by a dimension.
-#[derive(Debug, Serialize, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Default)]
 pub struct DayBucket {
     pub day: String,
     pub requests: u64,
@@ -1368,6 +1754,8 @@ impl UsagePipeline {
             agg: Aggregator::new(),
             recent: Mutex::new(VecDeque::new()),
             fleet: Mutex::new(Vec::new()),
+            recent_rollups: Arc::default(),
+            hot_bodies: Mutex::new(HotBodies::default()),
             dropped: AtomicU64::new(0),
             per_key_metrics: false,
             key_label_cap: 0,
@@ -1512,6 +1900,121 @@ impl UsagePipeline {
         out
     }
 
+    /// Rollup rows covering a window, from the cheapest tier that still
+    /// has the resolution the caller needs.
+    ///
+    /// This is the whole point of the rollup work: read cost is
+    /// proportional to the window's *resolution*, never to the traffic
+    /// inside it. A year at daily resolution is about twelve files. A
+    /// week at hourly resolution is seven. Neither depends on whether the
+    /// gateway served a thousand requests or a billion.
+    ///
+    /// Three tiers, coarsest first:
+    ///
+    /// 1. **Memory** for hours the flusher is still writing, so today
+    ///    costs nothing at all.
+    /// 2. **A month cache** for whole calendar months inside the window,
+    ///    when day resolution is enough. Anything wider than about a
+    ///    month is bucketed by day by the time it reaches a chart, so
+    ///    hourly detail there would be twenty-four times the reading for
+    ///    none of the answer.
+    /// 3. **A day cache** otherwise, one file per day.
+    ///
+    /// Rows are included when their bucket *overlaps* the window, so the
+    /// edges are hour-aligned (or day-aligned, at month resolution)
+    /// rather than exact to the millisecond. That is the trade rollups
+    /// are: the raw path this replaces was exact but capped, and reported
+    /// a silent floor on any window with real traffic in it. An hour of
+    /// slop at each edge of a seven-day window is a better answer than a
+    /// confident number that stopped counting at two hundred thousand.
+    fn rollups_for_window(&self, since_ms: u64, until_ms: u64, hourly: bool) -> Vec<RollupRow> {
+        let Some(root) = self.data_dir.as_deref() else {
+            return Vec::new();
+        };
+        let now = vkey::unix_now_ms();
+        // Callers pass the window the operator selected, which can reach
+        // back further than anything was ever written — `0` and
+        // `u64::MAX` are both legal and both arrive in practice. The walk
+        // below is one step per day, so an unclamped window is not merely
+        // wasteful, it does not terminate in any useful time. Bound it by
+        // what exists.
+        let until_ms = until_ms.min(now);
+        let since_ms = since_ms.max(earliest_partition_ms(root).unwrap_or(now));
+        if since_ms > until_ms {
+            return Vec::new();
+        }
+        let mut rows = Vec::new();
+
+        // The in-memory tail first: it also tells the disk walk where to
+        // stop, so the two can never both count the same hour.
+        let memory_floor = {
+            let recent = self.recent_rollups.lock().ok();
+            let floor = recent.as_ref().and_then(|r| r.floor_ms(now));
+            if let (Some(recent), Some(floor)) = (recent, floor) {
+                rows.extend(
+                    recent
+                        .rows
+                        .values()
+                        .filter(|row| row.hour_ms >= floor.max(since_ms.saturating_sub(HOUR_MS)))
+                        .cloned(),
+                );
+            }
+            floor
+        };
+
+        // Where the memory tier takes over. Days at or after this are
+        // already in `rows` and must not be read from disk as well.
+        let disk_ceiling_ms = memory_floor.map(|ms| ms - (ms % DAY_MS));
+
+        let mut cursor = since_ms - (since_ms % DAY_MS);
+        while cursor <= until_ms {
+            if disk_ceiling_ms.is_some_and(|ceiling| cursor >= ceiling) {
+                break;
+            }
+            // A whole calendar month inside the window, at a resolution
+            // the month cache can serve: one file instead of thirty.
+            if !hourly && cursor == month_start_ms(cursor) {
+                let month_end = month_end_ms(cursor);
+                let fits = month_end <= until_ms.saturating_add(1)
+                    && disk_ceiling_ms.is_none_or(|ceiling| month_end <= ceiling);
+                if fits
+                    && let Some(monthly) =
+                        crate::rollup_cache::monthly_rows(root, &month_partition(cursor))
+                {
+                    rows.extend(monthly);
+                    cursor = month_end;
+                    continue;
+                }
+            }
+            rows.extend(crate::rollup_cache::hourly_rows(
+                root,
+                &day_partition(cursor),
+            ));
+            cursor += DAY_MS;
+        }
+
+        // Other nodes' rows for the same window. Additive, never
+        // duplicative: a row is written by exactly the node that served
+        // the traffic.
+        if let Ok(fleet) = self.fleet.lock() {
+            rows.extend(fleet.iter().cloned());
+        }
+
+        // Tiers arrive at different resolutions — memory and day caches
+        // in hours, month caches in days. Normalising before the window
+        // filter is what lets one rule admit all of them, and folding
+        // also merges the duplicate keys that three sources inevitably
+        // produce.
+        let width = if hourly { HOUR_MS } else { DAY_MS };
+        let mut rows = if hourly {
+            fold_rows(rows)
+        } else {
+            crate::rollup_cache::to_daily(rows)
+        };
+        rows.retain(|row| row.hour_ms <= until_ms && row.hour_ms.saturating_add(width) > since_ms);
+        rows
+    }
+
     /// Replace the cached view of what other nodes have recorded.
     pub fn set_fleet_rollups(&self, rows: Vec<RollupRow>) {
         if let Ok(mut fleet) = self.fleet.lock() {
@@ -1519,194 +2022,88 @@ impl UsagePipeline {
         }
     }
 
-    /// Daily series for the console, read from hourly rollups.
+    /// Daily series for the console, one grouping at a time.
     ///
-    /// Rollups are two orders of magnitude smaller than the records they
-    /// summarise — a week is thousands of rows rather than millions — so
-    /// this is a bounded read whatever the traffic. Days with no rollup
-    /// (written before rollups existed, or by an older node) fall back to
-    /// scanning the raw records for that day, so history never has a
-    /// hole; the fallback simply costs what it always did.
+    /// Kept because the admin API still exposes it; the console asks for
+    /// [`Self::history_all`] instead, which produces every grouping from
+    /// one read.
     pub fn history(
         &self,
         days: u32,
         by: &str,
         filter: &HistoryFilter,
     ) -> BTreeMap<String, Vec<DayBucket>> {
-        let Some(root) = self.data_dir.clone() else {
-            return BTreeMap::new();
-        };
-        let cutoff =
-            day_partition(vkey::unix_now_ms().saturating_sub(days.max(1) as u64 * 86_400_000));
-        let mut out: BTreeMap<String, BTreeMap<String, DayBucket>> = BTreeMap::new();
-
-        let rollup_days = partitions_since(&root.join("rollup"), &cutoff);
-        let mut covered: BTreeSet<String> = BTreeSet::new();
-        for (partition, path) in rollup_days {
-            let day = partition.trim_start_matches("dt=").to_owned();
-            covered.insert(day.clone());
-            for row in read_rollup_dir(&path) {
-                if !filter.matches_dims(&row.provider, &row.model, row.vkey.as_deref()) {
-                    continue;
-                }
-                let series = match by {
-                    "provider" => row.provider.clone(),
-                    "model" => row.model.clone(),
-                    "key" => row.vkey.clone().unwrap_or_else(|| "(none)".into()),
-                    _ => "total".to_owned(),
-                };
-                let bucket = out
-                    .entry(series)
-                    .or_default()
-                    .entry(day.clone())
-                    .or_insert_with(|| DayBucket {
-                        day: day.clone(),
-                        ..Default::default()
-                    });
-                bucket.requests += row.requests;
-                bucket.failed += row.failed;
-                bucket.input_tokens += row.input_tokens;
-                bucket.output_tokens += row.output_tokens;
-                bucket.cost_micro_usd += row.cost_micro_usd;
-            }
-        }
-
-        // Other nodes' rollups for the same window. Their days are
-        // additive, never duplicative: a row is written by exactly the
-        // node that served the traffic.
-        if let Ok(fleet) = self.fleet.lock() {
-            for row in fleet.iter() {
-                let day = day_partition(row.hour_ms);
-                let day = day.trim_start_matches("dt=").to_owned();
-                if day.as_str() < cutoff.trim_start_matches("dt=") {
-                    continue;
-                }
-                if !filter.matches_dims(&row.provider, &row.model, row.vkey.as_deref()) {
-                    continue;
-                }
-                let series = match by {
-                    "provider" => row.provider.clone(),
-                    "model" => row.model.clone(),
-                    "key" => row.vkey.clone().unwrap_or_else(|| "(none)".into()),
-                    _ => "total".to_owned(),
-                };
-                let bucket = out
-                    .entry(series)
-                    .or_default()
-                    .entry(day.clone())
-                    .or_insert_with(|| DayBucket {
-                        day: day.clone(),
-                        ..Default::default()
-                    });
-                bucket.requests += row.requests;
-                bucket.failed += row.failed;
-                bucket.input_tokens += row.input_tokens;
-                bucket.output_tokens += row.output_tokens;
-                bucket.cost_micro_usd += row.cost_micro_usd;
-            }
-        }
-
-        // Any day inside the window without a rollup is scanned raw.
-        let raw = self.history_from_records(days, by, filter, &covered);
-        for (series, buckets) in raw {
-            let entry = out.entry(series).or_default();
-            for bucket in buckets {
-                let day = bucket.day.clone();
-                let slot = entry.entry(day.clone()).or_insert_with(|| DayBucket {
-                    day,
-                    ..Default::default()
-                });
-                slot.requests += bucket.requests;
-                slot.failed += bucket.failed;
-                slot.input_tokens += bucket.input_tokens;
-                slot.output_tokens += bucket.output_tokens;
-                slot.cost_micro_usd += bucket.cost_micro_usd;
-            }
-        }
-
-        out.into_iter()
-            .map(|(series, days)| (series, days.into_values().collect()))
-            .collect()
+        self.history_all(days, filter)
+            .remove(by)
+            .unwrap_or_default()
     }
 
-    /// The original full scan, kept for days that predate rollups.
-    fn history_from_records(
+    /// Every grouping the console draws, from one walk of the rollups.
+    ///
+    /// The Usage and Cost pages each asked for three: by model, by key
+    /// and by provider. That was three identical reads of the same
+    /// window, thrown at the gateway together on every page load and
+    /// again every time traffic nudged the refresh. The rows carry all
+    /// three dimensions, so the split is arithmetic over rows already in
+    /// hand — the read is the expensive part, and it is the same read
+    /// for all of them.
+    ///
+    /// Returns `by` -> series -> days, where `by` is `""` (the total),
+    /// `"provider"`, `"model"` or `"key"`.
+    pub fn history_all(
         &self,
         days: u32,
-        by: &str,
         filter: &HistoryFilter,
-        skip_days: &BTreeSet<String>,
-    ) -> BTreeMap<String, Vec<DayBucket>> {
-        let mut out: BTreeMap<String, BTreeMap<String, DayBucket>> = BTreeMap::new();
-        let Some(dir) = self.data_dir.as_ref().map(|d| d.join("usage")) else {
+    ) -> BTreeMap<String, BTreeMap<String, Vec<DayBucket>>> {
+        if self.data_dir.is_none() {
             return BTreeMap::new();
-        };
-        let cutoff =
-            day_partition(vkey::unix_now_ms().saturating_sub(days.max(1) as u64 * 86_400_000));
-        let Ok(entries) = std::fs::read_dir(&dir) else {
-            return BTreeMap::new();
-        };
-        let mut days_found: Vec<_> = entries
-            .flatten()
-            .filter_map(|e| {
-                let name = e.file_name().to_string_lossy().into_owned();
-                // Lexicographic compare works for `dt=YYYY-MM-DD`.
-                (name.starts_with("dt=") && name.as_str() >= cutoff.as_str())
-                    .then(|| (name, e.path()))
-            })
-            .collect();
-        days_found.sort();
+        }
+        let now = vkey::unix_now_ms();
+        let since = now.saturating_sub(days.max(1) as u64 * DAY_MS);
+        let rows = self.rollups_for_window(since, now, false);
 
-        for (partition, path) in days_found {
-            let day = partition.trim_start_matches("dt=").to_owned();
-            if skip_days.contains(&day) {
+        let mut out: BTreeMap<String, BTreeMap<String, BTreeMap<String, DayBucket>>> =
+            BTreeMap::new();
+        for row in rows {
+            if !filter.matches_dims(&row.provider, &row.model, row.vkey.as_deref()) {
                 continue;
             }
-            let Ok(files) = std::fs::read_dir(&path) else {
-                continue;
-            };
-            for file in files.flatten() {
-                let Ok(handle) = std::fs::File::open(file.path()) else {
-                    continue;
-                };
-                let Ok(decoder) = zstd::Decoder::new(handle) else {
-                    continue;
-                };
-                for line in
-                    std::io::BufRead::lines(std::io::BufReader::new(decoder)).map_while(Result::ok)
-                {
-                    let Ok(rec) = serde_json::from_str::<UsageRecord>(&line) else {
-                        continue;
-                    };
-                    if !filter.matches(&rec) {
-                        continue;
-                    }
-                    let series = match by {
-                        "provider" => rec.provider.clone(),
-                        "model" => rec.model.clone(),
-                        "key" => rec.vkey.clone().unwrap_or_else(|| "(none)".into()),
-                        _ => "total".to_owned(),
-                    };
-                    let bucket = out
-                        .entry(series)
-                        .or_default()
-                        .entry(day.clone())
-                        .or_insert_with(|| DayBucket {
-                            day: day.clone(),
-                            ..Default::default()
-                        });
-                    bucket.requests += 1;
-                    if rec.status >= 400 {
-                        bucket.failed += 1;
-                    }
-                    bucket.input_tokens += rec.input_tokens;
-                    bucket.output_tokens += rec.output_tokens;
-                    bucket.cost_micro_usd += rec.cost_micro_usd;
-                }
+            let day = day_partition(row.hour_ms)
+                .trim_start_matches("dt=")
+                .to_owned();
+            for (by, series) in [
+                ("", "total".to_owned()),
+                ("provider", row.provider.clone()),
+                ("model", row.model.clone()),
+                ("key", row.vkey.clone().unwrap_or_else(|| "(none)".into())),
+            ] {
+                let bucket = out
+                    .entry(by.to_owned())
+                    .or_default()
+                    .entry(series)
+                    .or_default()
+                    .entry(day.clone())
+                    .or_insert_with(|| DayBucket {
+                        day: day.clone(),
+                        ..Default::default()
+                    });
+                bucket.requests += row.requests;
+                bucket.failed += row.failed;
+                bucket.input_tokens += row.input_tokens;
+                bucket.output_tokens += row.output_tokens;
+                bucket.cost_micro_usd += row.cost_micro_usd;
             }
         }
         out.into_iter()
-            .map(|(series, days)| (series, days.into_values().collect()))
+            .map(|(by, groupings)| {
+                (
+                    by,
+                    groupings
+                        .into_iter()
+                        .map(|(series, days)| (series, days.into_values().collect()))
+                        .collect(),
+                )
+            })
             .collect()
     }
 }
@@ -1746,6 +2143,11 @@ const SUMMARY_SCAN_CAP: usize = 200_000;
 
 impl UsagePipeline {
     /// Aggregate every matching record in the window.
+    ///
+    /// Rollups answer this whenever they can, for the same reason they
+    /// answer [`Self::usage_summary`]: this header is drawn on every
+    /// Logs page load and again on every refresh, and it used to walk up
+    /// to two hundred thousand records to produce eight numbers.
     pub fn summary(
         &self,
         since_ms: u64,
@@ -1753,6 +2155,26 @@ impl UsagePipeline {
         filter: &HistoryFilter,
         errors_only: bool,
     ) -> RequestsSummary {
+        if !errors_only && self.data_dir.is_some() {
+            let wide = self.usage_summary_from_rollups(
+                since_ms,
+                until_ms,
+                filter,
+                bucket_width_secs(until_ms.saturating_sub(since_ms)),
+            );
+            return RequestsSummary {
+                requests: wide.requests,
+                errors: wide.errors,
+                attempts: wide.attempts,
+                input_tokens: wide.input_tokens,
+                output_tokens: wide.output_tokens,
+                cached_tokens: wide.cached_tokens,
+                cost_micro_usd: wide.cost_micro_usd,
+                p50_latency_ms: wide.p50_latency_ms,
+                p95_latency_ms: wide.p95_latency_ms,
+                capped: false,
+            };
+        }
         let records = self.collect_page(
             SUMMARY_SCAN_CAP + 1,
             since_ms,
@@ -1869,6 +2291,13 @@ fn bucket_width_secs(span_ms: u64) -> u64 {
 
 impl UsagePipeline {
     /// Aggregate a window into totals, groupings and a trend series.
+    ///
+    /// Served from rollups whenever they can answer, which is every
+    /// default view the console opens with. The raw-record path below is
+    /// kept for the two cases rollups genuinely cannot cover: an
+    /// errors-only view (a rollup counts failures but does not carry
+    /// their tokens or their latency separately) and a gateway with no
+    /// data directory, where the in-memory ring is the entire history.
     pub fn usage_summary(
         &self,
         since_ms: u64,
@@ -1876,6 +2305,10 @@ impl UsagePipeline {
         filter: &HistoryFilter,
         errors_only: bool,
     ) -> UsageSummary {
+        let bucket_secs = bucket_width_secs(until_ms.saturating_sub(since_ms));
+        if !errors_only && self.data_dir.is_some() {
+            return self.usage_summary_from_rollups(since_ms, until_ms, filter, bucket_secs);
+        }
         let records = self.collect_page(
             SUMMARY_SCAN_CAP + 1,
             since_ms,
@@ -1884,7 +2317,6 @@ impl UsagePipeline {
             errors_only,
             None,
         );
-        let bucket_secs = bucket_width_secs(until_ms.saturating_sub(since_ms));
         // Two different ceilings, both of which make these figures a floor.
         // The scan cap is the obvious one. The other is subtler: with no
         // usage directory configured nothing is ever flushed, so the
@@ -1980,6 +2412,153 @@ impl UsagePipeline {
         out.series = series.into_values().collect();
         out
     }
+
+    /// The same summary, from rollup rows instead of raw records.
+    ///
+    /// Never capped: it reads the whole window rather than the first two
+    /// hundred thousand records in it, so the figures are the window's
+    /// and not a floor. The rows it reads are bounded by the window's
+    /// resolution, which is why that is affordable at all.
+    fn usage_summary_from_rollups(
+        &self,
+        since_ms: u64,
+        until_ms: u64,
+        filter: &HistoryFilter,
+        bucket_secs: u64,
+    ) -> UsageSummary {
+        // Hourly rows can be re-bucketed into anything an hour or wider;
+        // below that the window is short enough that a day's rows are
+        // already in memory, so hourly costs nothing either way.
+        let hourly = bucket_secs < 86_400;
+        let rows = self.rollups_for_window(since_ms, until_ms, hourly);
+
+        // Sub-hour buckets are the one thing rollups cannot draw — an
+        // hourly row is one point, and asking for fifteen-minute
+        // resolution from it yields a chart with a quarter of its points
+        // and three-quarters of them zero. The minute aggregate is the
+        // source with that resolution, and it spans exactly the day
+        // these windows fall inside.
+        //
+        // When it cannot cover the window — a process that restarted
+        // inside it — the series widens to hourly and says so through
+        // `bucket_secs`, so the chart labels itself for what it actually
+        // drew instead of implying detail it does not have.
+        let now = vkey::unix_now_ms();
+        let minute_series = (bucket_secs < HOUR_MS / 1000)
+            .then(|| self.agg.floor_minute(now))
+            .flatten()
+            .filter(|floor| since_ms / 60_000 >= *floor)
+            .map(|_| self.agg.series(since_ms, until_ms, bucket_secs, filter));
+
+        let mut out = UsageSummary {
+            bucket_secs: match &minute_series {
+                Some(_) => bucket_secs,
+                None => bucket_secs.max(HOUR_MS / 1000),
+            },
+            ..Default::default()
+        };
+        let mut latency = LatencyHistogram::default();
+        let mut latency_sum = 0u64;
+        let mut by_model: HashMap<String, UsageSlice> = HashMap::new();
+        let mut by_provider: HashMap<String, UsageSlice> = HashMap::new();
+        let mut by_key: HashMap<String, UsageSlice> = HashMap::new();
+        let mut series: BTreeMap<u64, UsageBucket> = BTreeMap::new();
+
+        for row in &rows {
+            if !filter.matches_dims(&row.provider, &row.model, row.vkey.as_deref()) {
+                continue;
+            }
+            out.requests += row.requests;
+            out.errors += row.failed;
+            out.attempts += row.attempts;
+            out.input_tokens += row.input_tokens;
+            out.output_tokens += row.output_tokens;
+            out.cached_tokens += row.cached_tokens;
+            out.cost_micro_usd += row.cost_micro_usd;
+            latency.merge(&row.latency);
+            latency_sum += row.latency_ms_sum;
+
+            // A request that never reached a provider has no model and
+            // no provider; it is still a request, and grouping it under
+            // an empty name would hide exactly the failures worth
+            // seeing.
+            let unset = "(none)";
+            let add = |map: &mut HashMap<String, UsageSlice>, name: &str| {
+                let slice = map.entry(name.to_owned()).or_insert_with(|| UsageSlice {
+                    name: name.to_owned(),
+                    ..Default::default()
+                });
+                slice.requests += row.requests;
+                slice.failed += row.failed;
+                slice.input_tokens += row.input_tokens;
+                slice.output_tokens += row.output_tokens;
+                slice.cost_micro_usd += row.cost_micro_usd;
+            };
+            add(
+                &mut by_model,
+                if row.model.is_empty() {
+                    unset
+                } else {
+                    &row.model
+                },
+            );
+            add(
+                &mut by_provider,
+                if row.provider.is_empty() {
+                    unset
+                } else {
+                    &row.provider
+                },
+            );
+            add(&mut by_key, row.vkey.as_deref().unwrap_or(unset));
+
+            // Skipped when the minute aggregate is drawing the series:
+            // the two would be the same traffic counted twice.
+            if minute_series.is_some() {
+                continue;
+            }
+            let bucket = (row.hour_ms / 1000 / out.bucket_secs) * out.bucket_secs;
+            let point = series.entry(bucket).or_insert(UsageBucket {
+                ts: bucket,
+                ..Default::default()
+            });
+            point.requests += row.requests;
+            point.failed += row.failed;
+            point.input_tokens += row.input_tokens;
+            point.output_tokens += row.output_tokens;
+            point.cost_micro_usd += row.cost_micro_usd;
+        }
+
+        // Rows written before histograms existed carry only a sum. The
+        // mean is the only percentile a sum can honestly supply, and
+        // saying "p50 = mean" is better than saying "p50 = 0" for a
+        // window whose older half predates the upgrade.
+        out.p50_latency_ms = if latency.is_empty() {
+            latency_sum.checked_div(out.requests).unwrap_or(0)
+        } else {
+            latency.percentile(50)
+        };
+        out.p95_latency_ms = if latency.is_empty() {
+            latency_sum.checked_div(out.requests).unwrap_or(0)
+        } else {
+            latency.percentile(95)
+        };
+
+        let ranked = |map: HashMap<String, UsageSlice>| {
+            let mut v: Vec<UsageSlice> = map.into_values().collect();
+            v.sort_by(|a, b| {
+                b.requests
+                    .cmp(&a.requests)
+                    .then_with(|| a.name.cmp(&b.name))
+            });
+            v
+        };
+        out.by_model = ranked(by_model);
+        out.by_provider = ranked(by_provider);
+        out.by_key = ranked(by_key);
+        out.series = minute_series.unwrap_or_else(|| series.into_values().collect());
+        out
+    }
 }
 
 /// A request's bodies, stored apart from its metadata.
@@ -2015,6 +2594,39 @@ fn cap_body(body: &str, limit: usize) -> (String, bool) {
 }
 
 /// Append bodies for a batch, partitioned by day beside the records.
+/// The per-day map from request id to the file holding its bodies.
+///
+/// Appended as each batch is written, so it costs one line per captured
+/// request and turns "open one request" from a walk of the whole day's
+/// partition into a single file read. Plain text rather than compressed:
+/// it is read far more often than it is written, and a lookup that has
+/// to decompress an index has not saved very much.
+const BODIES_INDEX: &str = "index.tsv";
+
+/// Which file in a day partition holds a request's bodies.
+fn bodies_index_lookup(day_dir: &std::path::Path, request_id: &str) -> Option<String> {
+    let text = std::fs::read_to_string(day_dir.join(BODIES_INDEX)).ok()?;
+    // Last match wins: a body written twice for one id (a retry that
+    // reused it) should resolve to the most recent.
+    text.lines()
+        .rev()
+        .find_map(|line| line.strip_prefix(request_id)?.strip_prefix('\t'))
+        .map(str::to_owned)
+}
+
+/// One body record out of one file, or `None` if it is not in there.
+fn scan_bodies_file(path: &std::path::Path, request_id: &str) -> Option<RequestBodies> {
+    let handle = std::fs::File::open(path).ok()?;
+    let decoder = zstd::Decoder::new(handle).ok()?;
+    std::io::BufRead::lines(std::io::BufReader::new(decoder))
+        .map_while(Result::ok)
+        // A cheap reject before paying for a full parse: bodies are
+        // large, and most lines in a file are not the one being sought.
+        .filter(|line| line.contains(request_id))
+        .filter_map(|line| serde_json::from_str::<RequestBodies>(&line).ok())
+        .find(|bodies| bodies.request_id == request_id)
+}
+
 fn write_bodies(
     dir: &std::path::Path,
     node: &str,
@@ -2028,7 +2640,22 @@ fn write_bodies(
     for (day, bodies) in by_day {
         let day_dir = dir.join("bodies").join(&day);
         std::fs::create_dir_all(&day_dir)?;
-        let path = day_dir.join(format!("{node}-{seq:08}.jsonl.zst"));
+        let name = format!("{node}-{seq:08}.jsonl.zst");
+        // The index is appended before the data. A crash between the two
+        // leaves an index entry pointing at a file that does not exist,
+        // which reads as "not found" and falls through to the scan — the
+        // safe failure. The other order would leave bodies that no
+        // lookup could find without one.
+        if let Ok(mut index) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(day_dir.join(BODIES_INDEX))
+        {
+            for body in &bodies {
+                let _ = writeln!(index, "{}\t{name}", body.request_id);
+            }
+        }
+        let path = day_dir.join(&name);
         let file = std::fs::File::create(&path)?;
         // Level 6 rather than the 3 used for metadata: bodies are the
         // bulk of what is stored and they are prose, which compresses
@@ -2208,29 +2835,6 @@ fn partitions_since(dir: &std::path::Path, cutoff: &str) -> Vec<(String, PathBuf
     found
 }
 
-/// Every rollup row in one day partition.
-fn read_rollup_dir(path: &std::path::Path) -> Vec<RollupRow> {
-    let Ok(files) = std::fs::read_dir(path) else {
-        return Vec::new();
-    };
-    let mut rows = Vec::new();
-    for file in files.flatten() {
-        let Ok(handle) = std::fs::File::open(file.path()) else {
-            continue;
-        };
-        let Ok(decoder) = zstd::Decoder::new(handle) else {
-            continue;
-        };
-        for line in std::io::BufRead::lines(std::io::BufReader::new(decoder)).map_while(Result::ok)
-        {
-            if let Ok(row) = serde_json::from_str::<RollupRow>(&line) {
-                rows.push(row);
-            }
-        }
-    }
-    rows
-}
-
 fn write_batch(
     dir: &std::path::Path,
     node: &str,
@@ -2268,10 +2872,14 @@ const ROLLUP_RETENTION_FACTOR: u32 = 4;
 fn prune(dir: &std::path::Path, retention_days: u32, body_retention_days: u32) {
     prune_partitions(&dir.join("usage"), retention_days, "usage");
     prune_partitions(&dir.join("bodies"), body_retention_days, "bodies");
-    prune_partitions(
-        &dir.join("rollup"),
-        retention_days.saturating_mul(ROLLUP_RETENTION_FACTOR),
-        "rollup",
+    let rollup_days = retention_days.saturating_mul(ROLLUP_RETENTION_FACTOR);
+    prune_partitions(&dir.join("rollup"), rollup_days, "rollup");
+    // The read caches are derived from those partitions, so they go when
+    // their sources do — a cache for a day that no longer exists can
+    // never be validated again, and would sit there forever.
+    crate::rollup_cache::prune(
+        dir,
+        &day_partition(vkey::unix_now_ms().saturating_sub(rollup_days as u64 * DAY_MS)),
     );
 }
 
@@ -2383,6 +2991,19 @@ pub fn write_rollups_for_test(dir: &std::path::Path, node: &str, seq: u64, batch
     write_rollups(dir, node, seq, &roll_up(batch)).expect("test corpus writes");
 }
 
+/// Rollup rows with no records behind them, for exercising volumes it
+/// would be silly to materialise a record apiece for.
+#[doc(hidden)]
+#[cfg(test)]
+pub(crate) fn write_rollup_rows_for_test(
+    dir: &std::path::Path,
+    node: &str,
+    seq: u64,
+    rows: &[RollupRow],
+) {
+    write_rollups(dir, node, seq, rows).expect("test corpus writes");
+}
+
 #[cfg(test)]
 mod usage_summary_tests {
     use super::*;
@@ -2434,6 +3055,219 @@ mod usage_summary_tests {
         assert_eq!(summary.input_tokens, 25_000);
         assert_eq!(summary.output_tokens, 12_500);
         assert!(!summary.capped);
+    }
+
+    /// The rollup path and the raw-record path must not disagree.
+    ///
+    /// They are read from the same batches by construction, so this is
+    /// less a test of arithmetic than of the plumbing between them:
+    /// which tier answered, whether the window filter admitted the same
+    /// hours, whether a dimension got lost on the way through a rollup.
+    #[test]
+    fn rollups_and_raw_records_report_the_same_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        let records: Vec<UsageRecord> = (0..3_000)
+            .map(|i| {
+                let mut rec = record(i, if i % 3 == 0 { "gpt-4o" } else { "o3" }, 200);
+                if i % 7 == 0 {
+                    rec.status = 500;
+                }
+                rec
+            })
+            .collect();
+        for (batch, chunk) in records.chunks(400).enumerate() {
+            write_batch_for_test(dir.path(), "node-a", batch as u64, chunk);
+            write_rollups_for_test(dir.path(), "node-a", batch as u64, chunk);
+        }
+        let since = records.first().expect("records").ts;
+        let until = records.last().expect("records").ts;
+
+        let rollup = pipeline.usage_summary(since, until, &HistoryFilter::default(), false);
+        // `errors_only` is the one view rollups cannot serve, so it is
+        // also the way to reach the raw path for a comparison.
+        let raw = {
+            let mut summary = UsageSummary::default();
+            for rec in &records {
+                summary.requests += 1;
+                summary.errors += u64::from(rec.status >= 400);
+                summary.input_tokens += rec.input_tokens;
+                summary.output_tokens += rec.output_tokens;
+                summary.cost_micro_usd += rec.cost_micro_usd;
+                summary.attempts += u64::from(rec.attempts);
+            }
+            summary
+        };
+
+        assert_eq!(rollup.requests, raw.requests);
+        assert_eq!(rollup.errors, raw.errors);
+        assert_eq!(rollup.attempts, raw.attempts);
+        assert_eq!(rollup.input_tokens, raw.input_tokens);
+        assert_eq!(rollup.output_tokens, raw.output_tokens);
+        assert_eq!(rollup.cost_micro_usd, raw.cost_micro_usd);
+        assert!(
+            !rollup.capped,
+            "a rollup read covers the window, never a floor"
+        );
+        assert_eq!(rollup.by_model.len(), 2);
+    }
+
+    /// The scan cap was the thing that made a wide window a lie. Past it,
+    /// the old path silently stopped counting; the rollup path has no
+    /// such ceiling because it never touches a record.
+    #[test]
+    fn a_window_past_the_scan_cap_is_still_exact() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        // Rollup rows only — the point is that the record count is
+        // irrelevant to what this costs and what it reports.
+        let mut rows = Vec::new();
+        for hour in 0..24u64 {
+            rows.push(RollupRow {
+                requests: 500_000,
+                ..RollupRow::empty(
+                    (1_700_000_000_000 / HOUR_MS + hour) * HOUR_MS,
+                    "mock",
+                    "gpt-4o",
+                    None,
+                )
+            });
+        }
+        write_rollup_rows_for_test(dir.path(), "node-a", 0, &rows);
+
+        let start = rows.first().expect("rows").hour_ms;
+        let end = rows.last().expect("rows").hour_ms + HOUR_MS;
+        let summary = pipeline.usage_summary(start, end, &HistoryFilter::default(), false);
+        assert_eq!(summary.requests, 12_000_000);
+        assert!(!summary.capped);
+    }
+
+    /// Percentiles have to survive the trip through a rollup, or the
+    /// Logs header silently reports zero for every window wider than the
+    /// live tail.
+    #[test]
+    fn latency_percentiles_survive_the_rollup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        let records: Vec<UsageRecord> = (1..=1_000)
+            .map(|i| {
+                let mut rec = record(i, "gpt-4o", 200);
+                rec.latency_ms = i;
+                rec
+            })
+            .collect();
+        write_rollups_for_test(dir.path(), "node-a", 0, &records);
+
+        let since = records.first().expect("records").ts;
+        let until = records.last().expect("records").ts;
+        let summary = pipeline.summary(since, until, &HistoryFilter::default(), false);
+        // True p50 is 500 and p95 is 950; buckets report the upper bound,
+        // so never under and never more than a bucket over.
+        assert!((500..=600).contains(&summary.p50_latency_ms), "{summary:?}");
+        assert!(
+            (950..=1140).contains(&summary.p95_latency_ms),
+            "{summary:?}"
+        );
+    }
+
+    /// Every grouping from one read has to equal the groupings from
+    /// three, or the console shows different numbers than the API does.
+    #[test]
+    fn one_history_read_matches_the_three_it_replaced() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        let now = vkey::unix_now_ms();
+        let records: Vec<UsageRecord> = (0..500)
+            .map(|i| {
+                let mut rec = record(i, if i % 2 == 0 { "gpt-4o" } else { "o3" }, 200);
+                rec.ts = now - (i % 5) * DAY_MS - HOUR_MS;
+                rec
+            })
+            .collect();
+        write_rollups_for_test(dir.path(), "node-a", 0, &records);
+
+        let all = pipeline.history_all(30, &HistoryFilter::default());
+        for by in ["", "provider", "model", "key"] {
+            let one = pipeline.history(30, by, &HistoryFilter::default());
+            let from_all = all.get(by).cloned().unwrap_or_default();
+            assert_eq!(one, from_all, "grouping {by:?} disagreed");
+        }
+        let total: u64 = all["model"]
+            .values()
+            .flatten()
+            .map(|bucket| bucket.requests)
+            .sum();
+        assert_eq!(total, 500);
+    }
+
+    /// A short window has to keep its short buckets.
+    ///
+    /// Rollups are hourly, so serving the "Last hour" chart from them
+    /// alone would draw a single point and call it a trend. The minute
+    /// aggregate supplies the resolution; the rollups still supply the
+    /// totals.
+    #[test]
+    fn a_sub_hour_window_charts_at_sub_hour_resolution() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        let now = vkey::unix_now_ms();
+        // An hour of traffic, one request a minute.
+        let records: Vec<UsageRecord> = (0..=60)
+            .map(|i| {
+                let mut rec = record(i, "gpt-4o", 200);
+                rec.ts = now - (60 - i) * 60_000;
+                rec
+            })
+            .collect();
+        for rec in &records {
+            pipeline.record(rec.clone());
+        }
+        write_rollups_for_test(dir.path(), "node-a", 0, &records);
+
+        let summary =
+            pipeline.usage_summary(now - 3_600_000, now, &HistoryFilter::default(), false);
+        assert_eq!(summary.requests, 61, "totals still come from the rollups");
+        assert!(
+            summary.bucket_secs < 3600,
+            "an hour-wide window must not be charted in one-hour buckets",
+        );
+        assert!(
+            summary.series.len() > 1,
+            "a trend needs more than one point: {:?}",
+            summary.series,
+        );
+        let charted: u64 = summary.series.iter().map(|b| b.requests).sum();
+        assert_eq!(charted, 61, "the series and the totals must agree");
+    }
+
+    /// The aggregate is per process, so a window reaching back before
+    /// this one started cannot be charted at minute resolution. Widening
+    /// the buckets is the honest answer; drawing zeros is not.
+    #[test]
+    fn a_window_older_than_the_process_widens_its_buckets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        let now = vkey::unix_now_ms();
+        let records: Vec<UsageRecord> = (0..60)
+            .map(|i| {
+                let mut rec = record(i, "gpt-4o", 200);
+                rec.ts = now - (59 - i) * 60_000;
+                rec
+            })
+            .collect();
+        // Flushed, but never recorded through this process's aggregate —
+        // which is what a restart looks like.
+        write_rollups_for_test(dir.path(), "node-a", 0, &records);
+
+        let summary =
+            pipeline.usage_summary(now - 3_600_000, now, &HistoryFilter::default(), false);
+        assert_eq!(summary.requests, 60);
+        assert_eq!(
+            summary.bucket_secs, 3600,
+            "buckets widen to what is readable"
+        );
+        let charted: u64 = summary.series.iter().map(|b| b.requests).sum();
+        assert_eq!(charted, 60, "widening must not lose traffic");
     }
 
     /// The other ceiling: with nothing flushed, the ring is the whole
@@ -2668,6 +3502,101 @@ mod tests {
         }
     }
 
+    /// Opening a request must find its bodies by whichever route is
+    /// available, and the three must agree about what they found.
+    ///
+    /// The scan is what every lookup used to do — open every file in the
+    /// day partition and decompress it looking for a substring. It is
+    /// kept because partitions written before the index exists still
+    /// need answering, and it is tested because it is now the path least
+    /// likely to be exercised in anger.
+    #[test]
+    fn a_request_body_is_found_by_index_and_by_scan_alike() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let now = vkey::unix_now_ms();
+        let day_dir = dir.path().join("bodies").join(day_partition(now));
+
+        let wanted = RequestBodies {
+            request_id: "req-target".into(),
+            ts: now,
+            input: "{\"messages\":[{\"role\":\"user\",\"content\":\"hello\"}]}".into(),
+            output: "{\"choices\":[{\"message\":{\"content\":\"hi\"}}]}".into(),
+            truncated: false,
+        };
+        // Spread across batches, so a lookup that guessed the file would
+        // have to be right about which one.
+        for seq in 0..8u64 {
+            let mut batch: Vec<RequestBodies> = (0..4)
+                .map(|i| RequestBodies {
+                    request_id: format!("req-{seq}-{i}"),
+                    ts: now,
+                    input: "{}".into(),
+                    output: "{}".into(),
+                    truncated: false,
+                })
+                .collect();
+            if seq == 5 {
+                batch.push(wanted.clone());
+            }
+            write_bodies(dir.path(), "node-a", seq, &batch).expect("bodies write");
+        }
+
+        let pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        let by_index = pipeline
+            .bodies_for("req-target", now)
+            .expect("found via the index");
+        assert_eq!(by_index.input, wanted.input);
+        assert_eq!(by_index.output, wanted.output);
+        assert!(bodies_index_lookup(&day_dir, "req-target").is_some());
+
+        // A partition that predates the index: same answer, slower.
+        std::fs::remove_file(day_dir.join(BODIES_INDEX)).expect("drop the index");
+        let by_scan = pipeline
+            .bodies_for("req-target", now)
+            .expect("found via the scan");
+        assert_eq!(by_scan.input, wanted.input);
+        assert!(pipeline.bodies_for("req-absent", now).is_none());
+    }
+
+    /// A request that has only just been served is the one most likely
+    /// to be clicked, and it has not been flushed yet.
+    #[test]
+    fn a_just_served_request_is_readable_before_it_reaches_disk() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut pipeline = UsagePipeline::for_test(Some(dir.path().to_path_buf()));
+        pipeline.capture = router_core::config::BodyCapture::All;
+        pipeline.body_limit = 4096;
+        let now = vkey::unix_now_ms();
+
+        pipeline.record_bodies("req-live", now, 200, "{\"in\":1}", "{\"out\":2}");
+        let found = pipeline
+            .bodies_for("req-live", now)
+            .expect("readable straight away");
+        assert_eq!(found.input, "{\"in\":1}");
+        assert_eq!(found.output, "{\"out\":2}");
+        // Nothing was written: the flusher never ran.
+        assert!(!dir.path().join("bodies").exists());
+    }
+
+    /// The hot cache is bounded, so a long session of scrolling the log
+    /// cannot grow it without limit.
+    #[test]
+    fn the_hot_body_cache_evicts_oldest_first() {
+        let mut hot = HotBodies::default();
+        for i in 0..HOT_BODIES_CAP + 10 {
+            hot.insert(RequestBodies {
+                request_id: format!("req-{i}"),
+                ts: 0,
+                input: String::new(),
+                output: String::new(),
+                truncated: false,
+            });
+        }
+        assert_eq!(hot.by_id.len(), HOT_BODIES_CAP);
+        assert!(hot.get("req-0").is_none(), "the oldest should be gone");
+        assert!(hot.get(&format!("req-{}", HOT_BODIES_CAP + 9)).is_some());
+    }
+
     /// The rollup must answer exactly what a full scan of the same
     /// records would, for every grouping and filter the console offers.
     ///
@@ -2749,6 +3678,8 @@ mod tests {
             agg: Aggregator::new(),
             recent: Mutex::new(VecDeque::new()),
             fleet: Mutex::new(Vec::new()),
+            recent_rollups: Arc::default(),
+            hot_bodies: Mutex::new(HotBodies::default()),
             dropped: AtomicU64::new(0),
             per_key_metrics: false,
             key_label_cap: 0,

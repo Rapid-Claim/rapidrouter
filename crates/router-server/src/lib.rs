@@ -5,8 +5,11 @@ mod admin;
 #[cfg(feature = "console")]
 mod console;
 pub mod device_login;
+pub mod histogram;
 mod proxy;
 pub mod refresh;
+mod rollup_cache;
+mod session;
 mod upstream;
 pub mod usage;
 
@@ -71,7 +74,13 @@ pub struct AppState {
     /// Live console events (request ticks, config applies).
     pub events: tokio::sync::broadcast::Sender<serde_json::Value>,
     /// Admin session tokens -> expiry and who holds them.
+    ///
+    /// A cache, not the source of truth: a token carries its own signed
+    /// claims (see [`session`]), so a restart re-derives what this map
+    /// forgot instead of signing everyone out.
     pub sessions: Mutex<HashMap<String, Session>>,
+    /// Mints and verifies those claims.
+    pub session_signer: session::SessionSigner,
     /// Config's source of truth is a file: admin writes are disabled.
     pub file_managed: bool,
     /// Where this node keeps local state; uploaded credential files are
@@ -139,6 +148,13 @@ impl AppState {
         if let Some(dir) = data_dir.as_deref() {
             usage::UsagePipeline::seed_budgets(dir, &vkeys);
         }
+        let session_signer = session::SessionSigner::resolve(data_dir.as_deref());
+        if !session_signer.is_durable() {
+            tracing::info!(
+                "console sessions are per-process: no data directory to keep a signing key in, \
+                 so a restart signs operators out"
+            );
+        }
         let retained_data_dir = data_dir.clone();
         let (events, _) = tokio::sync::broadcast::channel(256);
         Arc::new(Self {
@@ -150,6 +166,7 @@ impl AppState {
             store,
             events,
             sessions: Mutex::new(HashMap::new()),
+            session_signer,
             data_dir: retained_data_dir,
             file_managed,
             liveness_window: DEFAULT_LIVENESS_WINDOW,
@@ -638,20 +655,54 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         ))
         .layer(DefaultBodyLimit::max(max_body));
 
+    // Compressed, but only here. The console's bundle and the analytics
+    // JSON are both large and both highly compressible — a year of daily
+    // rows is mostly repeated field names — and they are read over
+    // whatever network the operator happens to be on.
+    //
+    // Deliberately *not* on `/v1`: the proxy path's whole claim is
+    // microseconds of added latency, and re-compressing a provider's
+    // response would spend milliseconds to save bytes on a stream the
+    // caller is already reading incrementally.
+    let admin = Router::new()
+        .nest("/admin/api", admin::router(state.clone()))
+        .layer(compression());
+
     let app = Router::new()
         .merge(v1)
-        .nest("/admin/api", admin::router(state.clone()))
+        .merge(admin)
         .route("/health", get(health))
         .route("/metrics", get(metrics_endpoint))
         .layer(axum::middleware::from_fn(request_id));
     #[cfg(feature = "console")]
-    let app = app
-        .route("/favicon.svg", get(console::favicon))
-        .route("/favicon.ico", get(console::favicon))
-        .route("/console", get(console::root))
-        .route("/console/", get(console::root))
-        .route("/console/{*path}", get(console::asset));
+    let app = app.merge(
+        Router::new()
+            .route("/favicon.svg", get(console::favicon))
+            .route("/favicon.ico", get(console::favicon))
+            .route("/console", get(console::root))
+            .route("/console/", get(console::root))
+            .route("/console/{*path}", get(console::asset))
+            .layer(compression()),
+    );
     app.with_state(state)
+}
+
+/// Brotli or gzip, whichever the client asked for.
+///
+/// Server-sent events are excluded: compressing a stream that is read
+/// event by event buffers it, and a live tail that arrives in bursts is
+/// worse than one that arrives uncompressed.
+fn compression()
+-> tower_http::compression::CompressionLayer<impl tower_http::compression::Predicate> {
+    use tower_http::compression::Predicate as _;
+    tower_http::compression::CompressionLayer::new()
+        .br(true)
+        .gzip(true)
+        .compress_when(
+            tower_http::compression::predicate::DefaultPredicate::new().and(
+                tower_http::compression::predicate::NotForContentType::new("text/event-stream"),
+            ),
+        )
 }
 
 async fn chat_completions(
