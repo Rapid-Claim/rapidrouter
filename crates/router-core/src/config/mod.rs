@@ -288,6 +288,17 @@ pub struct CodexSettings {
     /// must be able to follow a new family without a gateway release.
     pub version: String,
     /// Reasoning-depth floor; `None` restores the backend's own default.
+    ///
+    /// Pinned low rather than left to the backend, and low rather than
+    /// deep, because this backend's per-model defaults are expensive in
+    /// a way that does not announce itself. Measured on a single-turn
+    /// extraction workload, `gpt-5.6-luna` spent 35% of its output
+    /// tokens on reasoning and ran a p50 of 14.5 s against `gpt-5.4`'s
+    /// 2.1 s — same prompt, same shape of answer, seven times the wait
+    /// and no error to explain it.
+    ///
+    /// A floor, not a ceiling: a caller that wants the thinking asks for
+    /// it per request, and pays for it knowingly.
     pub reasoning_effort: Option<String>,
     /// Output-verbosity floor; `None` restores the backend's own default.
     pub verbosity: Option<String>,
@@ -308,7 +319,7 @@ impl Default for CodexSettings {
     fn default() -> Self {
         Self {
             version: "0.146.0".into(),
-            reasoning_effort: Some("xhigh".into()),
+            reasoning_effort: Some("low".into()),
             verbosity: Some("low".into()),
             pdf_dpi: 150,
             pdf_max_pages: 50,

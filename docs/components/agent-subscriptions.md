@@ -288,6 +288,10 @@ keys = [
 
 [providers.codex]
 type = "codex_subscription"
+# Both floors default to "low" — spelled out here only to show the knob.
+# Raise them if you want the thinking; a caller can also raise either
+# per request. Leaving them to the backend's own per-model defaults is
+# what costs 14.5 s where 2.1 s would do.
 codex = { version = "0.146.0", reasoning_effort = "low", verbosity = "low" }
 keys = [
   { name = "seat-1", value = "file:/etc/rapid/codex/seat-1/auth.json" },
