@@ -405,7 +405,37 @@ async fn embeddings_and_completions_relay() {
 
 #[tokio::test]
 async fn models_endpoint_lists_catalog_and_aliases() {
-    let gw = gateway().await;
+    let gw = gateway_with(|mock| {
+        format!(
+            r#"
+[providers.openai]
+base_url = "{base}"
+keys = [
+  {{ name = "catalog", value = "sk-mock-catalog", models = ["gpt-4o-mini"] }},
+  {{ name = "wide", value = "sk-mock-wide" }},
+]
+
+[providers.claude]
+type = "claude_subscription"
+base_url = "{base}"
+keys = [{{ name = "seat", value = "sk-ant-oat01-test-seat" }}]
+
+[providers.limited-claude]
+type = "claude_subscription"
+base_url = "{base}"
+keys = [{{ name = "seat", value = "sk-ant-oat01-limited", models = ["claude-opus-4-8"] }}]
+
+[providers.groq]
+base_url = "{base}"
+keys = [{{ name = "main", value = "gsk-mock" }}]
+
+[aliases]
+fast = "groq/llama-3.3-70b-versatile"
+"#,
+            base = mock.base_url()
+        )
+    })
+    .await;
     let res = client()
         .get(format!("{}/v1/models", gw.url))
         .send()
@@ -420,11 +450,69 @@ async fn models_endpoint_lists_catalog_and_aliases() {
         .map(|m| m["id"].as_str().unwrap())
         .collect();
     assert!(ids.contains(&"openai/gpt-4o-mini"));
+    assert!(ids.contains(&"openai/gpt-4o"));
+    assert!(ids.contains(&"claude/claude-fable-5"));
+    assert!(ids.contains(&"claude/claude-opus-5"));
+    assert!(ids.contains(&"claude/claude-opus-4-8"));
+    assert!(ids.contains(&"claude/claude-opus-4-7"));
+    assert!(ids.contains(&"claude/claude-opus-4-6"));
+    assert!(ids.contains(&"claude/claude-opus-4-5"));
+    assert!(ids.contains(&"claude/claude-sonnet-5"));
+    assert!(ids.contains(&"claude/claude-sonnet-4-6"));
+    assert!(ids.contains(&"claude/claude-sonnet-4-5"));
+    assert!(ids.contains(&"claude/claude-haiku-4-5"));
+    assert!(ids.contains(&"limited-claude/claude-opus-4-8"));
+    assert!(!ids.contains(&"limited-claude/claude-sonnet-5"));
+    assert!(ids.contains(&"groq/llama-3.3-70b-versatile"));
     assert!(ids.contains(&"fast"));
     assert!(
         !ids.iter().any(|id| id.contains("err-")),
         "error stubs must not be listed"
     );
+
+    let codex_models = body["models"].as_array().unwrap();
+    let sonnet = codex_models
+        .iter()
+        .find(|model| model["slug"] == "claude/claude-sonnet-5")
+        .unwrap();
+    assert_eq!(sonnet["display_name"], "Claude Sonnet 5");
+    assert_eq!(sonnet["tool_mode"], "direct");
+    assert_eq!(sonnet["shell_type"], "unified_exec");
+    assert_eq!(sonnet["supports_search_tool"], false);
+    assert_eq!(sonnet["default_reasoning_level"], "high");
+    let sonnet_efforts = sonnet["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|preset| preset["effort"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(sonnet_efforts, ["low", "medium", "high", "xhigh", "max"]);
+    assert!(
+        sonnet["base_instructions"]
+            .as_str()
+            .unwrap()
+            .contains("Codex")
+    );
+
+    let sonnet_45 = codex_models
+        .iter()
+        .find(|model| model["slug"] == "claude/claude-sonnet-4-5")
+        .unwrap();
+    assert!(sonnet_45["default_reasoning_level"].is_null());
+    assert_eq!(sonnet_45["supported_reasoning_levels"], json!([]));
+
+    let gpt_55 = codex_models
+        .iter()
+        .find(|model| model["slug"] == "openai/gpt-5.5")
+        .unwrap();
+    assert_eq!(gpt_55["default_reasoning_level"], "medium");
+    let gpt_efforts = gpt_55["supported_reasoning_levels"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|preset| preset["effort"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(gpt_efforts, ["low", "medium", "high", "xhigh"]);
 }
 
 #[tokio::test]

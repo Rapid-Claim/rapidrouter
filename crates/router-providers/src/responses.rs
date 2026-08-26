@@ -62,32 +62,47 @@ pub fn request_to_internal(body: &Value) -> Result<ParsedRequest, GatewayError> 
         }
     }
 
-    // Responses tools are flat; the internal (chat) shape nests them.
+    // Chat-style providers support functions but not Responses namespaces.
+    // The default namespace is only a wrapper, so its function members remain
+    // callable. Named namespaces need a namespace-bearing response item to
+    // route calls back correctly and are omitted on this translated surface.
     let tools = match body["tools"].as_array() {
-        Some(tools) if !tools.is_empty() => Some(
-            tools
-                .iter()
-                .map(|t| match t["type"].as_str() {
-                    Some("function") | None => Ok(Tool {
-                        tool_type: "function".into(),
-                        function: FunctionDef {
-                            name: t["name"].as_str().unwrap_or_default().to_owned(),
-                            description: t["description"].as_str().map(str::to_owned),
-                            parameters: t.get("parameters").cloned().filter(|p| !p.is_null()),
-                            strict: t["strict"].as_bool(),
-                        },
-                    }),
-                    Some(builtin) => Err(GatewayError::new(
-                        ErrorClass::InvalidRequest,
-                        format!(
-                            "built-in tool `{builtin}` is only available on providers that \
-                             relay the Responses API natively"
-                        ),
-                    )
-                    .with_param("tools")),
-                })
-                .collect::<Result<Vec<_>, _>>()?,
-        ),
+        Some(tools) if !tools.is_empty() => {
+            let mut translated = Vec::new();
+            for tool in tools {
+                match tool["type"].as_str() {
+                    Some("function") | None => translated.push(responses_function(tool)),
+                    Some("namespace") => {
+                        let namespace = tool["name"].as_str().unwrap_or_default();
+                        if namespace == "functions" {
+                            for member in tool["tools"].as_array().into_iter().flatten() {
+                                match member["type"].as_str() {
+                                    Some("function") | None => {
+                                        translated.push(responses_function(member));
+                                    }
+                                    Some(member_type) => dropped
+                                        .push(format!("tools.namespace.{namespace}.{member_type}")),
+                                }
+                            }
+                        } else {
+                            dropped.push(format!("tools.namespace.{namespace}"));
+                        }
+                    }
+                    Some("web_search") => dropped.push("tools.web_search".to_owned()),
+                    Some(builtin) => {
+                        return Err(GatewayError::new(
+                            ErrorClass::InvalidRequest,
+                            format!(
+                                "built-in tool `{builtin}` is only available on providers that \
+                                 relay the Responses API natively"
+                            ),
+                        )
+                        .with_param("tools"));
+                    }
+                }
+            }
+            (!translated.is_empty()).then_some(translated)
+        }
         _ => None,
     };
 
@@ -117,13 +132,29 @@ pub fn request_to_internal(body: &Value) -> Result<ParsedRequest, GatewayError> 
         _ => None,
     };
 
-    for param in [
-        "reasoning",
-        "include",
-        "metadata",
-        "truncation",
-        "service_tier",
-    ] {
+    let mut extra = std::collections::BTreeMap::new();
+    match body.get("reasoning") {
+        Some(Value::Object(reasoning)) => {
+            for (name, value) in reasoning {
+                if value.is_null() {
+                    continue;
+                }
+                if name == "effort" {
+                    if let Some(effort) = value.as_str() {
+                        extra.insert("reasoning_effort".to_owned(), json!(effort));
+                    } else {
+                        dropped.push("reasoning.effort".to_owned());
+                    }
+                } else {
+                    dropped.push(format!("reasoning.{name}"));
+                }
+            }
+        }
+        Some(value) if !value.is_null() => dropped.push("reasoning".to_owned()),
+        _ => {}
+    }
+
+    for param in ["include", "metadata", "truncation", "service_tier"] {
         if body.get(param).is_some_and(|v| !v.is_null()) {
             dropped.push(param.to_owned());
         }
@@ -149,12 +180,27 @@ pub fn request_to_internal(body: &Value) -> Result<ParsedRequest, GatewayError> 
         frequency_penalty: None,
         seed: None,
         user: body["user"].as_str().map(str::to_owned),
-        extra: Default::default(),
+        extra,
     };
     Ok(ParsedRequest {
         internal,
         dropped_params: dropped,
     })
+}
+
+fn responses_function(tool: &Value) -> Tool {
+    Tool {
+        tool_type: "function".into(),
+        function: FunctionDef {
+            name: tool["name"].as_str().unwrap_or_default().to_owned(),
+            description: tool["description"].as_str().map(str::to_owned),
+            parameters: tool
+                .get("parameters")
+                .cloned()
+                .filter(|parameters| !parameters.is_null()),
+            strict: tool["strict"].as_bool(),
+        },
+    }
 }
 
 fn translate_input_item(

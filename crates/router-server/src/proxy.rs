@@ -2184,19 +2184,41 @@ pub fn error_response_for(render: RenderTarget, err: &GatewayError) -> Response 
 pub async fn models(State(state): State<Arc<AppState>>) -> Response {
     let table = state.table.load();
     let mut data = Vec::new();
+    let mut codex_models = std::collections::BTreeMap::new();
     for provider in table.providers() {
         let mut listed: std::collections::BTreeSet<&str> = Default::default();
+        if provider.keys.iter().any(|key| key.models.is_none()) {
+            for model in
+                router_core::config::presets::catalog_for_provider(&provider.name, provider.kind)
+            {
+                listed.insert(model.id);
+            }
+        }
         for key in &provider.keys {
             for model in key.models.iter().flatten() {
                 listed.insert(model);
             }
         }
         for model in listed {
+            let id = format!("{}/{}", provider.name, model);
             data.push(serde_json::json!({
-                "id": format!("{}/{}", provider.name, model),
+                "id": id,
                 "object": "model",
                 "owned_by": provider.name,
             }));
+            let slug = if provider.kind == ProviderKind::CodexSubscription {
+                model.to_owned()
+            } else {
+                id
+            };
+            codex_models.insert(
+                slug.clone(),
+                codex_model_metadata(
+                    &slug,
+                    &provider.name,
+                    codex_model_priority(provider.kind, model),
+                ),
+            );
         }
     }
     for (alias, target) in table.aliases() {
@@ -2205,6 +2227,9 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
             "object": "model",
             "owned_by": target.provider,
         }));
+        codex_models
+            .entry(alias.to_owned())
+            .or_insert_with(|| codex_model_metadata(alias, &target.provider, 500));
     }
     // A group is a model id a caller can send, so it belongs in the
     // catalog. It is owned by whichever providers back it, which is not
@@ -2221,8 +2246,109 @@ pub async fn models(State(state): State<Arc<AppState>>) -> Response {
             "object": "model",
             "owned_by": owners.join(","),
         }));
+        codex_models
+            .entry(name.to_owned())
+            .or_insert_with(|| codex_model_metadata(name, &owners.join(","), 600));
     }
-    axum::Json(serde_json::json!({ "object": "list", "data": data })).into_response()
+    axum::Json(serde_json::json!({
+        "object": "list",
+        "data": data,
+        "models": codex_models.into_values().collect::<Vec<_>>(),
+    }))
+    .into_response()
+}
+
+fn codex_model_priority(kind: ProviderKind, model: &str) -> i32 {
+    match kind {
+        ProviderKind::CodexSubscription => match model {
+            "gpt-5.6-sol" => 1,
+            "gpt-5.6-terra" => 2,
+            "gpt-5.6-luna" => 3,
+            "gpt-5.5" => 4,
+            _ => 20,
+        },
+        ProviderKind::ClaudeSubscription | ProviderKind::Anthropic => 100,
+        _ => 200,
+    }
+}
+
+fn codex_model_metadata(slug: &str, owner: &str, priority: i32) -> Value {
+    let model = slug.rsplit('/').next().unwrap_or(slug);
+    let reasoning = router_core::config::presets::reasoning_profile(model);
+    let supported_reasoning_levels = reasoning
+        .levels
+        .iter()
+        .map(|effort| {
+            serde_json::json!({
+                "effort": effort,
+                "description": reasoning_effort_description(effort),
+            })
+        })
+        .collect::<Vec<_>>();
+    let display_name = model
+        .split('-')
+        .map(|part| match part {
+            "claude" => "Claude".to_owned(),
+            "fable" => "Fable".to_owned(),
+            "opus" => "Opus".to_owned(),
+            "sonnet" => "Sonnet".to_owned(),
+            "haiku" => "Haiku".to_owned(),
+            "gpt" => "GPT".to_owned(),
+            "codex" => "Codex".to_owned(),
+            other => other.to_owned(),
+        })
+        .collect::<Vec<_>>()
+        .join(" ");
+    serde_json::json!({
+        "slug": slug,
+        "display_name": display_name,
+        "description": format!("Routed through {owner} by Rapid Router."),
+        "default_reasoning_level": reasoning.default,
+        "supported_reasoning_levels": supported_reasoning_levels,
+        "shell_type": "unified_exec",
+        "visibility": "list",
+        "supported_in_api": true,
+        "priority": priority,
+        "additional_speed_tiers": [],
+        "service_tiers": [],
+        "availability_nux": null,
+        "upgrade": null,
+        "base_instructions": "You are Codex, a coding agent. You and the user share a workspace. Work collaboratively to complete the user's requests. Follow the developer instructions and tool policies supplied with each task.",
+        "include_skills_usage_instructions": false,
+        "include_plugin_usage_instructions": false,
+        "include_apps_usage_instructions": false,
+        "supports_reasoning_summary_parameter": false,
+        "default_reasoning_summary": "none",
+        "support_verbosity": false,
+        "default_verbosity": null,
+        "apply_patch_tool_type": null,
+        "web_search_tool_type": "text",
+        "truncation_policy": {"mode": "tokens", "limit": 10000},
+        "supports_parallel_tool_calls": true,
+        "supports_image_detail_original": false,
+        "context_window": 200000,
+        "max_context_window": 200000,
+        "effective_context_window_percent": 95,
+        "experimental_supported_tools": [],
+        "input_modalities": ["text", "image"],
+        "supports_search_tool": false,
+        "use_responses_lite": false,
+        "node_repl_auto_review_required": false,
+        "node_repl_disabled": false,
+        "tool_mode": "direct",
+    })
+}
+
+fn reasoning_effort_description(effort: &str) -> &'static str {
+    match effort {
+        "low" => "Fast responses with lighter reasoning",
+        "medium" => "Balances speed and reasoning depth for everyday tasks",
+        "high" => "Greater reasoning depth for complex problems",
+        "xhigh" => "Extra high reasoning depth for complex problems",
+        "max" => "Maximum reasoning depth for the hardest problems",
+        "ultra" => "Maximum reasoning with automatic task delegation",
+        _ => "",
+    }
 }
 
 // ---------------------------------------------------------------------------

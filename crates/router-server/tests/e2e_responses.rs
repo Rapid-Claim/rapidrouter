@@ -189,6 +189,43 @@ async fn translate_sync_text_to_anthropic() {
 }
 
 #[tokio::test]
+async fn translate_reasoning_effort_to_supported_anthropic_model() {
+    let gw = gateway().await;
+    let res = responses(
+        &gw,
+        json!({
+            "model": "anthropic/claude-sonnet-5",
+            "input": "think carefully",
+            "reasoning": {"effort": "xhigh", "summary": "auto"},
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+
+    let seen = gw.mock.last_request();
+    assert_eq!(seen.path, "/v1/messages");
+    assert_eq!(seen.body["output_config"]["effort"], "xhigh");
+}
+
+#[tokio::test]
+async fn omit_reasoning_effort_for_unsupported_anthropic_model() {
+    let gw = gateway().await;
+    let res = responses(
+        &gw,
+        json!({
+            "model": "anthropic/claude-sonnet-4-5",
+            "input": "hi",
+            "reasoning": {"effort": "high"},
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+
+    let seen = gw.mock.last_request();
+    assert!(seen.body.get("output_config").is_none());
+}
+
+#[tokio::test]
 async fn translate_tools_to_anthropic() {
     let gw = gateway().await;
     let res = responses(&gw, json!({
@@ -225,6 +262,42 @@ async fn translate_tools_to_anthropic() {
         seen.body["messages"][2]["content"][0]["type"],
         "tool_result"
     );
+}
+
+#[tokio::test]
+async fn translate_codex_namespaces_to_anthropic() {
+    let gw = gateway().await;
+    let res = responses(
+        &gw,
+        json!({
+            "model": "anthropic/claude-x",
+            "input": "inspect the workspace",
+            "tools": [
+                {"type": "function", "name": "exec_command",
+                 "parameters": {"type": "object"}},
+                {"type": "namespace", "name": "functions", "description": "", "tools": [
+                    {"type": "function", "name": "update_plan",
+                     "parameters": {"type": "object"}},
+                    {"type": "custom", "name": "apply_patch",
+                     "format": {"type": "grammar", "syntax": "lark", "definition": "start: /.+/"}}
+                ]},
+                {"type": "namespace", "name": "mcp__example", "tools": [
+                    {"type": "function", "name": "lookup", "parameters": {"type": "object"}}
+                ]}
+            ],
+        }),
+    )
+    .await;
+    assert_eq!(res.status(), 200);
+
+    let seen = gw.mock.last_request();
+    let names = seen.body["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|tool| tool["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(names, ["exec_command", "update_plan"]);
 }
 
 #[tokio::test]
@@ -340,7 +413,7 @@ async fn state_rejected_on_translated_targets() {
 }
 
 #[tokio::test]
-async fn builtin_tools_rejected_on_translated_targets() {
+async fn hosted_web_search_is_omitted_on_translated_targets() {
     let gw = gateway().await;
     let res = responses(
         &gw,
@@ -350,13 +423,29 @@ async fn builtin_tools_rejected_on_translated_targets() {
         }),
     )
     .await;
+    assert_eq!(res.status(), 200);
+    let seen = gw.mock.last_request();
+    assert!(seen.body.get("tools").is_none());
+}
+
+#[tokio::test]
+async fn unsupported_builtin_tools_are_rejected_on_translated_targets() {
+    let gw = gateway().await;
+    let res = responses(
+        &gw,
+        json!({
+            "model": "anthropic/claude-x", "input": "use the computer",
+            "tools": [{"type": "computer_use_preview"}],
+        }),
+    )
+    .await;
     assert_eq!(res.status(), 400);
     let body: Value = res.json().await.unwrap();
     assert!(
         body["error"]["message"]
             .as_str()
             .unwrap()
-            .contains("web_search")
+            .contains("computer_use_preview")
     );
 }
 

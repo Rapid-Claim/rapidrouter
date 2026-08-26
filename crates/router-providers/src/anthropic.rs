@@ -3,6 +3,7 @@
 //! directions, sync and streaming.
 
 use router_core::chat::{ChatRequest, Content, ContentPart, Message, ToolCall};
+use router_core::config::presets;
 use router_core::sse::SseEvent;
 use router_core::{ErrorClass, GatewayError};
 use serde_json::{Map, Value, json};
@@ -81,6 +82,16 @@ pub fn build_request(req: &ChatRequest, model: &str) -> Result<BuiltRequest, Gat
     }
     if req.stream == Some(true) {
         body.insert("stream".into(), json!(true));
+    }
+
+    let reasoning_effort = req.extra.get("reasoning_effort").and_then(Value::as_str);
+    let reasoning_effort_supported =
+        reasoning_effort.is_some_and(|effort| presets::reasoning_profile(model).supports(effort));
+    if reasoning_effort_supported {
+        body.insert(
+            "output_config".into(),
+            json!({"effort": reasoning_effort.expect("checked above")}),
+        );
     }
 
     let mut tools = req.tools.as_ref().map(|tools| {
@@ -162,6 +173,9 @@ pub fn build_request(req: &ChatRequest, model: &str) -> Result<BuiltRequest, Gat
         }
     }
     for key in req.extra.keys() {
+        if key == "reasoning_effort" && reasoning_effort_supported {
+            continue;
+        }
         dropped.push(key.clone());
     }
 
