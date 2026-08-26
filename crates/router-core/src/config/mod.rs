@@ -10,7 +10,7 @@ pub mod presets;
 mod raw;
 mod validate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
@@ -66,6 +66,8 @@ pub struct Config {
     /// Routing groups by name, each a weighted primary and fallback pool.
     pub groups: BTreeMap<String, RoutingGroup>,
     pub reliability: Reliability,
+    /// The services that may own accounts and be named on a key.
+    pub tenants: BTreeSet<String>,
     /// File-declared virtual keys; managed mode appends store-held keys.
     pub virtual_keys: Vec<crate::vkey::VirtualKeyDef>,
     pub console: ConsoleConfig,
@@ -206,6 +208,60 @@ pub struct UsageConfig {
     /// Raise it if you need longer; the storage cost is roughly
     /// `requests/day × average body size × days`.
     pub body_retention_days: u32,
+    /// Caller-supplied metadata keys lifted onto every usage record as
+    /// filterable dimensions, by canonical name.
+    ///
+    /// An allowlist rather than "keep whatever arrived": callers put
+    /// arbitrary structures under `metadata`, and a log dimension that
+    /// anyone can invent is a cardinality incident waiting to happen.
+    /// It is config rather than a fixed list in code because the useful
+    /// keys are the *caller's* vocabulary — two of the best ones here
+    /// (`agent`, `patient_id`) arrived through an untyped passthrough
+    /// dict, and a gateway release should not be the cost of filtering
+    /// on the next one.
+    pub trace_keys: BTreeSet<String>,
+    /// Characters kept per dimension value. Values are identifiers and
+    /// short enum-ish strings; anything longer is a caller mistake or an
+    /// attempt to smuggle a payload into the log index.
+    pub trace_value_chars: usize,
+}
+
+/// The dimensions worth lifting out of a request by default.
+///
+/// Chosen from what callers actually send, on two tests: does it tell
+/// you *which* piece of work this request belongs to, and is its
+/// cardinality bounded enough to be a filter rather than a needle. The
+/// unbounded ones that survive anyway (`chart_id`) are here because
+/// "every call for this one chart" is the question logs exist to answer.
+pub const DEFAULT_TRACE_KEYS: &[&str] = &[
+    "workflow_id",
+    "chart_id",
+    "org_id",
+    "service",
+    "agent",
+    "stage",
+    "generation",
+    "batch_id",
+    "env",
+];
+
+/// Fold a caller's spelling of a dimension onto its canonical name.
+///
+/// Callers reach this gateway through two different client paths that
+/// disagree about naming, and one of them re-states values it has
+/// already sent. Normalising on the way in means the log has one column
+/// per concept instead of three near-duplicates, and a filter written
+/// against `stage` works regardless of which client sent the request.
+pub fn canonical_trace_key(key: &str) -> &str {
+    match key {
+        // The pipeline phase: `ICD_EXTRACTION`, `CPT_SEARCH`, `CHUNKER`.
+        "event_processing_tag" => "stage",
+        // The prompt/step, and on agentic paths the agent name.
+        "generation_name" => "generation",
+        // Langfuse's spelling of the tenant; always equal to `org_id`.
+        "trace_user_id" => "org_id",
+        other => other,
+    }
 }
 
 /// Which requests keep their bodies.
@@ -333,6 +389,8 @@ pub struct ApiKey {
     pub secret: SecretString,
     pub weight: f64,
     pub models: Option<Vec<String>>,
+    /// The service this account belongs to; `None` = unassigned.
+    pub tenant: Option<String>,
     /// This key's own request/token ceilings; see [`raw::RawKey`].
     pub rpm: Option<u64>,
     pub tpm: Option<u64>,

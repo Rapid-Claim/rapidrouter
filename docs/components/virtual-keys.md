@@ -33,6 +33,7 @@ name        = "checkout-service"
 id          = "9f3a2c"
 secret_hash = "blake3:…"
 models      = ["openai/gpt-4o-mini", "smart", "fast"]   # models, groups, or aliases
+tenant      = "optimizer"                               # which service this key belongs to
 budget      = { usd = 250, period = "monthly" }
 rate_limit  = { rpm = 600, tpm = 400_000 }
 expires     = "2027-01-01T00:00:00Z"                     # optional
@@ -43,12 +44,42 @@ enabled     = true
 - **Scope** is an allowlist of models, routing groups, and/or aliases (a
   group or alias keeps the scope stable while you repoint what is behind
   it). No scope = all configured models.
+- **Tenant** is the service this key belongs to, and decides how deep into
+  an account pool it may draw when the pool is under pressure — see below.
 - **Budget** is spend per period, priced from provider-reported usage.
 - **Rate limits** are requests/min and tokens/min (input + output;
   provider-cached tokens excluded).
 - **Tags** flow into usage records and metrics labels are *not* generated
   from them (cardinality stays bounded); they exist for console filtering
   and exports.
+
+## Which accounts a key can spend
+
+`models` answers "what may this key call". The **tenant** answers "which
+service is this, and how deep into the account pool may it draw when the
+pool runs low".
+
+```toml
+tenant = "optimizer"
+```
+
+A key with a tenant reaches **every** account of every provider its
+`models` scope allows — the tenant does not hand it a subset. What the
+tenant decides is the order in which services stop being served as a pool
+drains: each one is admitted while more accounts are available than the
+services ranked above it need. Floors, priorities and the numbers behind
+that live in [account-pools.md](account-pools.md).
+
+A key with no tenant is served last, behind every declared service, on any
+pool that declares floors. On a pool that declares none — which is every
+pool until someone writes a `floors` block — nothing is gated and every key
+reaches everything.
+
+Many keys may share one tenant, which is the point: a service's floor
+survives issuing, rotating and revoking the keys that spend it. Tenant
+names are checked when the key is written — on config load, in the console,
+and on the CLI — so a typo fails there rather than quietly demoting the key
+to last place.
 
 ## Enforcement semantics
 
@@ -58,6 +89,7 @@ Enforcement happens in the auth layer, before routing, in this order:
 |---|---|---|
 | Key exists, enabled, unexpired | `401 authentication` | constant-time verify |
 | Model in scope | `403 permission` — names the model and key | checked after model extraction, before any upstream work |
+| Pool pressure | `429 rate_limited` — names the service and the counts | applied at credential selection, per attempt, per target |
 | Rate limits | `429 rate_limited` + `retry-after` | atomic token buckets; race-free under concurrency (loom/proptest-verified) |
 | Budget | `429 insufficient_quota` | see lag note below |
 
@@ -85,6 +117,8 @@ key count is under a configured cardinality cap.
 ```bash
 rapid-router key create --name checkout-service \
   --models openai/gpt-4o-mini,fast --budget-usd 250/monthly --rpm 600
+
+rapid-router key create --name bulk-batch --tenant optimizer
 # → prints the full key once
 
 rapid-router key ls | rotate <id> | disable <id> | enable <id> | rm <id>

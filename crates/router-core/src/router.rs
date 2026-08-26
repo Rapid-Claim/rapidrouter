@@ -45,6 +45,12 @@ pub struct ProviderRuntime {
     pub bedrock: Option<BedrockSettings>,
     pub vertex: Option<VertexSettings>,
     pub codex: Option<CodexSettings>,
+    /// Whether any account of this pool carries a service label.
+    ///
+    /// A pool where none do is shared by every caller, exactly as it was
+    /// before services existed — which is what keeps every provider you
+    /// have not labelled working unchanged.
+    pub managed: bool,
 }
 
 #[derive(Debug)]
@@ -58,6 +64,9 @@ pub struct KeyRuntime {
     pub weight: f64,
     /// `None` = serves every model of this provider.
     pub models: Option<BTreeSet<String>>,
+    /// The service this account belongs to; `None` = unassigned, which in
+    /// a labelled pool means it serves nobody until someone assigns it.
+    pub tenant: Option<String>,
     pub breaker: Breaker,
     /// Where a rotated credential is persisted; see
     /// [`crate::config::ApiKey::source_path`].
@@ -237,6 +246,16 @@ pub struct RoutePlan {
     pub retry_on: Vec<RetryOn>,
 }
 
+/// What a service holds in one pool, for the console and for the sentence
+/// a refused caller is shown.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Holding {
+    /// Accounts labelled for this service.
+    pub owned: u32,
+    /// How many of them can serve right now.
+    pub usable: u32,
+}
+
 /// A key admitted for one attempt. `key` is `None` for keyless providers;
 /// `admission` says whether this was a healthy pick or a breaker probe.
 pub struct KeyChoice<'a> {
@@ -289,6 +308,7 @@ impl RoutingTable {
                     source_path: k.source_path.clone(),
                     weight: k.weight,
                     models: k.models.as_ref().map(|m| m.iter().cloned().collect()),
+                    tenant: k.tenant.clone(),
                     breaker: Breaker::new(breaker_config),
                     // A minute's worth of capacity, refilled per second,
                     // so a burst is allowed but a sustained overrun is
@@ -327,6 +347,7 @@ impl RoutingTable {
                     base_url: p.base_url.clone(),
                     auth: p.auth,
                     keys,
+                    managed: p.keys.iter().any(|k| k.tenant.is_some()),
                     timeout: p.timeout,
                     semaphore: Arc::new(Semaphore::new(p.max_concurrency)),
                     provider_breaker: Breaker::new(breaker_config),
@@ -518,13 +539,87 @@ fn carry_bucket(prev: Option<&TokenBucket>, limit: Option<u64>) -> Option<TokenB
 }
 
 impl ProviderRuntime {
+    /// The keys of this provider that may serve `model`, health aside.
+    ///
+    /// `None` = a request that names no model, which is the relay path
+    /// forwarding an arbitrary provider endpoint; every key can carry it.
+    fn eligible(&self, model: Option<&str>) -> Vec<&KeyRuntime> {
+        self.keys
+            .iter()
+            .filter(|k| match model {
+                Some(model) => k.models.as_ref().is_none_or(|m| m.contains(model)),
+                None => true,
+            })
+            .collect()
+    }
+
+    /// Whether one account is this caller's to spend.
+    ///
+    /// The whole of the service model, in five lines: an account carries
+    /// the name of the service it belongs to, a key carries the name of
+    /// the service it is, and they have to match. An unassigned account
+    /// belongs to nobody, and a key that names no service owns nothing —
+    /// both deliberate, so capacity is never spent by accident.
+    ///
+    /// A pool with no labels at all is shared, which is every provider
+    /// nobody has divided up.
+    fn owned_by(&self, key: &KeyRuntime, tenant: Option<&str>) -> bool {
+        if !self.managed {
+            return true;
+        }
+        match (key.tenant.as_deref(), tenant) {
+            (Some(owner), Some(caller)) => owner == caller,
+            _ => false,
+        }
+    }
+
+    /// What one service holds here: accounts labelled for it, and how many
+    /// of those can serve right now.
+    pub fn holding(&self, model: &str, tenant: Option<&str>, now_ms: u64) -> Holding {
+        let mine = self
+            .eligible(Some(model))
+            .into_iter()
+            .filter(|k| self.owned_by(k, tenant));
+        let mut holding = Holding::default();
+        for key in mine {
+            holding.owned += 1;
+            if key.breaker.looks_healthy(now_ms) {
+                holding.usable += 1;
+            }
+        }
+        holding
+    }
+
     /// Admit one attempt for `model`: weighted-random among healthy
     /// eligible keys; if none is healthy, offer the probe slot of an
     /// unhealthy one (single racer wins, per breaker semantics).
     ///
     /// `None` means nothing is admitted right now: every eligible key is
     /// open and in cooldown (or no key serves this model at all).
-    pub fn admit_key(&self, model: &str, now_ms: u64) -> Option<KeyChoice<'_>> {
+    pub fn admit_key(
+        &self,
+        model: &str,
+        tenant: Option<&str>,
+        now_ms: u64,
+    ) -> Option<KeyChoice<'_>> {
+        self.admit_for(Some(model), tenant, now_ms)
+    }
+
+    /// Admit a credential for a request that names no model: the relay
+    /// path, which forwards whatever provider endpoint the caller asked
+    /// for. It spends a real account, so it goes through the same
+    /// selection — health, weights, rate ceilings, account rules — as
+    /// every routed request.
+    pub fn admit_any(&self, tenant: Option<&str>, now_ms: u64) -> Option<KeyChoice<'_>> {
+        self.admit_for(None, tenant, now_ms)
+    }
+
+    fn admit_for(
+        &self,
+        model: Option<&str>,
+        tenant: Option<&str>,
+        now_ms: u64,
+    ) -> Option<KeyChoice<'_>> {
         if self.keys.is_empty() {
             return match self.provider_breaker.admit(now_ms) {
                 Admission::No => None,
@@ -535,10 +630,12 @@ impl ProviderRuntime {
             };
         }
 
+        // Only this caller's own accounts are candidates. In an unlabelled
+        // pool that is all of them, which is the pre-existing behaviour.
         let eligible: Vec<&KeyRuntime> = self
-            .keys
-            .iter()
-            .filter(|k| k.models.as_ref().is_none_or(|m| m.contains(model)))
+            .eligible(model)
+            .into_iter()
+            .filter(|k| self.owned_by(k, tenant))
             .collect();
         if eligible.is_empty() {
             return None;
@@ -602,16 +699,11 @@ impl ProviderRuntime {
     /// idle. Counting the *healthy* keys rather than all of them keeps the
     /// budget honest — retrying more times than there are seats to try
     /// only burns the caller's latency.
-    pub fn healthy_key_count(&self, model: &str, now_ms: u64) -> u32 {
+    pub fn healthy_key_count(&self, model: &str, tenant: Option<&str>, now_ms: u64) -> u32 {
         if self.keys.is_empty() {
             return 1;
         }
-        self.keys
-            .iter()
-            .filter(|k| k.models.as_ref().is_none_or(|m| m.contains(model)))
-            .filter(|k| k.breaker.looks_healthy(now_ms))
-            .count()
-            .max(1) as u32
+        self.holding(model, tenant, now_ms).usable.max(1)
     }
 
     /// Whether every eligible key for `model` is benched on a quota
@@ -623,11 +715,11 @@ impl ProviderRuntime {
     /// exhausted subscription pool is a rate limit with a known reset —
     /// and telling a caller "no capacity" when the truth is "out of quota
     /// until Tuesday" sends them into a retry loop that cannot succeed.
-    pub fn all_keys_benched(&self, model: &str, now_ms: u64) -> bool {
+    pub fn all_keys_benched(&self, model: &str, tenant: Option<&str>, now_ms: u64) -> bool {
         let mut eligible = self
-            .keys
-            .iter()
-            .filter(|k| k.models.as_ref().is_none_or(|m| m.contains(model)))
+            .eligible(Some(model))
+            .into_iter()
+            .filter(|k| self.owned_by(k, tenant))
             .peekable();
         // Only benches that are still running count. Answering "out of
         // quota until Tuesday" off a deadline that passed on Sunday sends
@@ -643,11 +735,7 @@ impl ProviderRuntime {
     /// Health-unaware selection, for surfaces that only need a key (e.g.
     /// tests, catalog listings).
     pub fn select_key(&self, model: &str) -> Option<&KeyRuntime> {
-        let eligible: Vec<&KeyRuntime> = self
-            .keys
-            .iter()
-            .filter(|k| k.models.as_ref().is_none_or(|m| m.contains(model)))
-            .collect();
+        let eligible = self.eligible(Some(model));
         if eligible.is_empty() {
             None
         } else {
@@ -855,7 +943,9 @@ keys = [
 
         // Selection still serves, because the other key is unlimited.
         for _ in 0..20 {
-            let choice = p.admit_key("gpt-4o", 1_000).expect("a key is admitted");
+            let choice = p
+                .admit_key("gpt-4o", None, 1_000)
+                .expect("a key is admitted");
             assert_eq!(choice.key.unwrap().name, "spare");
         }
     }
@@ -1025,6 +1115,136 @@ fast = "groq/llama-3.3-70b"
         }
     }
 
+    /// Four accounts, labelled for three services. `seat-4` is unassigned.
+    const POOL: &str = r#"
+tenants = ["kris", "agi", "optimizer"]
+
+[providers.codex]
+type = "openai_compat"
+base_url = "http://127.0.0.1:1"
+keys = [
+  { name = "seat-1", value = "sk-1", tenant = "kris" },
+  { name = "seat-2", value = "sk-2", tenant = "agi" },
+  { name = "seat-3", value = "sk-3", tenant = "optimizer" },
+  { name = "seat-4", value = "sk-4" },
+]
+
+[providers.openai]
+keys = [{ name = "main", value = "sk-m" }]
+"#;
+
+    fn served_by(provider: &Arc<ProviderRuntime>, tenant: Option<&str>) -> BTreeSet<String> {
+        let mut seen = BTreeSet::new();
+        for now in 0..40 {
+            if let Some(choice) = provider.admit_key("gpt-5.6", tenant, now) {
+                seen.insert(choice.key.unwrap().name.clone());
+            }
+        }
+        seen
+    }
+
+    /// The whole model: a service spends the accounts labelled for it, and
+    /// nothing else.
+    #[test]
+    fn a_service_spends_only_the_accounts_labelled_for_it() {
+        let t = table(POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        assert_eq!(
+            served_by(&r.provider, Some("kris")),
+            BTreeSet::from(["seat-1".to_owned()])
+        );
+        assert_eq!(
+            served_by(&r.provider, Some("optimizer")),
+            BTreeSet::from(["seat-3".to_owned()])
+        );
+    }
+
+    /// An unassigned account belongs to nobody — not to a service, and not
+    /// to a caller that names none.
+    #[test]
+    fn an_unassigned_account_serves_nobody() {
+        let t = table(POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        for who in [Some("kris"), Some("agi"), Some("optimizer"), None] {
+            assert!(
+                !served_by(&r.provider, who).contains("seat-4"),
+                "seat-4 is unassigned; {who:?} must not reach it"
+            );
+        }
+    }
+
+    /// A key that names no service owns nothing in a labelled pool.
+    #[test]
+    fn a_caller_with_no_service_gets_nothing_from_a_labelled_pool() {
+        let t = table(POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        assert!(r.provider.admit_key("gpt-5.6", None, 0).is_none());
+        assert_eq!(r.provider.holding("gpt-5.6", None, 0).owned, 0);
+    }
+
+    /// …and an unlabelled pool is untouched by any of this.
+    #[test]
+    fn an_unlabelled_pool_is_shared_by_everyone() {
+        let t = table(POOL);
+        let r = t.resolve("openai/gpt-4o").unwrap();
+        assert!(!r.provider.managed);
+        for who in [Some("optimizer"), None] {
+            assert!(r.provider.admit_key("gpt-4o", who, 0).is_some());
+        }
+    }
+
+    /// One service running out says nothing about the others: no borrowing,
+    /// in either direction.
+    #[test]
+    fn one_service_running_dry_does_not_touch_another() {
+        let t = table(POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        let p = &r.provider;
+        for key in &p.keys {
+            if key.name == "seat-3" {
+                key.breaker.bench_until(10_000);
+            }
+        }
+        assert!(
+            p.admit_key("gpt-5.6", Some("optimizer"), 5_000).is_none(),
+            "the optimizer's only account is out of quota"
+        );
+        assert!(
+            p.all_keys_benched("gpt-5.6", Some("optimizer"), 5_000),
+            "and it is out of quota, not out of capacity"
+        );
+        assert!(
+            p.admit_key("gpt-5.6", Some("kris"), 5_000).is_some(),
+            "kris is unaffected"
+        );
+    }
+
+    #[test]
+    fn holdings_are_what_the_console_reads() {
+        let t = table(POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        let p = &r.provider;
+        for key in &p.keys {
+            if key.name == "seat-3" {
+                key.breaker.bench_until(10_000);
+            }
+        }
+        assert_eq!(
+            p.holding("gpt-5.6", Some("optimizer"), 5_000),
+            Holding {
+                owned: 1,
+                usable: 0
+            }
+        );
+        assert_eq!(
+            p.holding("gpt-5.6", Some("kris"), 5_000),
+            Holding {
+                owned: 1,
+                usable: 1
+            }
+        );
+    }
+
     /// A pool is only worth its healthy seats, and the dispatch loop
     /// sizes its retry budget from this. Benched seats must not count:
     /// budgeting attempts for seats that cannot serve spends the
@@ -1042,26 +1262,26 @@ keys = [
 "#,
         );
         let r = t.resolve("openai/gpt-4o").unwrap();
-        assert_eq!(r.provider.healthy_key_count("gpt-4o", 0), 3);
+        assert_eq!(r.provider.healthy_key_count("gpt-4o", None, 0), 3);
 
         r.provider.keys[0].breaker.bench_until(10_000);
         r.provider.keys[1].breaker.bench_until(10_000);
-        assert_eq!(r.provider.healthy_key_count("gpt-4o", 5_000), 1);
-        assert!(!r.provider.all_keys_benched("gpt-4o", 5_000));
+        assert_eq!(r.provider.healthy_key_count("gpt-4o", None, 5_000), 1);
+        assert!(!r.provider.all_keys_benched("gpt-4o", None, 5_000));
 
         // Every seat out: a rate limit, not a capacity problem.
         r.provider.keys[2].breaker.bench_until(10_000);
-        assert!(r.provider.all_keys_benched("gpt-4o", 5_000));
+        assert!(r.provider.all_keys_benched("gpt-4o", None, 5_000));
         assert_eq!(
-            r.provider.healthy_key_count("gpt-4o", 5_000),
+            r.provider.healthy_key_count("gpt-4o", None, 5_000),
             1,
             "floors at 1"
         );
 
         // Once the windows roll, the pool is whole again without anyone
         // having had to fail a request to discover it.
-        assert!(!r.provider.all_keys_benched("gpt-4o", 10_000));
-        assert_eq!(r.provider.healthy_key_count("gpt-4o", 10_000), 3);
+        assert!(!r.provider.all_keys_benched("gpt-4o", None, 10_000));
+        assert_eq!(r.provider.healthy_key_count("gpt-4o", None, 10_000), 3);
     }
 
     /// The seat whose bench just elapsed has to be *returned*, not merely
@@ -1078,11 +1298,11 @@ keys = [{ name = "only", value = "sk-a" }]
         );
         let r = t.resolve("openai/gpt-4o").unwrap();
         r.provider.keys[0].breaker.bench_until(10_000);
-        assert!(r.provider.admit_key("gpt-4o", 9_999).is_none());
+        assert!(r.provider.admit_key("gpt-4o", None, 9_999).is_none());
 
         let choice = r
             .provider
-            .admit_key("gpt-4o", 10_000)
+            .admit_key("gpt-4o", None, 10_000)
             .expect("the window rolled; the seat serves again");
         assert_eq!(choice.key.unwrap().name, "only");
         assert_eq!(choice.admission, Admission::Yes);
@@ -1134,7 +1354,7 @@ cooldown_secs = 1
 
         // While `a` is open, admission must always land on `b`.
         for _ in 0..50 {
-            let choice = r.provider.admit_key("m", 10).unwrap();
+            let choice = r.provider.admit_key("m", None, 10).unwrap();
             assert_eq!(choice.key.unwrap().name, "b");
             assert_eq!(choice.admission, Admission::Yes);
         }
@@ -1143,15 +1363,15 @@ cooldown_secs = 1
         let b = r.provider.keys.iter().find(|k| k.name == "b").unwrap();
         b.breaker.record_failure(2);
         b.breaker.record_failure(3);
-        assert!(r.provider.admit_key("m", 10).is_none());
+        assert!(r.provider.admit_key("m", None, 10).is_none());
 
         // Past cooldown: one probe per open key, then nothing.
-        let first = r.provider.admit_key("m", 1500).unwrap();
+        let first = r.provider.admit_key("m", None, 1500).unwrap();
         assert_eq!(first.admission, Admission::Probe);
-        let second = r.provider.admit_key("m", 1500).unwrap();
+        let second = r.provider.admit_key("m", None, 1500).unwrap();
         assert_eq!(second.admission, Admission::Probe);
         assert_ne!(first.key.unwrap().name, second.key.unwrap().name);
-        assert!(r.provider.admit_key("m", 1500).is_none());
+        assert!(r.provider.admit_key("m", None, 1500).is_none());
     }
 
     /// A pool of `n` equal seats, `toml` for a provider named `pool`.
@@ -1272,12 +1492,12 @@ keys = [
     fn keyless_provider_uses_provider_breaker() {
         let t = table("[providers.ollama]\nauth = \"none\"\n");
         let r = t.resolve("ollama/llama3").unwrap();
-        let choice = r.provider.admit_key("llama3", 0).unwrap();
+        let choice = r.provider.admit_key("llama3", None, 0).unwrap();
         assert!(choice.key.is_none());
         r.provider.provider_breaker.record_failure(0);
         for _ in 0..4 {
             r.provider.provider_breaker.record_failure(0);
         }
-        assert!(r.provider.admit_key("llama3", 1).is_none());
+        assert!(r.provider.admit_key("llama3", None, 1).is_none());
     }
 }

@@ -120,6 +120,9 @@ enum KeyCommand {
         /// Comma-separated models and/or aliases; omit for all models.
         #[arg(long, value_delimiter = ',')]
         models: Vec<String>,
+        /// Which service this key belongs to (`[tenants.<name>]`).
+        #[arg(long)]
+        tenant: Option<String>,
         /// Spend cap as `AMOUNT/PERIOD`, e.g. `250/monthly`.
         #[arg(long, value_name = "USD/PERIOD")]
         budget_usd: Option<String>,
@@ -428,6 +431,7 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
         KeyCommand::Create {
             name,
             models,
+            tenant,
             budget_usd,
             rpm,
             tpm,
@@ -456,6 +460,7 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
                 secret_hash: vkey::hash_secret(&generated.secret),
                 prev_secret: None,
                 models: models.clone(),
+                tenant: tenant.clone(),
                 budget,
                 rate,
                 expires_ms,
@@ -499,11 +504,14 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
                         (None, None) => "-".into(),
                     })
                     .unwrap_or_else(|| "-".into());
-                let scope = if def.models.is_empty() {
+                let mut scope = if def.models.is_empty() {
                     "all models".to_owned()
                 } else {
                     def.models.join(",")
                 };
+                if let Some(tenant) = &def.tenant {
+                    scope.push_str(&format!(" [tenant {tenant}]"));
+                }
                 let state_label = if !def.enabled {
                     "disabled"
                 } else if def.expires_ms.is_some_and(|e| e <= vkey::unix_now_ms()) {

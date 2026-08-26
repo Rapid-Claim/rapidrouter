@@ -17,6 +17,11 @@ pub struct RawConfig {
     /// weighted primary pool and a weighted fallback pool.
     pub groups: BTreeMap<String, RawGroup>,
     pub reliability: RawReliability,
+    /// The services that draw on account pools, by name. Declaring one
+    /// here is what makes its name usable on an account or on a key —
+    /// which turns a typo into a startup error instead of an account that
+    /// silently serves nobody.
+    pub tenants: Vec<String>,
     /// File-mode virtual keys (hash form) — GitOps shops declare them
     /// here; managed mode keeps them in the store instead.
     pub virtual_keys: Vec<RawVirtualKey>,
@@ -85,6 +90,10 @@ pub struct RawVirtualKey {
     pub secret_hash: String,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Which service this key belongs to. It may use the accounts labelled
+    /// for that service, and no others.
+    #[serde(default)]
+    pub tenant: Option<String>,
     #[serde(default)]
     pub budget: Option<RawBudget>,
     #[serde(default)]
@@ -184,6 +193,11 @@ pub struct RawUsage {
     pub capture_bodies: String,
     pub body_limit_bytes: usize,
     pub body_retention_days: u32,
+    /// Which caller-supplied metadata keys become filterable log
+    /// dimensions. Empty disables the whole extraction.
+    pub trace_keys: Vec<String>,
+    /// Characters kept per dimension value.
+    pub trace_value_chars: usize,
 }
 
 impl Default for RawUsage {
@@ -195,6 +209,11 @@ impl Default for RawUsage {
             body_retention_days: 1,
             flush_interval_secs: 10,
             per_key_metrics: false,
+            trace_keys: super::DEFAULT_TRACE_KEYS
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect(),
+            trace_value_chars: 128,
         }
     }
 }
@@ -285,6 +304,13 @@ pub struct RawKey {
     /// Restrict this key to specific models; omitted = all models.
     #[serde(default)]
     pub models: Option<Vec<String>>,
+    /// Which service owns this account. Omitted = unassigned.
+    ///
+    /// One field, so an account cannot belong to two services and cannot
+    /// be forgotten by all of them. Moving an account between services is
+    /// an edit to this one word.
+    #[serde(default)]
+    pub tenant: Option<String>,
     /// This key's own ceiling, independent of any virtual key's.
     ///
     /// Provider accounts are rate limited per credential, so the limit

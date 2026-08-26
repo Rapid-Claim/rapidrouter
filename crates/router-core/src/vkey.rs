@@ -31,6 +31,15 @@ pub struct VirtualKeyDef {
     /// Allowlist of models and/or aliases; empty = all configured models.
     #[serde(default)]
     pub models: Vec<String>,
+    /// Which service this key belongs to.
+    ///
+    /// A tenant is a *service* — the AGI gateway, the Slack agent, the
+    /// optimizer — so many keys can belong to one, and a floor survives a
+    /// key rotation. It decides how deep into an account pool this key may
+    /// draw while the pool is under pressure; `None` is served last, behind
+    /// every declared service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tenant: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -553,6 +562,7 @@ mod tests {
             secret_hash: hash_secret(secret),
             prev_secret: None,
             models: Vec::new(),
+            tenant: None,
             budget: None,
             rate: None,
             expires_ms: None,
@@ -646,6 +656,17 @@ mod tests {
     }
 
     #[test]
+    fn a_key_carries_the_service_it_belongs_to() {
+        let mut d = def("abc123", "s");
+        d.tenant = Some("optimizer".into());
+        let rt = VkRuntime::new(d, None, 1);
+        assert_eq!(rt.def.tenant.as_deref(), Some("optimizer"));
+        // Which accounts that reaches is the pool's decision, not the
+        // key's: a key names a service, never a credential.
+        assert!(rt.allows_model("anything", None));
+    }
+
+    #[test]
     fn rpm_limits_and_budget_deny() {
         let mut d = def("abc123", "s");
         d.rate = Some(RateLimit {
@@ -730,6 +751,7 @@ mod tests {
             rpm: Some(600),
             tpm: Some(400_000),
         });
+        d.tenant = Some("optimizer".into());
         d.tags.insert("team".into(), "payments".into());
         let json = serde_json::to_string(&d).unwrap();
         let back: VirtualKeyDef = serde_json::from_str(&json).unwrap();

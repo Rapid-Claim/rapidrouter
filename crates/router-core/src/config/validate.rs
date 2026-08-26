@@ -34,7 +34,10 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
     let fallbacks = validate_fallbacks(&raw, &providers, &aliases, &mut errors);
     let groups = validate_groups(&raw, &providers, &aliases, &mut errors);
     let reliability = validate_reliability(&raw, &mut errors);
-    let virtual_keys = validate_virtual_keys(&raw, &providers, &aliases, &groups, &mut errors);
+    let tenants = validate_tenants(&raw, &mut errors);
+    validate_account_tenants(&raw, &tenants, &mut errors);
+    let virtual_keys =
+        validate_virtual_keys(&raw, &providers, &aliases, &groups, &tenants, &mut errors);
     let console = validate_console(&raw, env, &mut errors);
     let store = validate_store(&raw, &mut errors);
     let usage = validate_usage(&raw, &mut errors);
@@ -48,6 +51,7 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
             fallbacks,
             groups,
             reliability,
+            tenants,
             virtual_keys,
             console,
             store,
@@ -93,6 +97,7 @@ fn validate_virtual_keys(
     providers: &BTreeMap<String, Provider>,
     aliases: &BTreeMap<String, TargetModel>,
     groups: &BTreeMap<String, RoutingGroup>,
+    tenants: &BTreeSet<String>,
     errors: &mut Vec<ConfigError>,
 ) -> Vec<crate::vkey::VirtualKeyDef> {
     use crate::vkey;
@@ -145,6 +150,19 @@ fn validate_virtual_keys(
                     format!("`{scope}` is not a configured routing group or alias (use `provider/model` to scope to a model)"),
                 ));
             }
+        }
+        // A tenant nobody declared is not a harmless label: the key would
+        // be served last on every pool, behind every declared service.
+        if let Some(tenant) = &rk.tenant
+            && !tenants.contains(tenant)
+        {
+            errors.push(ConfigError::new(
+                format!("{path}.tenant"),
+                format!(
+                    "no service named `{tenant}` is declared \
+                     (add it to the top-level `tenants` list)"
+                ),
+            ));
         }
         let budget = rk.budget.as_ref().and_then(|b| {
             let period = match b.period.as_str() {
@@ -210,6 +228,7 @@ fn validate_virtual_keys(
                 secret_hash: rk.secret_hash.clone(),
                 prev_secret: None,
                 models: rk.models.clone(),
+                tenant: rk.tenant.clone(),
                 budget,
                 rate,
                 expires_ms,
@@ -336,6 +355,44 @@ fn validate_usage(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> super::Usag
             "must be between 1 and 3650",
         ));
     }
+    // A dimension becomes a log column and a filter facet, so the cap is
+    // on how many can exist at all rather than on any one request.
+    if u.trace_keys.len() > 32 {
+        errors.push(ConfigError::new(
+            "usage.trace_keys",
+            "must list 32 keys or fewer",
+        ));
+    }
+    let mut trace_keys = BTreeSet::new();
+    for (i, key) in u.trace_keys.iter().enumerate() {
+        let canonical = super::canonical_trace_key(key.trim());
+        if canonical.is_empty() {
+            errors.push(ConfigError::new(
+                format!("usage.trace_keys[{i}]"),
+                "must not be empty",
+            ));
+            continue;
+        }
+        // The key lands in a query string (`?meta.workflow_id=…`) and in
+        // a JSON field name, so keep it to the shape both read cleanly.
+        if !canonical
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_')
+        {
+            errors.push(ConfigError::new(
+                format!("usage.trace_keys[{i}]"),
+                "must be ASCII alphanumeric or underscore",
+            ));
+            continue;
+        }
+        trace_keys.insert(canonical.to_owned());
+    }
+    if !(8..=1024).contains(&u.trace_value_chars) {
+        errors.push(ConfigError::new(
+            "usage.trace_value_chars",
+            "must be between 8 and 1024",
+        ));
+    }
     super::UsageConfig {
         retention_days: u.retention_days,
         flush_interval: Duration::from_secs(u.flush_interval_secs),
@@ -343,6 +400,8 @@ fn validate_usage(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> super::Usag
         capture_bodies,
         body_limit_bytes: u.body_limit_bytes,
         body_retention_days: u.body_retention_days,
+        trace_keys,
+        trace_value_chars: u.trace_value_chars,
     }
 }
 
@@ -513,6 +572,7 @@ fn validate_provider(
                 secret,
                 weight: rk.weight,
                 models: rk.models.clone(),
+                tenant: rk.tenant.clone(),
                 rpm: rk.rpm,
                 tpm: rk.tpm,
                 source_path: rk
@@ -630,6 +690,54 @@ fn validate_provider(
         vertex,
         codex,
     })
+}
+
+/// Validate `tenants = [...]`: the services that may own accounts.
+///
+/// The list exists only so a misspelling is caught here. A typo on an
+/// account would otherwise label it for a service that does not exist —
+/// leaving it owned by nobody and serving nobody — and a typo on a key
+/// would leave that key with no accounts at all. Both look fine until the
+/// pool is busy.
+fn validate_tenants(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> BTreeSet<String> {
+    let mut tenants = BTreeSet::new();
+    for (i, name) in raw.tenants.iter().enumerate() {
+        if name.trim().is_empty() {
+            errors.push(ConfigError::new(
+                format!("tenants[{i}]"),
+                "a service name must not be empty",
+            ));
+        } else if !tenants.insert(name.clone()) {
+            errors.push(ConfigError::new(
+                format!("tenants[{i}]"),
+                format!("duplicate service `{name}`"),
+            ));
+        }
+    }
+    tenants
+}
+
+/// Every `tenant` on an account must name a declared service.
+fn validate_account_tenants(
+    raw: &RawConfig,
+    tenants: &BTreeSet<String>,
+    errors: &mut Vec<ConfigError>,
+) {
+    for (provider, rp) in &raw.providers {
+        for (i, key) in rp.keys.iter().enumerate() {
+            if let Some(tenant) = &key.tenant
+                && !tenants.contains(tenant)
+            {
+                errors.push(ConfigError::new(
+                    format!("providers.{provider}.keys[{i}].tenant"),
+                    format!(
+                        "no service named `{tenant}` is declared \
+                         (add it to the top-level `tenants` list)"
+                    ),
+                ));
+            }
+        }
+    }
 }
 
 /// Validate the `[providers.x.codex]` block.

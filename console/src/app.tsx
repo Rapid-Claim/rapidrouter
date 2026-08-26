@@ -2330,6 +2330,7 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
   const [search, setSearch] = createSignal("");
   const [name, setName] = createSignal("");
   const [models, setModels] = createSignal<string[]>([]);
+  const [tenant, setTenant] = createSignal("");
   const [budget, setBudget] = createSignal("");
   const [period, setPeriod] = createSignal("monthly");
   const [rpm, setRpm] = createSignal("");
@@ -2353,7 +2354,7 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
     return needle ? all.filter((k) => `${k.name} ${k.id}`.toLowerCase().includes(needle)) : all;
   });
 
-  const reset = () => { setName(""); setModels([]); setBudget(""); setRpm(""); setTpm(""); setError(""); };
+  const reset = () => { setName(""); setModels([]); setTenant(""); setBudget(""); setRpm(""); setTpm(""); setError(""); };
   createEffect(() => {
     if (!creating()) return;
     const onKey = (event: KeyboardEvent) => {
@@ -2389,6 +2390,7 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
           e.preventDefault(); setError("");
           try {
             const input: Record<string, unknown> = { name: name(), models: models() };
+            if (tenant()) input.tenant = tenant().trim();
             if (budget()) input.budget = { usd: Number(budget()), period: period() };
             if (rpm() || tpm()) input.rate = { ...(rpm() ? { rpm: Number(rpm()) } : {}), ...(tpm() ? { tpm: Number(tpm()) } : {}) };
             const result = await api.createKey(input);
@@ -2408,6 +2410,10 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
               label="Allowed models"
               emptyMeans="Every model"
             />
+          </label>
+          <label>Service <span class="optional">Optional</span>
+            <input value={tenant()} placeholder="e.g. optimizer" onInput={(e) => setTenant(e.currentTarget.value)} />
+            <small class="muted">Which service this key belongs to. Every service uses the whole account pool; the declared floors decide who pauses first when it runs low.</small>
           </label>
           <div class="disclosure" classList={{ open: advanced() }}>
             <button type="button" class="disclosure-toggle" aria-expanded={advanced()} onClick={() => setAdvanced((v) => !v)}>
@@ -2463,7 +2469,7 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
 }
 
 function KeyRow(props: { key: VirtualKey; reload: () => Promise<void>; reveal: (value: string) => void }) {
-  return <tr><td><strong>{props.key.name}</strong><small class="mono">{props.key.id}</small></td><td>{props.key.models.length ? props.key.models.join(", ") : "All models"}</td><td>{props.key.rate?.rpm ? `${props.key.rate.rpm} RPM` : "Unlimited"}</td><td>{props.key.budget ? `${formatUsd(props.key.budget.usd)} / ${props.key.budget.period}` : "None"}</td><td><Status text={props.key.enabled ? "Active" : "Revoked"} tone={props.key.enabled ? "success" : "muted"} /></td><td class="actions"><button class="icon-button" title={`Rotate ${props.key.name}`} aria-label={`Rotate ${props.key.name}`} onClick={async () => { const result = await api.rotateKey(props.key.id); props.reveal(result.key); await props.reload(); }}><RefreshCw size={16} /></button><button class="icon-button danger" title={`Delete ${props.key.name}`} aria-label={`Delete ${props.key.name}`} onClick={async () => { if (confirm(`Delete ${props.key.name}?`)) { await api.deleteKey(props.key.id); await props.reload(); } }}><Trash2 size={16} /></button></td></tr>;
+  return <tr><td><strong>{props.key.name}</strong><small class="mono">{props.key.id}</small></td><td>{props.key.models.length ? props.key.models.join(", ") : "All models"}<Show when={props.key.tenant}><small>{`service ${props.key.tenant}`}</small></Show></td><td>{props.key.rate?.rpm ? `${props.key.rate.rpm} RPM` : "Unlimited"}</td><td>{props.key.budget ? `${formatUsd(props.key.budget.usd)} / ${props.key.budget.period}` : "None"}</td><td><Status text={props.key.enabled ? "Active" : "Revoked"} tone={props.key.enabled ? "success" : "muted"} /></td><td class="actions"><button class="icon-button" title={`Rotate ${props.key.name}`} aria-label={`Rotate ${props.key.name}`} onClick={async () => { const result = await api.rotateKey(props.key.id); props.reveal(result.key); await props.reload(); }}><RefreshCw size={16} /></button><button class="icon-button danger" title={`Delete ${props.key.name}`} aria-label={`Delete ${props.key.name}`} onClick={async () => { if (confirm(`Delete ${props.key.name}?`)) { await api.deleteKey(props.key.id); await props.reload(); } }}><Trash2 size={16} /></button></td></tr>;
 }
 
 type TrendPoint = [number, number];
@@ -3059,6 +3065,17 @@ function Requests(props: { refresh: () => number }) {
   // "previous" is a step back rather than a re-query from the start.
   const [cursor, setCursor] = createSignal<string | null>(null);
   const [stack, setStack] = createSignal<string[]>([]);
+  // Caller dimensions (workflow, chart, agent, stage, …). Which keys
+  // exist is gateway config rather than something this page can name, so
+  // it holds a map and discovers the keys from what arrives.
+  const [meta, setMeta] = createSignal<Record<string, string>>({});
+  const setMetaKey = (key: string, value: string) =>
+    setMeta((current) => {
+      const next = { ...current };
+      if (value) next[key] = value;
+      else delete next[key];
+      return next;
+    });
 
   // Every query derives from one place, so the range picker and the
   // filters cannot move the table and the header out of step — which is
@@ -3079,20 +3096,20 @@ function Requests(props: { refresh: () => number }) {
   // the old query means nothing under the new one.
   createEffect(
     on(
-      () => [range(), status(), provider(), model(), vkey()] as const,
+      () => [range(), status(), provider(), model(), vkey(), meta()] as const,
       () => { setCursor(null); setStack([]); },
       { defer: true },
     ),
   );
 
   const [records] = createResource(
-    () => [props.refresh(), query(), cursor()] as const,
-    ([, q, after]) => api.requests(q.errors, PAGE_SIZE, { ...q, after: after ?? undefined }),
+    () => [props.refresh(), query(), cursor(), meta()] as const,
+    ([, q, after, m]) => api.requests(q.errors, PAGE_SIZE, { ...q, after: after ?? undefined }, m),
   );
   // Totals for the whole window, independent of which page is open.
   const [summary] = createResource(
-    () => [props.refresh(), query()] as const,
-    ([, q]) => api.requestsSummary(q.errors, q),
+    () => [props.refresh(), query(), meta()] as const,
+    ([, q, m]) => api.requestsSummary(q.errors, q, m),
   );
   const [selected, setSelected] = createSignal<UsageRecord | null>(null);
   const [keys] = createResource(props.refresh, api.keys);
@@ -3106,6 +3123,27 @@ function Requests(props: { refresh: () => number }) {
       .sort()
       .map((v) => ({ value: v, label: v }));
 
+  // Which caller dimensions exist is the gateway's config, so the page
+  // reads them off the records instead of hard-coding a list — a new
+  // dimension added in config shows up here without a console release.
+  // A key currently being filtered on is kept even when the page it
+  // returns happens not to carry it, so a filter can always be cleared.
+  const metaKeys = createMemo(() => {
+    const seen = new Set<string>([
+      ...all().flatMap((r) => Object.keys(r.meta ?? {})),
+      ...Object.keys(meta()),
+    ]);
+    // The dimensions that answer "which piece of work is this" lead;
+    // anything else follows alphabetically.
+    const lead = ["workflow_id", "chart_id", "agent", "stage", "service", "generation"];
+    return [...seen].sort((a, b) => {
+      const ia = lead.indexOf(a);
+      const ib = lead.indexOf(b);
+      if (ia !== ib) return (ia < 0 ? lead.length : ia) - (ib < 0 ? lead.length : ib);
+      return a.localeCompare(b);
+    });
+  });
+
   // Only the free-text search narrows client-side; everything else is
   // already applied by the gateway, so re-applying it here would only
   // risk the two disagreeing.
@@ -3113,7 +3151,7 @@ function Requests(props: { refresh: () => number }) {
     const needle = search().trim().toLowerCase();
     if (!needle) return all();
     return all().filter((record) =>
-      `${record.requested} ${routeLabel(record)} ${record.vkey ?? ""} ${record.status} ${record.request_id} ${record.prompt ?? ""}`
+      `${record.requested} ${routeLabel(record)} ${record.vkey ?? ""} ${record.status} ${record.request_id} ${record.prompt ?? ""} ${Object.values(record.meta ?? {}).join(" ")} ${record.error_class ?? ""} ${record.seat ?? ""}`
         .toLowerCase()
         .includes(needle),
     );
@@ -3151,6 +3189,17 @@ function Requests(props: { refresh: () => number }) {
           onChange: setVkey,
           options: (keys()?.data ?? []).map((k) => ({ value: k.id, label: k.name, hint: k.id })),
         },
+        ...metaKeys().map((key) => ({
+          id: `meta.${key}`,
+          label: metaTermLabel(key),
+          value: meta()[key] ?? "",
+          onChange: (value: string) => setMetaKey(key, value),
+          options: facet((r) => r.meta?.[key]),
+          // Grouped apart from status/provider/model: those describe how
+          // the gateway handled a request, these describe what work it
+          // belonged to, and the two are answered at different moments.
+          group: "Caller context",
+        })),
       ]}
     />
     <Loading when={summary.loading && !summary()} skeleton="stats" rows={5}>
@@ -3338,6 +3387,14 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
             <div><dt>Requested</dt><dd class="mono">{record.requested}</dd></div>
             <div><dt>Endpoint</dt><dd class="mono">{record.endpoint}</dd></div>
             <div><dt>Virtual key</dt><dd class="mono">{record.vkey ?? "—"}</dd></div>
+            {/* Which *account* served it. `Route` names the provider; on a
+                pooled provider that is not enough to find the seat. */}
+            <Show when={record.seat}>
+              <div><dt>Seat</dt><dd class="mono">{record.seat}</dd></div>
+            </Show>
+            <Show when={record.error_class}>
+              <div><dt>Failure</dt><dd class="mono">{record.error_class}</dd></div>
+            </Show>
             <div><dt>Attempts</dt><dd>{record.attempts}{record.attempts > 1 ? " (retried)" : ""}</dd></div>
             <div><dt>Streaming</dt><dd>{record.stream ? "Yes" : "No"}</dd></div>
             <div><dt>Request id</dt><dd class="mono wrap">{record.request_id}</dd></div>
@@ -3352,10 +3409,29 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
             <div><dt>Total tokens</dt><dd>{formatNumber(record.input_tokens + record.output_tokens)}</dd></div>
             <div><dt>Cost</dt><dd>{formatUsd(record.cost_micro_usd / 1e6)}</dd></div>
             <div><dt>Latency</dt><dd>{formatNumber(record.latency_ms)} ms</dd></div>
+            <Show when={record.ttft_ms !== undefined}>
+              <div><dt>First byte</dt><dd>{formatNumber(record.ttft_ms ?? 0)} ms</dd></div>
+            </Show>
             <div><dt>Gateway overhead</dt><dd>{formatNumber(record.overhead_us)} µs</dd></div>
+            {/* Time spent in front of the gateway, which no gateway-side
+                number can see — a large value here means the caller's own
+                queue is the backlog, not this hop. */}
+            <Show when={record.queue_lag_ms !== undefined}>
+              <div><dt>Queued before arrival</dt><dd>{formatDuration(record.queue_lag_ms ?? 0)}</dd></div>
+            </Show>
             <div><dt>Time</dt><dd>{new Date(record.ts).toLocaleString()}</dd></div>
           </dl>
         </section>
+        <Show when={Object.keys(record.meta ?? {}).length}>
+          <section class="drawer-card context">
+            <h3>Caller context</h3>
+            <dl>
+              <For each={Object.entries(record.meta ?? {})}>{([key, value]) =>
+                <div><dt>{metaTermLabel(key)}</dt><dd class="mono wrap">{value}</dd></div>
+              }</For>
+            </dl>
+          </section>
+        </Show>
       </div>
       <div class="drawer-section">
         <SectionTitle
@@ -3425,6 +3501,7 @@ function RequestRows(props: {
           <thead><tr>
             <th>Time</th>
             <th>Route</th>
+            <Show when={!props.compact}><th>Context</th></Show>
             <Show when={!props.compact}><th>Prompt</th></Show>
             <Show when={!props.compact}><th>Tokens</th><th>Cost</th></Show>
             <th>Latency</th>
@@ -3449,6 +3526,15 @@ function RequestRows(props: {
               {routeLabel(record)}
             </td>
             <Show when={!props.compact}>
+              <td class="context-cell" title={contextTitle(record)}>
+                <Show when={contextChips(record).length} fallback={<span class="muted">—</span>}>
+                  <For each={contextChips(record)}>{(value) =>
+                    <span class="chip dim-chip">{value}</span>
+                  }</For>
+                </Show>
+              </td>
+            </Show>
+            <Show when={!props.compact}>
               <td class="prompt-cell" title={record.prompt ?? ""}>
                 <Show when={record.prompt} fallback={<span class="muted">—</span>}>{record.prompt}</Show>
               </td>
@@ -3458,7 +3544,15 @@ function RequestRows(props: {
               <td class="nowrap">{formatUsd(record.cost_micro_usd / 1e6)}</td>
             </Show>
             <td class="nowrap">{record.latency_ms} ms</td>
-            <td><Status text={String(record.status)} tone={record.status < 400 ? "success" : "danger"} /></td>
+            {/* The class is the title rather than a column: it only
+                exists on failures, and a column that is empty on the 99%
+                of rows that succeeded is a column nobody reads. */}
+            <td title={record.error_class ?? ""}>
+              <Status
+                text={record.error_class ?? String(record.status)}
+                tone={record.status < 400 ? "success" : "danger"}
+              />
+            </td>
           </tr>}</For></tbody>
         </table>
       </div>
