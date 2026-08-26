@@ -1579,10 +1579,6 @@ pub fn codex_relay_body(value: &Value, model: &str) -> Value {
         if !object.get("instructions").is_some_and(|i| i.is_string()) {
             object.insert("instructions".into(), json!("You are Codex."));
         }
-        // Relaying is verbatim, which would otherwise carry the caller's
-        // attribution to a backend that has no use for it and no field
-        // by that name it will accept.
-        object.remove("metadata");
     }
     body
 }

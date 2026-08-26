@@ -154,9 +154,7 @@ pub fn request_to_internal(body: &Value) -> Result<ParsedRequest, GatewayError> 
         _ => {}
     }
 
-    // `metadata` is absent from this list on purpose: the gateway reads
-    // it as attribution, so it is consumed rather than dropped.
-    for param in ["include", "truncation", "service_tier"] {
+    for param in ["include", "metadata", "truncation", "service_tier"] {
         if body.get(param).is_some_and(|v| !v.is_null()) {
             dropped.push(param.to_owned());
         }

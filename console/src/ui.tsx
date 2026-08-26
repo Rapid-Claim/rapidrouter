@@ -68,16 +68,7 @@ export function escapeCloses(close: () => void) {
 /// absolutely-positioned child, and there is no combination of `overflow`
 /// values that fixes that for every container a control might land in.
 /// Fixed positioning off the trigger's rect is clipped by nothing.
-/// `maxPx` caps how tall the popup may grow. An option list wants a
-/// modest cap — a hundred models should scroll, not become the page —
-/// but the filter panel is a fixed, countable set of rows, and clipping
-/// it hides the last few filters behind a scroll nobody looks for.
-function anchorTo(
-  trigger: () => HTMLElement | undefined,
-  open: () => boolean,
-  maxPx = 340,
-) {
-
+function anchorTo(trigger: () => HTMLElement | undefined, open: () => boolean) {
   const [style, setStyle] = createSignal<Record<string, string>>({});
   const place = () => {
     const el = trigger();
@@ -89,7 +80,7 @@ function anchorTo(
     // Flip above the trigger when the space below cannot hold a usable
     // list, which is what happens to a control near the foot of a dialog.
     const flip = below < 220 && above > below;
-    const maxHeight = Math.max(160, Math.min(maxPx, flip ? above : below));
+    const maxHeight = Math.max(160, Math.min(340, flip ? above : below));
     const width = Math.max(rect.width, 240);
     const left = Math.min(Math.max(margin, rect.left), window.innerWidth - width - margin);
     setStyle({
@@ -594,10 +585,6 @@ export type FilterSpec = {
   /// Empty string = no constraint.
   value: string;
   onChange: (value: string) => void;
-  /// Heading this filter sits under. A run of filters sharing one is
-  /// drawn as a group; the first filter of each new group starts it.
-  /// Thirteen undifferentiated rows is a list you read twice.
-  group?: string;
 };
 
 /// The toolbar above a list: filters and a range on the left, search hard
@@ -619,16 +606,11 @@ export function FilterBar(props: {
   const [open, setOpen] = createSignal(false);
   let panel!: HTMLDivElement;
   const [popup, setPopup] = createSignal<HTMLDivElement>();
-  // Tall enough for the whole list: the caller dimensions are discovered
-  // from the data, so this panel grows as a gateway is configured, and a
-  // filter that exists but cannot be reached is worse than one that does
-  // not exist.
-  const style = anchorTo(() => panel, open, 620);
+  const style = anchorTo(() => panel, open);
   onMount(() => dismissable(() => [panel, popup()], () => setOpen(false), ".combobox-popup"));
   const active = createMemo(() => props.filters.filter((f) => f.value).length);
 
   return (
-    <div class="filter-bar-wrap">
     <div class="filter-bar">
       <div class="search-field">
         <Search size={14} aria-hidden="true" />
@@ -662,11 +644,7 @@ export function FilterBar(props: {
             <Portal>
             <div class="combobox-popup wide" role="group" aria-label="Filters" ref={setPopup} style={style()}>
               <For each={props.filters}>
-                {(filter, i) => (
-                  <>
-                  <Show when={filter.group && filter.group !== props.filters[i() - 1]?.group}>
-                    <div class="filter-group">{filter.group}</div>
-                  </Show>
+                {(filter) => (
                   <div class="filter-row">
                     <span>{filter.label}</span>
                     <Combobox
@@ -678,7 +656,6 @@ export function FilterBar(props: {
                       allowEmpty
                     />
                   </div>
-                  </>
                 )}
               </For>
               <Show when={active()}>
@@ -695,6 +672,15 @@ export function FilterBar(props: {
           </Show>
         </div>
         </Show>
+        <For each={props.filters.filter((f) => f.value)}>{(filter) => (
+          <span class="chip filter-chip">
+            <span class="filter-chip-name">{filter.label}</span>
+            {filter.options.find((o) => o.value === filter.value)?.label ?? filter.value}
+            <button type="button" aria-label={`Clear ${filter.label} filter`} onClick={() => filter.onChange("")}>
+              <X size={11} />
+            </button>
+          </span>
+        )}</For>
         <Show when={props.range}>
           {(range) => (
             <div class="segmented" role="group" aria-label="Date range">
@@ -713,34 +699,6 @@ export function FilterBar(props: {
         </Show>
       </div>
       <Show when={props.extra}><div class="filter-bar-actions">{props.extra}</div></Show>
-    </div>
-    {/* Active filters get a row of their own rather than sharing the
-        control bar. Inline, they wrapped *around* the search field —
-        squashing it to a few characters and re-flowing the whole bar
-        every time one was added. A separate row grows downward and
-        leaves the controls where the eye last found them. */}
-    <Show when={active()}>
-      <div class="filter-chips">
-        <For each={props.filters.filter((f) => f.value)}>{(filter) => (
-          <span class="chip filter-chip">
-            <span class="filter-chip-name">{filter.label}</span>
-            {filter.options.find((o) => o.value === filter.value)?.label ?? filter.value}
-            <button type="button" aria-label={`Clear ${filter.label} filter`} onClick={() => filter.onChange("")}>
-              <X size={11} />
-            </button>
-          </span>
-        )}</For>
-        <Show when={active() > 1}>
-          <button
-            type="button"
-            class="filter-chips-clear"
-            onClick={() => props.filters.forEach((f) => f.onChange(""))}
-          >
-            Clear all
-          </button>
-        </Show>
-      </div>
-    </Show>
     </div>
   );
 }
