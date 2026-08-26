@@ -130,41 +130,6 @@ export function urlSearch(name = "q"): [() => string, (value: string) => void] {
   ];
 }
 
-/// The caller dimensions on the log page, as `meta.*` parameters.
-///
-/// An open set rather than named fields: which dimensions exist is
-/// gateway config, so this reads whatever `meta.` prefixed parameters
-/// are on the URL instead of naming them here. That keeps a filtered log
-/// — "the ICD_EXTRACTION step of this workflow, for this chart" —
-/// linkable in the same way a filtered chart already is, which is most
-/// of what anyone wants to do once they have found the requests they
-/// were looking for.
-export function urlMeta(): [
-  () => Record<string, string>,
-  (next: Record<string, string>) => void,
-] {
-  return [
-    stable(() => {
-      const out: Record<string, string> = {};
-      for (const [name, value] of params()) {
-        if (name.startsWith("meta.") && value) out[name.slice(5)] = value;
-      }
-      return out;
-    }),
-    (next) => {
-      // Every currently-set dimension is cleared first, so removing one
-      // removes it from the URL rather than leaving a stale parameter
-      // behind that the next read would resurrect.
-      const changes: Record<string, string> = {};
-      for (const [name] of params()) {
-        if (name.startsWith("meta.")) changes[name] = "";
-      }
-      for (const [key, value] of Object.entries(next)) changes[`meta.${key}`] = value;
-      patch(changes);
-    },
-  ];
-}
-
 /// The provider / model / key trio the observability pages share, moved
 /// as a unit so one write covers a change to any of them.
 export type DimFilters = { provider: string; model: string; key: string };

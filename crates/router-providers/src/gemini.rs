@@ -134,10 +134,7 @@ pub fn build_request(req: &ChatRequest) -> Result<BuiltRequest, GatewayError> {
             dropped.push(param.to_owned());
         }
     }
-    // `metadata` is not reported: the gateway consumed it as this
-    // request's attribution, so it was taken deliberately rather than
-    // lost to a dialect that had nowhere to put it.
-    for key in req.extra.keys().filter(|k| k.as_str() != "metadata") {
+    for key in req.extra.keys() {
         dropped.push(key.clone());
     }
 

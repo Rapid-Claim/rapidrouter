@@ -176,12 +176,6 @@ pub fn build_request(req: &ChatRequest, model: &str) -> Result<BuiltRequest, Gat
         if key == "reasoning_effort" && reasoning_effort_supported {
             continue;
         }
-        // `metadata` is not reported either: the gateway consumed it as
-        // this request's attribution, so it was taken deliberately
-        // rather than lost to a dialect with nowhere to put it.
-        if key == "metadata" {
-            continue;
-        }
         dropped.push(key.clone());
     }
 

@@ -427,11 +427,6 @@ mod tests {
             overhead_us: 0,
             tag: None,
             prompt: None,
-            meta: Default::default(),
-            error_class: None,
-            seat: None,
-            ttft_ms: None,
-            queue_lag_ms: None,
         }
     }
 

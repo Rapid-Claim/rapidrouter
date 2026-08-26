@@ -184,11 +184,6 @@ pub struct RawUsage {
     pub capture_bodies: String,
     pub body_limit_bytes: usize,
     pub body_retention_days: u32,
-    /// Which caller-supplied metadata keys become filterable log
-    /// dimensions. Empty disables the whole extraction.
-    pub trace_keys: Vec<String>,
-    /// Characters kept per dimension value.
-    pub trace_value_chars: usize,
 }
 
 impl Default for RawUsage {
@@ -200,11 +195,6 @@ impl Default for RawUsage {
             body_retention_days: 1,
             flush_interval_secs: 10,
             per_key_metrics: false,
-            trace_keys: super::DEFAULT_TRACE_KEYS
-                .iter()
-                .map(|k| (*k).to_owned())
-                .collect(),
-            trace_value_chars: 128,
         }
     }
 }

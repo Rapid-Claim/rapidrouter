@@ -97,13 +97,6 @@ pub fn build_outbound(
             let mut req = req.clone();
             req.model = model.to_owned();
             req.stream = if stream { Some(true) } else { None };
-            // `metadata` rode in on `extra` and would be re-emitted with
-            // the rest of it. It is the gateway's attribution channel,
-            // already read off the request, and OpenAI accepts only
-            // sixteen string pairs under that name — so forwarding what
-            // callers actually send there is a 400, not a passthrough.
-            // The foreign dialects drop `extra` wholesale already.
-            req.extra.remove("metadata");
             let body = serde_json::to_vec(&req).expect("chat request serializes");
             Ok(OutboundRequest {
                 path: "/chat/completions".into(),
