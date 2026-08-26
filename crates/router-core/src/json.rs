@@ -16,6 +16,15 @@ pub struct Probe {
     /// Byte range of the model's string token, including both quotes.
     pub model_span: (usize, usize),
     pub stream: Option<bool>,
+    /// Byte range of the whole top-level `metadata` member — its key
+    /// token through the end of its value — when the body carries one.
+    ///
+    /// The gateway *consumes* `metadata`: it is the channel callers
+    /// attribute their traffic through, and it is not a field upstreams
+    /// should see. Recording the span here means dropping it costs one
+    /// copy on a path that was already copying to rewrite the model,
+    /// rather than a parse and re-serialize of the whole request.
+    pub metadata_span: Option<(usize, usize)>,
 }
 
 /// Scan a top-level JSON object for `model` (string) and `stream` (bool).
@@ -28,6 +37,7 @@ pub fn probe(body: &[u8]) -> Option<Probe> {
     let mut s = Scanner { b: body, i: 0 };
     let mut model: Option<(usize, usize)> = None;
     let mut stream: Option<bool> = None;
+    let mut metadata: Option<(usize, usize)> = None;
 
     s.ws();
     s.eat(b'{')?;
@@ -37,6 +47,9 @@ pub fn probe(body: &[u8]) -> Option<Probe> {
     }
     loop {
         s.ws();
+        // The member starts at its key token, which is where a removal
+        // has to begin.
+        let member_start = s.i;
         let (ks, ke) = s.string_token()?;
         let key = &body[ks + 1..ke - 1];
         if key.contains(&b'\\') {
@@ -69,6 +82,18 @@ pub fn probe(body: &[u8]) -> Option<Probe> {
                     _ => return None,
                 };
             }
+            b"metadata" => {
+                if metadata.is_some() {
+                    // A duplicate key: last-one-wins would leave the
+                    // earlier member in place and forward it upstream,
+                    // which is exactly what removing it is meant to
+                    // prevent. Hand the body to the full parser, which
+                    // collapses duplicates before the member is dropped.
+                    return None;
+                }
+                s.skip_value()?;
+                metadata = Some((member_start, s.i));
+            }
             _ => s.skip_value()?,
         }
         s.ws();
@@ -89,7 +114,63 @@ pub fn probe(body: &[u8]) -> Option<Probe> {
         model: model_str,
         model_span: (vs, ve),
         stream,
+        metadata_span: metadata,
     })
+}
+
+/// Grow a member's span to swallow the one comma that separated it.
+///
+/// The preceding comma when there is one, otherwise the following one —
+/// and neither for a sole member, which leaves `{}`.
+fn member_span_with_separator(body: &[u8], span: (usize, usize)) -> (usize, usize) {
+    let (mut start, mut end) = span;
+    let is_ws = |c: u8| matches!(c, b' ' | b'\t' | b'\n' | b'\r');
+    match body[..start].iter().rposition(|&c| !is_ws(c)) {
+        Some(i) if body[i] == b',' => start = i,
+        _ => {
+            if let Some(offset) = body[end..].iter().position(|&c| !is_ws(c))
+                && body[end + offset] == b','
+            {
+                end += offset + 1;
+            }
+        }
+    }
+    (start, end)
+}
+
+/// Rewrite the model and drop `metadata` in a single copy.
+///
+/// Both edits land in one pass, applied in positional order, because
+/// each would otherwise invalidate the other's offsets — removing a
+/// `metadata` member that sits before `model` shifts the model span left
+/// by however much came out.
+///
+/// The two members are distinct keys of the same object, so one strictly
+/// precedes the other and there is no overlap to reconcile.
+pub fn splice_model_dropping_metadata(
+    body: &Bytes,
+    model_span: (usize, usize),
+    metadata_span: Option<(usize, usize)>,
+    new_model: &str,
+) -> Bytes {
+    let Some(metadata_span) = metadata_span else {
+        return splice_model(body, model_span, new_model);
+    };
+    let md = member_span_with_separator(body, metadata_span);
+    let quoted = serde_json::to_string(new_model).expect("strings always serialize");
+    let mut out = BytesMut::with_capacity(body.len() + quoted.len());
+    if md.1 <= model_span.0 {
+        out.extend_from_slice(&body[..md.0]);
+        out.extend_from_slice(&body[md.1..model_span.0]);
+        out.extend_from_slice(quoted.as_bytes());
+        out.extend_from_slice(&body[model_span.1..]);
+    } else {
+        out.extend_from_slice(&body[..model_span.0]);
+        out.extend_from_slice(quoted.as_bytes());
+        out.extend_from_slice(&body[model_span.1..md.0]);
+        out.extend_from_slice(&body[md.1..]);
+    }
+    out.freeze()
 }
 
 /// Replace the model token at `span` with `new_model`, JSON-escaped.
@@ -272,5 +353,116 @@ mod tests {
         let out = splice_model(&body, got.model_span, "a\"b");
         let v: serde_json::Value = serde_json::from_slice(&out).unwrap();
         assert_eq!(v["model"], "a\"b");
+    }
+
+    /// The `metadata` member is found wherever it sits, and its span
+    /// covers the key through the end of the value.
+    #[test]
+    fn probe_locates_the_metadata_member() {
+        for body in [
+            r#"{"model":"m","metadata":{"a":1}}"#,
+            r#"{"metadata":{"a":1},"model":"m"}"#,
+            r#"{"model":"m","metadata":{"a":1},"stream":true}"#,
+            r#"{ "model" : "m" , "metadata" : { "a" : 1 } }"#,
+        ] {
+            let probed = probe(body.as_bytes()).expect("scannable");
+            let (start, end) = probed.metadata_span.expect("a metadata member");
+            assert!(body[start..].starts_with("\"metadata\""), "span {body}");
+            assert!(body[..end].ends_with('}'), "span end {body}");
+        }
+        // Absent when the body carries none.
+        assert_eq!(
+            probe(br#"{"model":"m","stream":true}"#)
+                .unwrap()
+                .metadata_span,
+            None
+        );
+    }
+
+    /// Removing a member must leave valid JSON in every position —
+    /// alone, first, last, and in the middle — which means the span it
+    /// is removed by has to absorb exactly one comma.
+    #[test]
+    fn a_member_span_absorbs_its_separator() {
+        for (body, want) in [
+            (r#"{"metadata":{"a":1}}"#, r#"{}"#),
+            (r#"{"model":"m","metadata":{"a":1}}"#, r#"{"model":"m"}"#),
+            (r#"{"metadata":{"a":1},"model":"m"}"#, r#"{"model":"m"}"#),
+            (r#"{"a":1,"metadata":{},"b":2}"#, r#"{"a":1,"b":2}"#),
+        ] {
+            let span = probe(body.as_bytes())
+                .and_then(|p| p.metadata_span)
+                .unwrap_or_else(|| find_metadata_span(body));
+            let (start, end) = member_span_with_separator(body.as_bytes(), span);
+            let out = format!("{}{}", &body[..start], &body[end..]);
+            assert_eq!(out, want, "from {body}");
+            // The real assertion: what is left still parses.
+            let _: serde_json::Value = serde_json::from_str(&out).expect("valid JSON");
+        }
+    }
+
+    /// Bodies without a `model` are not probeable, so tests that only
+    /// care about removal locate the member the simple way.
+    fn find_metadata_span(body: &str) -> (usize, usize) {
+        let start = body.find("\"metadata\"").expect("a metadata member");
+        let value_start = body[start..].find(':').expect("a colon") + start + 1;
+        let mut depth = 0usize;
+        let bytes = body.as_bytes();
+        let mut i = value_start;
+        while i < bytes.len() {
+            match bytes[i] {
+                b'{' | b'[' => depth += 1,
+                b'}' | b']' => {
+                    if depth == 0 {
+                        break;
+                    }
+                    depth -= 1;
+                    if depth == 0 {
+                        i += 1;
+                        break;
+                    }
+                }
+                b',' if depth == 0 => break,
+                _ => {}
+            }
+            i += 1;
+        }
+        (start, i)
+    }
+
+    /// Both edits in one pass, whichever order the members arrived in —
+    /// removing `metadata` shifts every offset after it, so a naive
+    /// second edit would splice into the wrong place.
+    #[test]
+    fn model_and_metadata_are_rewritten_together() {
+        for body in [
+            r#"{"model":"old/name","metadata":{"trace_metadata":{"workflow_id":"W"}},"stream":true}"#,
+            r#"{"metadata":{"trace_metadata":{"workflow_id":"W"}},"model":"old/name","stream":true}"#,
+            r#"{"stream":true,"metadata":{},"model":"old/name"}"#,
+            r#"{ "model" : "old/name" , "metadata" : { } , "stream" : true }"#,
+        ] {
+            let bytes = Bytes::copy_from_slice(body.as_bytes());
+            let probed = probe(body.as_bytes()).expect("scannable");
+            let out = splice_model_dropping_metadata(
+                &bytes,
+                probed.model_span,
+                probed.metadata_span,
+                "upstream-model",
+            );
+            let v: serde_json::Value = serde_json::from_slice(&out).expect("valid JSON");
+            assert_eq!(v["model"], "upstream-model", "from {body}");
+            assert!(v.get("metadata").is_none(), "metadata survived: {body}");
+            assert_eq!(v["stream"], true, "other members disturbed: {body}");
+        }
+    }
+
+    /// With no metadata to drop, the rewrite is exactly the plain splice.
+    #[test]
+    fn without_metadata_it_is_the_plain_splice() {
+        let body = Bytes::from_static(br#"{"model": "openai/gpt-4o", "messages": [1,2,3]}"#);
+        let probed = probe(&body).unwrap();
+        let out =
+            splice_model_dropping_metadata(&body, probed.model_span, probed.metadata_span, "m");
+        assert_eq!(&out[..], br#"{"model": "m", "messages": [1,2,3]}"#);
     }
 }

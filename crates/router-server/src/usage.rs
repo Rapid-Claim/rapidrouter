@@ -395,6 +395,44 @@ pub struct UsageRecord {
     /// itself carries one. Absent on records written before this shipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// Caller-supplied dimensions — which workflow, chart, agent and
+    /// pipeline stage this request belongs to.
+    ///
+    /// A map rather than named columns because the vocabulary is the
+    /// caller's, not the gateway's: it is bounded by
+    /// [`UsageConfig::trace_keys`], so the cardinality risk a free map
+    /// would carry is answered by config instead of by the type.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub meta: BTreeMap<String, String>,
+    /// Why a failed request failed, beyond its HTTP status.
+    ///
+    /// The status alone loses the distinction that matters when you are
+    /// paged: `429` is both "slow down" and "this account is out of
+    /// quota", and `502` says nothing at all about which upstream
+    /// condition produced it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<String>,
+    /// The account (`provider/key`) that actually served this request.
+    ///
+    /// `provider` says *what* served it; under an account pool, "which
+    /// seat is burning the pool" is a different question and this is the
+    /// only field that answers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seat: Option<String>,
+    /// Milliseconds to the first response byte.
+    ///
+    /// For a stream this is the number the caller actually feels;
+    /// `latency_ms` on a long generation describes the tail, not the
+    /// wait.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttft_ms: Option<u64>,
+    /// Milliseconds between the caller's source event and this request.
+    ///
+    /// Derived from the caller's `event_create_ts`, so it measures the
+    /// queue *in front of* the gateway — backlog that no gateway-side
+    /// latency number can see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub queue_lag_ms: Option<u64>,
 }
 
 /// How much of the prompt the record keeps. Enough for a table cell to be
@@ -414,16 +452,26 @@ const PROMPT_PREVIEW_CHARS: usize = 240;
 /// about; falls back to the system prompt, which is better than nothing
 /// for an embeddings or tool-only call.
 pub fn prompt_preview(body: &str) -> Option<String> {
-    let value: Value = serde_json::from_str(body).ok()?;
-    let user = first_turn_text(&value, "user");
+    prompt_preview_of(&serde_json::from_str::<Value>(body).ok()?)
+}
+
+/// The same, from a body that has already been parsed.
+///
+/// Every record reads two things out of one request body — this preview
+/// and the caller's dimensions. Parsing it once for both keeps the cost
+/// proportional to the body rather than to how many things want a look
+/// at it, which matters when a chart body runs to a quarter megabyte.
+pub fn prompt_preview_of(value: &Value) -> Option<String> {
+    let user = first_turn_text(value, "user");
+
     let text = user.or_else(|| {
         // No user turn: fall back to whatever framing the caller set.
         value
             .get("instructions")
             .and_then(Value::as_str)
             .map(str::to_owned)
-            .or_else(|| system_text(&value))
-            .or_else(|| first_turn_text(&value, "system"))
+            .or_else(|| system_text(value))
+            .or_else(|| first_turn_text(value, "system"))
     })?;
     let text = collapse_whitespace(&text);
     if text.is_empty() {
@@ -516,6 +564,134 @@ fn truncate_chars(text: &str, limit: usize) -> String {
     let mut out: String = text.chars().take(limit).collect();
     out.push('…');
     out
+}
+
+// ---------------------------------------------------------------------------
+// Caller-supplied dimensions
+// ---------------------------------------------------------------------------
+
+/// Where a caller's `event_create_ts` stops being believable as a
+/// timestamp. Callers send it as a string in whichever unit their
+/// language handed them, so the reader has to guess seconds from
+/// milliseconds and reject the rest.
+const MIN_PLAUSIBLE_MS: u64 = 1_262_304_000_000; // 2010-01-01
+
+/// The caller-supplied context lifted out of one request body.
+#[derive(Debug, Default)]
+pub struct TraceInfo {
+    /// Allowed dimensions, by canonical name.
+    pub dims: BTreeMap<String, String>,
+    /// The caller's source-event timestamp, kept out of `dims` because it
+    /// is a measurement rather than something anyone filters on.
+    pub event_create_ts: Option<String>,
+}
+
+/// Lift the caller's dimensions out of a request body.
+///
+/// Three shapes reach this gateway and all three are read here, because
+/// which one arrives is a property of the client library rather than of
+/// the request:
+///
+/// * `metadata.{org_id,chart_id,…}` — flat, sent by clients talking to
+///   the gateway directly.
+/// * `metadata.trace_metadata.{…}` — nested, the Langfuse shape that
+///   LiteLLM-based clients emit.
+/// * `X-Org-Id` / `X-Chart-Id` headers — a fallback for the keys a body
+///   omits, merged into the result by the caller of this function.
+///
+/// Nested wins over flat where both somehow appear, and the body wins
+/// over headers: a header is the fallback for something the body did not
+/// say, so letting it overwrite a value the body *did* say would invert
+/// the contract clients were written against.
+///
+/// The body is parsed once for both outputs. A body that is not JSON, or
+/// that carries no `metadata`, yields an empty result rather than an
+/// error — attribution is a side channel and must never fail a request.
+pub fn trace_info(body: &str, allow: &BTreeSet<String>, value_chars: usize) -> TraceInfo {
+    match serde_json::from_str::<Value>(body) {
+        Ok(value) => trace_info_of(&value, allow, value_chars),
+        Err(_) => TraceInfo::default(),
+    }
+}
+
+/// The same, from a body that has already been parsed.
+pub fn trace_info_of(value: &Value, allow: &BTreeSet<String>, value_chars: usize) -> TraceInfo {
+    let mut info = TraceInfo::default();
+    let Some(metadata) = value.get("metadata").and_then(Value::as_object) else {
+        return info;
+    };
+    // `tags` is skipped deliberately rather than missed: it restates the
+    // structured keys as `orgId:…` strings alongside free-form labels,
+    // and storing both spellings of one fact makes the log wider without
+    // making it more answerable.
+    collect_dims(metadata, allow, value_chars, &mut info.dims);
+    info.event_create_ts = scalar(metadata.get("event_create_ts"));
+    if let Some(nested) = metadata.get("trace_metadata").and_then(Value::as_object) {
+        collect_dims(nested, allow, value_chars, &mut info.dims);
+        info.event_create_ts = scalar(nested.get("event_create_ts")).or(info.event_create_ts);
+    }
+    info
+}
+
+/// Take the allowed keys out of one metadata object, canonicalising
+/// names and rendering scalar values.
+fn collect_dims(
+    object: &serde_json::Map<String, Value>,
+    allow: &BTreeSet<String>,
+    value_chars: usize,
+    out: &mut BTreeMap<String, String>,
+) {
+    if allow.is_empty() {
+        return;
+    }
+    for (key, value) in object {
+        let canonical = router_core::config::canonical_trace_key(key.as_str());
+        if !allow.contains(canonical) {
+            continue;
+        }
+        // Only scalars: an object or array under an allowed key is a
+        // caller mistake, and flattening one would put unbounded text
+        // into a field the console renders as a filter chip.
+        let Some(rendered) = scalar(Some(value)) else {
+            continue;
+        };
+        out.insert(canonical.to_owned(), truncate_chars(&rendered, value_chars));
+    }
+}
+
+/// A JSON scalar as a trimmed string; `None` for containers, nulls, and
+/// values that are empty once trimmed.
+fn scalar(value: Option<&Value>) -> Option<String> {
+    let rendered = match value? {
+        Value::String(text) => text.trim().to_owned(),
+        Value::Number(n) => n.to_string(),
+        Value::Bool(b) => b.to_string(),
+        _ => return None,
+    };
+    (!rendered.is_empty()).then_some(rendered)
+}
+
+/// Milliseconds a request waited in the caller's queue before it reached
+/// the gateway, from the `event_create_ts` the caller stamped on it.
+///
+/// Accepts seconds or milliseconds — callers send whichever their
+/// language's clock returned — and discards anything outside a plausible
+/// window, since a misparsed unit yields a lag of decades rather than an
+/// obvious error.
+fn queue_lag_ms(created: Option<&str>, now_ms: u64) -> Option<u64> {
+    let parsed: u64 = created?.trim().parse().ok()?;
+    // Ten digits is seconds, thirteen is milliseconds; scale the short
+    // one rather than rejecting it. Anything before 2010 is neither.
+    let created_ms = if parsed < MIN_PLAUSIBLE_MS / 1000 {
+        return None;
+    } else if parsed < MIN_PLAUSIBLE_MS {
+        parsed.checked_mul(1000)?
+    } else {
+        parsed
+    };
+    // Clock skew between the caller's box and this one; a negative lag
+    // is noise, not a measurement.
+    now_ms.checked_sub(created_ms)
 }
 
 // ---------------------------------------------------------------------------
@@ -897,6 +1073,10 @@ pub struct UsagePipeline {
     body_tx: Mutex<Option<mpsc::SyncSender<RequestBodies>>>,
     capture: BodyCapture,
     body_limit: usize,
+    /// Which caller metadata keys become dimensions, and how much of
+    /// each value is kept.
+    trace_keys: BTreeSet<String>,
+    trace_value_chars: usize,
 }
 
 impl UsagePipeline {
@@ -943,7 +1123,35 @@ impl UsagePipeline {
             dropped: AtomicU64::new(0),
             per_key_metrics: cfg.per_key_metrics,
             key_label_cap: 100,
+            trace_keys: cfg.trace_keys.clone(),
+            trace_value_chars: cfg.trace_value_chars,
         })
+    }
+
+    /// Which caller metadata keys this gateway lifts onto records.
+    ///
+    /// Exposed because the same allowlist governs both sources of a
+    /// dimension — the request body and the identity headers — and the
+    /// header side is read in the proxy, before a hook exists.
+    pub fn trace_keys(&self) -> &BTreeSet<String> {
+        &self.trace_keys
+    }
+
+    /// Characters kept per dimension value, from config.
+    pub fn trace_value_chars(&self) -> usize {
+        self.trace_value_chars
+    }
+
+    /// Whether the request body is worth materialising at all.
+    ///
+    /// Broader than "will a body be stored": the prompt preview and the
+    /// caller's dimensions are both read out of the request body and
+    /// belong on the record whether or not bodies are kept, so a gateway
+    /// with `capture_bodies = "off"` still needs the bytes in hand for
+    /// the length of one request. Also true in `"errors"` mode, where
+    /// whether this body will be stored is not known until the status is.
+    pub fn wants_input_body(&self) -> bool {
+        self.capture != BodyCapture::Off || !self.trace_keys.is_empty()
     }
 
     /// Bytes this pipeline will keep for a response with this status —
@@ -1137,6 +1345,17 @@ pub struct UsageHook {
     pub seat: Option<crate::proxy::SeatUsed>,
     /// The request body as the caller sent it, kept for the log drawer.
     pub input_body: Option<String>,
+    /// Dimensions read from request *headers*, before the body is seen.
+    ///
+    /// Seeded at hook construction because that is where the headers
+    /// are; the body's own dimensions are merged over these on
+    /// completion, so a header only ever fills a gap.
+    pub header_dims: BTreeMap<String, String>,
+    /// Set on the failure path, where the gateway knows why it failed.
+    pub error_class: Option<&'static str>,
+    /// Milliseconds to the first response byte, filled in by the metered
+    /// body as it streams.
+    pub ttft_ms: Option<u64>,
 }
 
 impl UsageHook {
@@ -1166,6 +1385,28 @@ impl UsageHook {
         {
             key.debit_tokens(usage.billable(), router_core::clock::now_ms());
         }
+        // One parse of the request body serves both readers below — the
+        // prompt preview and the caller's dimensions. A body that is not
+        // JSON yields neither, rather than failing the request.
+        let parsed = self
+            .input_body
+            .as_deref()
+            .and_then(|body| serde_json::from_str::<Value>(body).ok());
+        // Body dimensions win over header ones: a header is the
+        // documented fallback for a key the body omitted.
+        let trace = parsed
+            .as_ref()
+            .map(|value| {
+                trace_info_of(
+                    value,
+                    &self.pipeline.trace_keys,
+                    self.pipeline.trace_value_chars,
+                )
+            })
+            .unwrap_or_default();
+        let mut meta = self.header_dims;
+        meta.extend(trace.dims);
+        let queue_lag_ms = queue_lag_ms(trace.event_create_ts.as_deref(), now_unix);
         let rec = UsageRecord {
             ts: now_unix,
             request_id: self.request_id,
@@ -1188,7 +1429,17 @@ impl UsageHook {
             // the capture queue — and independently of whether capture is
             // on at all, so the log table shows a prompt even on a
             // gateway that stores no bodies.
-            prompt: self.input_body.as_deref().and_then(prompt_preview),
+            prompt: parsed.as_ref().and_then(prompt_preview_of),
+            meta,
+            error_class: self.error_class.map(str::to_owned),
+            // `provider/key`, so a seat is readable on its own and sorts
+            // with its provider's other seats.
+            seat: self
+                .seat
+                .as_ref()
+                .map(|s| format!("{}/{}", s.provider.name, s.key)),
+            ttft_ms: self.ttft_ms,
+            queue_lag_ms,
         };
         if let Some(events) = &self.events {
             let _ = events.send(serde_json::json!({
@@ -1235,6 +1486,7 @@ pub fn meter_response(response: Response, hook: UsageHook, dialect: Dialect) -> 
         tail: Vec::new(),
         capture_limit: hook_capture_limit,
         captured: Vec::new(),
+        ttft_ms: None,
     };
     Response::from_parts(parts, Body::new(body))
 }
@@ -1254,10 +1506,22 @@ struct MeteredBody {
     /// wants to read starts at the beginning.
     captured: Vec<u8>,
     capture_limit: usize,
+    /// Time to the first *non-empty* frame.
+    ///
+    /// Empty frames are skipped because a stream's opening frames can
+    /// carry headers or keep-alive padding with no content; timing those
+    /// would report a first token that had not arrived yet.
+    ttft_ms: Option<u64>,
 }
 
 impl MeteredBody {
     fn observe(&mut self, data: &[u8]) {
+        if self.ttft_ms.is_none() && !data.is_empty() {
+            self.ttft_ms = self
+                .hook
+                .as_ref()
+                .map(|hook| hook.started.elapsed().as_millis() as u64);
+        }
         if self.captured.len() < self.capture_limit {
             let room = self.capture_limit - self.captured.len();
             self.captured
@@ -1281,9 +1545,10 @@ impl MeteredBody {
     }
 
     fn complete(&mut self) {
-        let Some(hook) = self.hook.take() else {
+        let Some(mut hook) = self.hook.take() else {
             return;
         };
+        hook.ttft_ms = self.ttft_ms;
         let captured = std::mem::take(&mut self.captured);
         let output = String::from_utf8_lossy(&captured).into_owned();
         let usage = if hook.stream {
@@ -1804,14 +2069,32 @@ pub struct HistoryFilter {
     pub provider: Option<String>,
     pub model: Option<String>,
     pub vkey: Option<String>,
+    /// Caller dimensions that must all match — `workflow_id=X` *and*
+    /// `stage=Y`. Conjunctive because that is what narrowing a log means;
+    /// a disjunction over two different workflows is two queries.
+    pub meta: Vec<(String, String)>,
 }
 
 impl HistoryFilter {
     /// The same constraints applied to a rollup row's dimensions.
+    ///
+    /// Rollup rows carry only the aggregate dimensions, so a query that
+    /// constrains a caller dimension cannot be served from them; callers
+    /// check [`Self::needs_records`] before reaching for a rollup.
     fn matches_dims(&self, provider: &str, model: &str, vkey: Option<&str>) -> bool {
         self.provider.as_deref().is_none_or(|p| provider == p)
             && self.model.as_deref().is_none_or(|m| model == m)
             && self.vkey.as_deref().is_none_or(|k| vkey == Some(k))
+    }
+
+    /// Whether this filter can only be answered from raw records.
+    ///
+    /// Hourly rollups are keyed by provider/model/key alone. Answering a
+    /// caller-dimension filter from them would silently ignore that
+    /// filter and report the *unfiltered* total, which is worse than
+    /// being slower — so the read falls back to scanning records.
+    pub fn needs_records(&self) -> bool {
+        !self.meta.is_empty()
     }
 
     fn matches(&self, rec: &UsageRecord) -> bool {
@@ -1821,6 +2104,10 @@ impl HistoryFilter {
                 .vkey
                 .as_deref()
                 .is_none_or(|k| rec.vkey.as_deref() == Some(k))
+            && self
+                .meta
+                .iter()
+                .all(|(key, want)| rec.meta.get(key).is_some_and(|got| got == want))
     }
 }
 
@@ -1884,6 +2171,11 @@ impl UsagePipeline {
             body_tx: Mutex::new(None),
             capture: BodyCapture::Off,
             body_limit: 0,
+            trace_keys: router_core::config::DEFAULT_TRACE_KEYS
+                .iter()
+                .map(|k| (*k).to_owned())
+                .collect(),
+            trace_value_chars: 128,
         }
     }
 
@@ -2173,6 +2465,11 @@ impl UsagePipeline {
     ///
     /// Returns the groupings plus the window's latency percentiles; see
     /// [`History`].
+    /// Caller dimensions are not answerable here. This reads rollups
+    /// and nothing else — the record-scan path this once fell back to is
+    /// gone, which is what makes a year cost what a day did — so
+    /// `/history` does not accept `meta.*` terms at all rather than
+    /// quietly returning totals that ignore them.
     pub fn history_all(&self, days: u32, filter: &HistoryFilter) -> History {
         if self.data_dir.is_none() {
             return History::default();
@@ -2298,7 +2595,12 @@ impl UsagePipeline {
         filter: &HistoryFilter,
         errors_only: bool,
     ) -> RequestsSummary {
-        if !errors_only && self.data_dir.is_some() {
+        // A caller-dimension filter cannot be served from rollups —
+        // their rows carry provider, model and key and nothing else — so
+        // reading them here would drop the filter and report the
+        // *unfiltered* total as the answer. The record scan below is
+        // slower and is the only one that answers the question asked.
+        if !errors_only && self.data_dir.is_some() && !filter.needs_records() {
             let wide = self.usage_summary_from_rollups(
                 since_ms,
                 until_ms,
@@ -2501,7 +2803,9 @@ impl UsagePipeline {
         errors_only: bool,
     ) -> UsageSummary {
         let bucket_secs = bucket_width_secs(until_ms.saturating_sub(since_ms));
-        if !errors_only && self.data_dir.is_some() {
+        // Same reasoning as `summary`: rollups have no caller
+        // dimensions, so a filter naming one falls back to records.
+        if !errors_only && self.data_dir.is_some() && !filter.needs_records() {
             return self.usage_summary_from_rollups(since_ms, until_ms, filter, bucket_secs);
         }
         let records = self.collect_page(
@@ -3185,6 +3489,11 @@ mod usage_summary_tests {
             attempts: 1,
             tag: None,
             prompt: None,
+            meta: BTreeMap::new(),
+            error_class: None,
+            seat: None,
+            ttft_ms: None,
+            queue_lag_ms: None,
         }
     }
 
@@ -3768,6 +4077,11 @@ mod tests {
             attempts: 1,
             tag: None,
             prompt: None,
+            meta: BTreeMap::new(),
+            error_class: None,
+            seat: None,
+            ttft_ms: None,
+            queue_lag_ms: None,
         }
     }
 
@@ -3912,8 +4226,7 @@ mod tests {
         // And a filtered slice must match the records it stands for.
         let filter = HistoryFilter {
             provider: Some("openai".into()),
-            model: None,
-            vkey: None,
+            ..Default::default()
         };
         let rolled: u64 = rows
             .iter()
@@ -3955,6 +4268,8 @@ mod tests {
             body_tx: Mutex::new(None),
             capture: BodyCapture::Off,
             body_limit: 0,
+            trace_keys: BTreeSet::new(),
+            trace_value_chars: 128,
         };
         let history = pipeline.history(2, "model", &HistoryFilter::default());
         let total: u64 = history
@@ -4123,6 +4438,11 @@ mod tests {
             attempts: 1,
             tag: None,
             prompt: None,
+            meta: BTreeMap::new(),
+            error_class: None,
+            seat: None,
+            ttft_ms: None,
+            queue_lag_ms: None,
         };
         let now: u64 = 200 * 60_000;
         agg.record(&rec(now, "openai", Some("k1"), 500));
@@ -4167,6 +4487,11 @@ mod tests {
             attempts: 1,
             tag: None,
             prompt: None,
+            meta: BTreeMap::new(),
+            error_class: None,
+            seat: None,
+            ttft_ms: None,
+            queue_lag_ms: None,
         };
         let old = now.saturating_sub(90 * 86_400_000);
         write_batch(
@@ -4230,5 +4555,248 @@ mod tests {
                 "{key} should be recognised as already read from local disk",
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod trace_tests {
+    use super::*;
+
+    fn keys() -> BTreeSet<String> {
+        router_core::config::DEFAULT_TRACE_KEYS
+            .iter()
+            .map(|k| (*k).to_owned())
+            .collect()
+    }
+
+    /// The shape LiteLLM-based callers send: everything nested under
+    /// `metadata.trace_metadata`, with Langfuse's own field names beside
+    /// it. This is the majority of production traffic, so it is the case
+    /// that must not regress.
+    #[test]
+    fn reads_the_nested_langfuse_shape() {
+        let body = r#"{
+            "model": "gpt-5",
+            "messages": [],
+            "metadata": {
+                "trace_name": "agentic_dag_coder",
+                "trace_user_id": "org-uuid",
+                "session_id": "org-uuid_20250107000002",
+                "tags": ["orgId:org-uuid", "agno", "temporal"],
+                "trace_metadata": {
+                    "org_id": "org-uuid",
+                    "chart_id": "20250107000002",
+                    "workflow_id": "WORKFLOW_HCC_CONFIRMED",
+                    "batch_id": "20241015600018",
+                    "service": "agentic_dag_coder",
+                    "generation_name": "icd_coder",
+                    "event_processing_tag": "ICD_EXTRACTION",
+                    "env": "prod",
+                    "agent": "icd_coder"
+                }
+            }
+        }"#;
+        let info = trace_info(body, &keys(), 128);
+        assert_eq!(info.dims["workflow_id"], "WORKFLOW_HCC_CONFIRMED");
+        assert_eq!(info.dims["chart_id"], "20250107000002");
+        assert_eq!(info.dims["org_id"], "org-uuid");
+        assert_eq!(info.dims["batch_id"], "20241015600018");
+        assert_eq!(info.dims["service"], "agentic_dag_coder");
+        assert_eq!(info.dims["agent"], "icd_coder");
+        // Renamed on the way in, so one filter works across both client
+        // shapes rather than one per caller vocabulary.
+        assert_eq!(info.dims["stage"], "ICD_EXTRACTION");
+        assert_eq!(info.dims["generation"], "icd_coder");
+        assert_eq!(info.dims["env"], "prod");
+        // Redundant spellings are dropped rather than stored twice.
+        assert!(!info.dims.contains_key("trace_name"));
+        assert!(!info.dims.contains_key("session_id"));
+        assert!(!info.dims.contains_key("tags"));
+        assert!(!info.dims.contains_key("trace_user_id"));
+    }
+
+    /// The shape clients talking to the gateway directly send: the same
+    /// keys, flat.
+    #[test]
+    fn reads_the_flat_shape() {
+        let body = r#"{"metadata":{"service":"agentic_dag_coder","agent":"icd_coder",
+            "org_id":"org-1","chart_id":"chart-1","workflow_id":"wf-1"}}"#;
+        let info = trace_info(body, &keys(), 128);
+        assert_eq!(info.dims["workflow_id"], "wf-1");
+        assert_eq!(info.dims["chart_id"], "chart-1");
+        assert_eq!(info.dims["agent"], "icd_coder");
+    }
+
+    /// Only what config allows becomes a dimension. A caller can put
+    /// anything under `metadata`; none of it may become a log column on
+    /// its own say-so.
+    #[test]
+    fn an_unlisted_key_is_not_a_dimension() {
+        let body = r#"{"metadata":{"workflow_id":"wf-1","patient_id":"p-1","whatever":"x"}}"#;
+        let info = trace_info(body, &keys(), 128);
+        assert_eq!(info.dims["workflow_id"], "wf-1");
+        assert!(!info.dims.contains_key("patient_id"));
+        assert!(!info.dims.contains_key("whatever"));
+
+        // …and adding it to config is all it takes.
+        let mut extended = keys();
+        extended.insert("patient_id".into());
+        let info = trace_info(body, &extended, 128);
+        assert_eq!(info.dims["patient_id"], "p-1");
+        assert!(!info.dims.contains_key("whatever"));
+    }
+
+    /// A container under an allowed key is a caller mistake; flattening
+    /// one would put unbounded text into a filter chip.
+    #[test]
+    fn non_scalar_and_empty_values_are_skipped() {
+        let body = r#"{"metadata":{"workflow_id":{"nested":"object"},"chart_id":["a"],
+            "agent":"   ","service":null,"stage":"","org_id":42,"env":true}}"#;
+        let info = trace_info(body, &keys(), 128);
+        assert!(!info.dims.contains_key("workflow_id"));
+        assert!(!info.dims.contains_key("chart_id"));
+        assert!(!info.dims.contains_key("agent"));
+        assert!(!info.dims.contains_key("service"));
+        assert!(!info.dims.contains_key("stage"));
+        // Numbers and bools are scalars and do render — some callers
+        // send numeric ids unquoted.
+        assert_eq!(info.dims["org_id"], "42");
+        assert_eq!(info.dims["env"], "true");
+    }
+
+    /// A value long enough to matter is cut, not stored.
+    #[test]
+    fn values_are_length_capped() {
+        let long = "x".repeat(500);
+        let body = format!(r#"{{"metadata":{{"chart_id":"{long}"}}}}"#);
+        let info = trace_info(&body, &keys(), 32);
+        // 32 characters plus the ellipsis the truncator marks it with.
+        assert_eq!(info.dims["chart_id"].chars().count(), 33);
+    }
+
+    /// Attribution is a side channel: nothing it is handed may fail a
+    /// request or produce a partial record.
+    #[test]
+    fn junk_bodies_yield_nothing_rather_than_failing() {
+        for body in [
+            "",
+            "not json at all",
+            "{",
+            "[]",
+            "null",
+            r#"{"messages":[]}"#,
+            r#"{"metadata":null}"#,
+            r#"{"metadata":"a string"}"#,
+            r#"{"metadata":[1,2,3]}"#,
+        ] {
+            let info = trace_info(body, &keys(), 128);
+            assert!(info.dims.is_empty(), "body {body:?} produced dimensions");
+            assert!(info.event_create_ts.is_none());
+        }
+    }
+
+    /// An empty allowlist turns the whole feature off.
+    #[test]
+    fn no_configured_keys_means_no_dimensions() {
+        let body = r#"{"metadata":{"workflow_id":"wf-1"}}"#;
+        let info = trace_info(body, &BTreeSet::new(), 128);
+        assert!(info.dims.is_empty());
+    }
+
+    /// `event_create_ts` is read for the lag measurement even though it
+    /// is not a filterable dimension — the two are deliberately separate.
+    #[test]
+    fn the_source_timestamp_is_read_without_being_a_dimension() {
+        let body = r#"{"metadata":{"trace_metadata":{"event_create_ts":"1700000000000"}}}"#;
+        let info = trace_info(body, &keys(), 128);
+        assert_eq!(info.event_create_ts.as_deref(), Some("1700000000000"));
+        assert!(!info.dims.contains_key("event_create_ts"));
+    }
+
+    #[test]
+    fn queue_lag_reads_seconds_and_milliseconds_alike() {
+        let now = 1_700_000_600_000u64;
+        assert_eq!(queue_lag_ms(Some("1700000000000"), now), Some(600_000));
+        // The same instant in seconds.
+        assert_eq!(queue_lag_ms(Some("1700000000"), now), Some(600_000));
+        assert_eq!(queue_lag_ms(Some(" 1700000000 "), now), Some(600_000));
+    }
+
+    /// A misparsed unit yields a lag of decades rather than an obvious
+    /// error, so implausible stamps are refused outright.
+    #[test]
+    fn implausible_or_skewed_timestamps_are_refused() {
+        let now = 1_700_000_600_000u64;
+        for stamp in ["0", "12345", "not a number", "", "-1", "1.5"] {
+            assert_eq!(queue_lag_ms(Some(stamp), now), None, "stamp {stamp:?}");
+        }
+        // A caller whose clock runs ahead of this box: a negative lag is
+        // noise, not a measurement.
+        assert_eq!(queue_lag_ms(Some("1700000900000"), now), None);
+        assert_eq!(queue_lag_ms(None, now), None);
+    }
+
+    /// A filter narrows on every term it names, and a term no record
+    /// carries matches nothing rather than being ignored.
+    #[test]
+    fn a_meta_filter_is_conjunctive() {
+        let mut rec = UsageRecord {
+            ts: 1_700_000_000_000,
+            request_id: "r".into(),
+            endpoint: "chat".into(),
+            requested: "gpt-5".into(),
+            provider: "openai".into(),
+            model: "gpt-5".into(),
+            vkey: None,
+            status: 200,
+            stream: false,
+            input_tokens: 1,
+            output_tokens: 1,
+            cached_tokens: 0,
+            cost_micro_usd: 1,
+            latency_ms: 1,
+            overhead_us: 1,
+            attempts: 1,
+            tag: None,
+            prompt: None,
+            meta: BTreeMap::new(),
+            error_class: None,
+            seat: None,
+            ttft_ms: None,
+            queue_lag_ms: None,
+        };
+        rec.meta
+            .insert("workflow_id".into(), "WORKFLOW_RISE_HCS".into());
+        rec.meta.insert("stage".into(), "ICD_SEARCH".into());
+
+        let matching = HistoryFilter {
+            meta: vec![
+                ("workflow_id".into(), "WORKFLOW_RISE_HCS".into()),
+                ("stage".into(), "ICD_SEARCH".into()),
+            ],
+            ..Default::default()
+        };
+        assert!(matching.matches(&rec));
+        assert!(matching.needs_records());
+
+        // One term right, one wrong.
+        let partial = HistoryFilter {
+            meta: vec![
+                ("workflow_id".into(), "WORKFLOW_RISE_HCS".into()),
+                ("stage".into(), "CPT_SEARCH".into()),
+            ],
+            ..Default::default()
+        };
+        assert!(!partial.matches(&rec));
+
+        // A dimension this record does not carry at all.
+        let absent = HistoryFilter {
+            meta: vec![("agent".into(), "icd_coder".into())],
+            ..Default::default()
+        };
+        assert!(!absent.matches(&rec));
+
+        // And an unconstrained filter still needs no record scan.
+        assert!(!HistoryFilter::default().needs_records());
     }
 }

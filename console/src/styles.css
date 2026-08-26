@@ -864,7 +864,36 @@ kbd {
 }
 /* Every popup is portalled to the body, so a nested one is no longer a
    child of the panel and nothing here clips it. */
-.combobox-popup.wide { min-width: 320px; padding: 6px; overflow-y: auto; }
+.combobox-popup.wide { min-width: 336px; padding: 5px; overflow-y: auto; }
+
+/* The filter panel is a *list of settings*, not ten inputs stacked. Each
+   row was drawing its own outlined box inside an already-outlined panel,
+   which at ten filters reads as a stack of boxes rather than a menu, so
+   inside this panel the control drops its chrome and the row itself
+   carries the hover. The edge comes back on hover and focus, where it
+   means something. */
+.combobox-popup.wide .combobox-trigger {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  padding: 0 7px;
+  background: transparent;
+  border-color: transparent;
+}
+.combobox-popup.wide .filter-row:hover .combobox-trigger,
+.combobox-popup.wide .combobox-trigger[aria-expanded="true"] {
+  background: var(--field);
+  border-color: var(--border);
+}
+
+/* A nested popup floats above the panel that opened it. Both were the
+   same surface with the same border, so the two read as one confused
+   sheet; depth, not another outline, is what says which is on top. */
+.combobox-popup .combobox-popup {
+  border-color: var(--border-soft);
+  box-shadow: var(--shadow-pop), 0 0 0 1px rgb(0 0 0 / 22%);
+}
+
 
 .combobox-search {
   display: flex;
@@ -986,24 +1015,90 @@ kbd {
 /* Search leads, filters follow it, the page's one create action sits
    hard right — the same order on every page, so the control you reach
    for does not move as you navigate. */
+.filter-bar-wrap { width: 100%; margin-bottom: 12px; }
 .filter-bar {
   display: flex;
   align-items: center;
   gap: 10px;
   width: 100%;
-  margin-bottom: 12px;
 }
+
+/* Active filters, on their own line under the controls. `wrap` here is
+   safe because nothing shares the row: adding a sixth chip grows this
+   downward instead of re-flowing the search field. */
+.filter-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: 9px;
+}
+.filter-chips-clear {
+  height: 24px;
+  padding: 0 8px;
+  margin-left: 2px;
+  border: 0;
+  background: transparent;
+  border-radius: var(--radius-small);
+  color: var(--muted);
+  font-size: 11.5px;
+  cursor: pointer;
+}
+.filter-chips-clear:hover { color: var(--text); background: var(--hover); }
 .filter-bar-left { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; min-width: 0; }
 .filter-bar-actions { margin-left: auto; display: flex; align-items: center; gap: 8px; }
 .filter-row {
-  display: flex;
+  display: grid;
+  grid-template-columns: minmax(76px, auto) minmax(0, 1fr);
   align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  padding: 5px 6px;
+  gap: 10px;
+  padding: 1px 3px;
+  border-radius: var(--radius-small);
 }
-.filter-row > span { color: var(--muted); font-size: 12px; }
-.filter-clear { width: 100%; justify-content: center; margin-top: 4px; }
+.filter-row > span {
+  color: var(--muted);
+  font-size: 11.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+/* A quiet heading, not a rule: it separates the routing attributes from
+   the caller's own dimensions without adding another line to a panel
+   that already has thirteen. */
+.filter-group {
+  margin: 7px 3px 3px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--faint, var(--muted));
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+/* A quiet heading, not a rule: it separates the routing attributes from
+   the caller's own dimensions without adding another line to a panel
+   that already has thirteen. */
+.filter-group {
+  margin: 7px 3px 3px;
+  padding-top: 8px;
+  border-top: 1px solid var(--border-soft);
+  color: var(--faint, var(--muted));
+  font-size: 10px;
+  font-weight: 500;
+  letter-spacing: 0.05em;
+  text-transform: uppercase;
+}
+.filter-clear {
+  width: 100%;
+  justify-content: center;
+  margin-top: 5px;
+  padding-top: 7px;
+  border-top: 1px solid var(--border-soft);
+  border-radius: 0;
+  color: var(--muted);
+  font-size: 11.5px;
+}
+.filter-clear:hover { color: var(--text); background: transparent; }
 
 /* Search sits hard right and is the widest thing in the bar: it is the
    control reached for most often, and a fixed-width box next to a
@@ -1528,8 +1623,14 @@ table.dense .meter { min-width: 70px; }
 .range-custom .button { align-self: flex-end; }
 
 /* Active filters read as chips beside the button, removable in place. */
-.filter-chip { height: 24px; padding: 0 4px 0 8px; gap: 6px; }
-.filter-chip-name { color: var(--muted); }
+.filter-chip {
+  height: 24px;
+  padding: 0 4px 0 8px;
+  gap: 6px;
+  max-width: 100%;
+  min-width: 0;
+}
+.filter-chip-name { color: var(--muted); flex: none; }
 
 /* ------------------------------------------------------- provider marks */
 

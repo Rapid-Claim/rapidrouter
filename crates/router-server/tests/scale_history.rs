@@ -62,6 +62,11 @@ fn a_week_of_a_million_requests_a_day_reads_fast() {
                         attempts: 1,
                         tag: None,
                         prompt: None,
+                        meta: Default::default(),
+                        error_class: None,
+                        seat: None,
+                        ttft_ms: None,
+                        queue_lag_ms: None,
                     }
                 })
                 .collect();
@@ -129,8 +134,7 @@ fn a_week_of_a_million_requests_a_day_reads_fast() {
         now,
         &HistoryFilter {
             provider: Some("openai".into()),
-            model: None,
-            vkey: None,
+            ..Default::default()
         },
         false,
     );

@@ -812,3 +812,84 @@ models = ["fast"]
     )
     .expect("a group is a scopable model id");
 }
+
+/// The caller-dimension allowlist: what a gateway will lift out of a
+/// request's `metadata` and make filterable.
+#[test]
+fn trace_keys_default_to_the_useful_dimensions() {
+    let config = load(
+        "[providers.openai]\nkeys = [{ name = \"k\", value = \"sk\" }]\n",
+        &[],
+    )
+    .expect("a config that says nothing about tracing is valid");
+    for key in ["workflow_id", "chart_id", "agent", "stage", "service"] {
+        assert!(
+            config.usage.trace_keys.contains(key),
+            "`{key}` should be a dimension by default"
+        );
+    }
+    assert_eq!(config.usage.trace_value_chars, 128);
+}
+
+#[test]
+fn trace_keys_are_canonicalised_and_may_be_narrowed() {
+    let config = load(
+        "[providers.openai]\nkeys = [{ name = \"k\", value = \"sk\" }]\n\n\
+         [usage]\ntrace_keys = [\"workflow_id\", \"event_processing_tag\", \"patient_id\"]\n",
+        &[],
+    )
+    .expect("an explicit key list is valid");
+    // The caller's spelling folds onto the canonical name, so a filter
+    // written against `stage` works whichever client sent the request.
+    assert!(config.usage.trace_keys.contains("stage"));
+    assert!(!config.usage.trace_keys.contains("event_processing_tag"));
+    // Adding a dimension is config, not a release.
+    assert!(config.usage.trace_keys.contains("patient_id"));
+    // And narrowing means narrowing: what was not listed is not kept.
+    assert!(!config.usage.trace_keys.contains("chart_id"));
+}
+
+#[test]
+fn trace_bounds_are_enforced() {
+    assert_invalid(
+        "[usage]\ntrace_value_chars = 2\n",
+        &[],
+        "usage.trace_value_chars",
+        "between",
+    );
+    assert_invalid(
+        "[usage]\ntrace_keys = [\"work flow\"]\n",
+        &[],
+        "usage.trace_keys[0]",
+        "alphanumeric",
+    );
+    assert_invalid(
+        "[usage]\ntrace_keys = [\"\"]\n",
+        &[],
+        "usage.trace_keys[0]",
+        "empty",
+    );
+    let many = (0..40)
+        .map(|i| format!("\"k{i}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    assert_invalid(
+        &format!("[usage]\ntrace_keys = [{many}]\n"),
+        &[],
+        "usage.trace_keys",
+        "32",
+    );
+}
+
+/// Tracing is switchable off entirely, for a gateway that must not read
+/// caller metadata at all.
+#[test]
+fn an_empty_trace_key_list_is_valid() {
+    let config = load(
+        "[providers.openai]\nkeys = [{ name = \"k\", value = \"sk\" }]\n\n\
+         [usage]\ntrace_keys = []\n",
+        &[],
+    )
+    .expect("an empty list turns the feature off rather than being an error");
+    assert!(config.usage.trace_keys.is_empty());
+}
