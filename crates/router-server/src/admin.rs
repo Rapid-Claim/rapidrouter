@@ -4,7 +4,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use axum::extract::{Path, Query, Request, State};
+use axum::extract::{Path, Query, RawQuery, Request, State};
 use axum::http::StatusCode;
 use axum::http::header::SET_COOKIE;
 use axum::middleware::Next;
@@ -845,9 +845,100 @@ impl RequestsQuery {
     }
 }
 
+/// Caller-dimension constraints, parsed out of the raw query string.
+///
+/// These arrive as `meta.<key>=<value>` — an open namespace, since which
+/// dimensions exist is config rather than something this type can name.
+/// `serde_urlencoded` (what `Query` uses) cannot express that, so the
+/// raw string is read directly instead of being forced into a struct.
+///
+/// Unknown or misspelled keys are kept, not ignored: a filter for a
+/// dimension no record carries must return nothing, because silently
+/// dropping it would answer a different question than the one asked.
+fn meta_filters(raw: Option<&str>) -> Vec<(String, String)> {
+    let Some(raw) = raw else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for pair in raw.split('&') {
+        let Some((key, value)) = pair.split_once('=') else {
+            continue;
+        };
+        let Some(name) = percent_decode(key).strip_prefix("meta.").map(str::to_owned) else {
+            continue;
+        };
+        let value = percent_decode(value);
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        out.push((name, value));
+        // The filter is conjunctive, so more terms only ever narrow the
+        // result; the cap is against a query string built to make the
+        // scan's per-record work unbounded.
+        if out.len() >= 16 {
+            break;
+        }
+    }
+    out
+}
+
+/// Minimal `application/x-www-form-urlencoded` decoding for one
+/// component: `+` is a space, `%XX` is a byte.
+///
+/// Works on bytes throughout rather than slicing the `&str`: the two
+/// characters after a `%` are not necessarily a character boundary — a
+/// literal `%` followed by a multi-byte character is a query string a
+/// browser will happily send, and slicing it would panic on an admin
+/// endpoint.
+fn percent_decode(input: &str) -> String {
+    let bytes = input.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'+' => {
+                out.push(b' ');
+                i += 1;
+            }
+            b'%' => {
+                match (
+                    bytes.get(i + 1).copied().and_then(hex_nibble),
+                    bytes.get(i + 2).copied().and_then(hex_nibble),
+                ) {
+                    (Some(hi), Some(lo)) => {
+                        out.push(hi << 4 | lo);
+                        i += 3;
+                    }
+                    // Not a valid escape: keep the `%` as written rather
+                    // than dropping a character the caller may have meant.
+                    _ => {
+                        out.push(b'%');
+                        i += 1;
+                    }
+                }
+            }
+            other => {
+                out.push(other);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 async fn requests(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RequestsQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
     let now = crate::vkey::unix_now_ms();
     let since = query
@@ -857,6 +948,7 @@ async fn requests(
         provider: query.provider.clone().filter(|v| !v.is_empty()),
         model: query.model.clone().filter(|v| !v.is_empty()),
         vkey: query.key.clone().filter(|v| !v.is_empty()),
+        meta: meta_filters(raw.as_deref()),
     };
     // The cursor is opaque to the console: "ts:request_id", which is
     // exactly the ordering key the reader pages by.
@@ -889,6 +981,7 @@ async fn requests(
 async fn requests_summary(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RequestsQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
     let now = crate::vkey::unix_now_ms();
     let since = query
@@ -898,6 +991,7 @@ async fn requests_summary(
         provider: query.provider.clone().filter(|v| !v.is_empty()),
         model: query.model.clone().filter(|v| !v.is_empty()),
         vkey: query.key.clone().filter(|v| !v.is_empty()),
+        meta: meta_filters(raw.as_deref()),
     };
     let usage = state.usage.clone();
     let until = query.until_ms.unwrap_or(now);
@@ -917,6 +1011,7 @@ async fn requests_summary(
 async fn usage_summary(
     State(state): State<Arc<AppState>>,
     Query(query): Query<RequestsQuery>,
+    RawQuery(raw): RawQuery,
 ) -> Response {
     let now = crate::vkey::unix_now_ms();
     let since = query
@@ -926,6 +1021,7 @@ async fn usage_summary(
         provider: query.provider.clone().filter(|v| !v.is_empty()),
         model: query.model.clone().filter(|v| !v.is_empty()),
         vkey: query.key.clone().filter(|v| !v.is_empty()),
+        meta: meta_filters(raw.as_deref()),
     };
     let usage = state.usage.clone();
     let until = query.until_ms.unwrap_or(now);
@@ -2444,6 +2540,11 @@ async fn history(
         provider: query.provider.filter(|v| !v.is_empty()),
         model: query.model.filter(|v| !v.is_empty()),
         vkey: query.key.filter(|v| !v.is_empty()),
+        // No `meta` here on purpose: `/history` is served from rollups,
+        // whose rows carry no caller dimensions. Accepting a `meta.*`
+        // term would mean ignoring it and answering a different
+        // question; see `UsagePipeline::history_all`.
+        meta: Vec::new(),
     };
     let usage = state.usage.clone();
     let by = by.to_owned();
@@ -2726,3 +2827,75 @@ async fn events(
 
 #[allow(dead_code)]
 fn _assert_json_is_send(_: Value) {}
+
+#[cfg(test)]
+mod meta_filter_tests {
+    use super::*;
+
+    #[test]
+    fn reads_meta_terms_and_ignores_everything_else() {
+        let raw = "limit=100&meta.workflow_id=WORKFLOW_HCC_CONFIRMED&provider=openai&meta.stage=ICD_SEARCH";
+        let filters = meta_filters(Some(raw));
+        assert_eq!(
+            filters,
+            vec![
+                (
+                    "workflow_id".to_owned(),
+                    "WORKFLOW_HCC_CONFIRMED".to_owned()
+                ),
+                ("stage".to_owned(), "ICD_SEARCH".to_owned()),
+            ]
+        );
+    }
+
+    /// Chart ids and agent names travel through a query string, so the
+    /// escapes a browser puts in have to come back out.
+    #[test]
+    fn decodes_percent_escapes_and_plus() {
+        let filters = meta_filters(Some(
+            "meta.chart_id=BS_HMV%2F002209353.pdf&meta.agent=icd+coder",
+        ));
+        assert_eq!(
+            filters,
+            vec![
+                ("chart_id".to_owned(), "BS_HMV/002209353.pdf".to_owned()),
+                ("agent".to_owned(), "icd coder".to_owned()),
+            ]
+        );
+    }
+
+    /// A lone `%` is kept as written rather than swallowed — dropping it
+    /// would silently filter on a different string than the one asked for.
+    #[test]
+    fn a_malformed_escape_is_left_alone() {
+        assert_eq!(
+            meta_filters(Some("meta.agent=100%")),
+            vec![("agent".to_owned(), "100%".to_owned())]
+        );
+        assert_eq!(
+            meta_filters(Some("meta.agent=a%zzb")),
+            vec![("agent".to_owned(), "a%zzb".to_owned())]
+        );
+    }
+
+    #[test]
+    fn empty_terms_and_absent_queries_constrain_nothing() {
+        assert!(meta_filters(None).is_empty());
+        assert!(meta_filters(Some("")).is_empty());
+        assert!(meta_filters(Some("meta.=x")).is_empty());
+        assert!(meta_filters(Some("meta.workflow_id=")).is_empty());
+        assert!(meta_filters(Some("provider=openai&errors=true")).is_empty());
+        assert!(meta_filters(Some("metadata.workflow_id=x")).is_empty());
+    }
+
+    /// The filter is conjunctive, so extra terms only narrow; the cap is
+    /// against a query built to make the per-record work unbounded.
+    #[test]
+    fn the_term_count_is_capped() {
+        let raw = (0..40)
+            .map(|i| format!("meta.k{i}=v"))
+            .collect::<Vec<_>>()
+            .join("&");
+        assert_eq!(meta_filters(Some(&raw)).len(), 16);
+    }
+}

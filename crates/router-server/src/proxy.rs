@@ -3,6 +3,7 @@
 //! dialect traffic forwards raw bytes; cross-dialect traffic translates
 //! through the internal OpenAI-shaped model — sync and streaming.
 
+use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -156,6 +157,7 @@ fn record_failure(
         None => build_hook(state, vk, endpoint, requested, headers, started),
     };
     hook.provider = err.provider.clone().unwrap_or_default();
+    hook.error_class = Some(err.class.as_str());
     hook.complete(err.class.http_status(), TokenUsage::default());
 }
 
@@ -170,8 +172,11 @@ fn build_hook_with_input(
     input: &[u8],
 ) -> UsageHook {
     let mut hook = build_hook(state, vk, endpoint, requested, headers, started);
-    // Only materialise the body when something will store it.
-    if state.usage.capture_limit_for(200) > 0 {
+    // Materialised when anything will *read* it, not only when something
+    // will store it: the prompt preview and the caller's dimensions come
+    // out of this body and belong on the record even where bodies are
+    // never written to disk.
+    if state.usage.wants_input_body() {
         hook.input_body = Some(String::from_utf8_lossy(input).into_owned());
     }
     hook
@@ -211,7 +216,64 @@ fn build_hook(
             .map(str::to_owned),
         seat: None,
         input_body: None,
+        header_dims: header_dims(
+            headers,
+            state.usage.trace_keys(),
+            state.usage.trace_value_chars(),
+        ),
+        error_class: None,
+        ttft_ms: None,
     }
+}
+
+/// Identity headers some clients send alongside (or instead of) the same
+/// keys in the request body.
+///
+/// The contract these clients were written against is that a header
+/// fills a dimension the body omitted — so these are only a starting
+/// point, and the body's own values are merged over them on completion.
+const HEADER_DIMS: &[(&str, &str)] = &[
+    ("x-org-id", "org_id"),
+    ("x-chart-id", "chart_id"),
+    ("x-workflow-id", "workflow_id"),
+];
+
+/// Read the identity headers into canonical dimension names.
+///
+/// Governed by the same allowlist as the body, so narrowing
+/// `usage.trace_keys` — or emptying it to switch the feature off —
+/// closes both doors rather than only the obvious one.
+///
+/// Values are capped to the same length as the body's, rather than
+/// trusted: a header is the one part of this that arrives without
+/// passing through a JSON parse, and an 8 KiB header value should not
+/// become an 8 KiB log column.
+fn header_dims(
+    headers: &HeaderMap,
+    allow: &std::collections::BTreeSet<String>,
+    value_chars: usize,
+) -> BTreeMap<String, String> {
+    let mut out = BTreeMap::new();
+    if allow.is_empty() {
+        return out;
+    }
+    for (header, dim) in HEADER_DIMS {
+        if !allow.contains(*dim) {
+            continue;
+        }
+        let Some(value) = headers.get(*header).and_then(|v| v.to_str().ok()) else {
+            continue;
+        };
+        let value = value.trim();
+        if value.is_empty() {
+            continue;
+        }
+        out.insert(
+            (*dim).to_owned(),
+            value.chars().take(value_chars).collect::<String>(),
+        );
+    }
+    out
 }
 
 /// Cap for buffered (non-streaming) translated response bodies.
@@ -251,6 +313,9 @@ pub enum InboundChat {
     OpenAi {
         body: Bytes,
         span: Option<(usize, usize)>,
+        /// Span of the `metadata` member, which the gateway consumes and
+        /// does not forward.
+        metadata_span: Option<(usize, usize)>,
         model: String,
         stream: bool,
     },
@@ -281,6 +346,7 @@ impl InboundChat {
             return Ok(Self::OpenAi {
                 body,
                 span: Some(probe.model_span),
+                metadata_span: probe.metadata_span,
                 model: probe.model,
                 stream,
             });
@@ -300,6 +366,7 @@ impl InboundChat {
         Ok(Self::OpenAi {
             body,
             span: None,
+            metadata_span: None,
             model: minimal.model,
             stream: minimal.stream,
         })
@@ -388,26 +455,59 @@ impl InboundChat {
     /// Raw same-dialect passthrough body with the model rewritten.
     fn passthrough_body(&self, upstream_model: &str) -> Bytes {
         match self {
-            Self::OpenAi { body, span, .. } => match span {
-                Some(span) => json::splice_model(body, *span, upstream_model),
+            Self::OpenAi {
+                body,
+                span,
+                metadata_span,
+                ..
+            } => match span {
+                Some(span) => json::splice_model_dropping_metadata(
+                    body,
+                    *span,
+                    *metadata_span,
+                    upstream_model,
+                ),
+                // The scanner declined this body, so there is no span to
+                // splice and the slow path rewrites through a parse.
                 None => rewrite_model_value(body, upstream_model),
             },
             Self::Anthropic { value, .. } => {
                 let mut v = value.clone();
                 v["model"] = Value::String(upstream_model.to_owned());
+                drop_metadata(&mut v);
                 Bytes::from(serde_json::to_vec(&v).expect("serializable"))
             }
-            // Gemini carries the model in the URL; the body is untouched.
+            // Gemini carries the model in the URL; the body is otherwise
+            // forwarded as sent, less the attribution the gateway took.
             Self::Gemini { value, .. } => {
-                Bytes::from(serde_json::to_vec(value).expect("serializable"))
+                let mut v = value.clone();
+                drop_metadata(&mut v);
+                Bytes::from(serde_json::to_vec(&v).expect("serializable"))
             }
         }
+    }
+}
+
+/// Take the gateway's attribution channel back out of a parsed body.
+///
+/// `metadata` is read on the way in and belongs to the gateway; no
+/// upstream should see it. That is not only tidiness — the field name is
+/// taken on every provider and none of them accept the shape callers
+/// send here: OpenAI allows at most sixteen string pairs, Anthropic
+/// allows `user_id` and nothing else, so forwarding a caller's nested
+/// `trace_metadata` earns a 400 rather than being ignored.
+fn drop_metadata(value: &mut Value) {
+    if let Some(object) = value.as_object_mut() {
+        object.remove("metadata");
     }
 }
 
 fn rewrite_model_value(body: &Bytes, model: &str) -> Bytes {
     let mut value: Value = serde_json::from_slice(body).expect("validated by from_openai");
     value["model"] = Value::String(model.to_owned());
+    // Same rule as the fast path: `metadata` is the gateway's attribution
+    // channel and is not forwarded.
+    drop_metadata(&mut value);
     Bytes::from(serde_json::to_vec(&value).expect("serializable"))
 }
 
@@ -1638,10 +1738,20 @@ pub async fn handle_relay(
     let requested = json::probe(&body)
         .map(|p| p.model)
         .unwrap_or_else(|| "unknown".to_owned());
+    // Cloning a `Bytes` is a refcount bump, not a copy.
+    let sent = body.clone();
     match run_relay(&state, endpoint, &headers, body, started, vk.as_deref()).await {
         Ok(response) => meter(
             response,
-            build_hook(&state, &vk, endpoint.name(), &requested, &headers, started),
+            build_hook_with_input(
+                &state,
+                &vk,
+                endpoint.name(),
+                &requested,
+                &headers,
+                started,
+                &sent,
+            ),
             Dialect::OpenAi,
             false,
         ),
@@ -1654,7 +1764,7 @@ pub async fn handle_relay(
                 &err,
                 started,
                 &headers,
-                None,
+                Some(&sent),
             );
             error_response(&err)
         }
@@ -1669,8 +1779,8 @@ async fn run_relay(
     started: Instant,
     vk: Option<&VkRuntime>,
 ) -> Result<Response, GatewayError> {
-    let (model, span) = match json::probe(&body) {
-        Some(probe) => (probe.model, Some(probe.model_span)),
+    let (model, span, metadata_span) = match json::probe(&body) {
+        Some(probe) => (probe.model, Some(probe.model_span), probe.metadata_span),
         None => {
             #[derive(serde::Deserialize)]
             struct Minimal {
@@ -1682,7 +1792,7 @@ async fn run_relay(
                     format!("request body is not a valid request object: {err}"),
                 )
             })?;
-            (minimal.model, None)
+            (minimal.model, None, None)
         }
     };
 
@@ -1731,7 +1841,12 @@ async fn run_relay(
             attempts += 1;
             let breaker = route.provider.breaker_for(choice.key);
             let upstream_body = match span {
-                Some(span) => json::splice_model(&body, span, &route.upstream_model),
+                Some(span) => json::splice_model_dropping_metadata(
+                    &body,
+                    span,
+                    metadata_span,
+                    &route.upstream_model,
+                ),
                 None => rewrite_model_value(&body, &route.upstream_model),
             };
             let request = build_upstream_request(
@@ -2488,12 +2603,16 @@ async fn run_responses(
                 )
             } else {
                 match json::probe(&body) {
-                    Some(probe) => {
-                        json::splice_model(&body, probe.model_span, &route.upstream_model)
-                    }
+                    Some(probe) => json::splice_model_dropping_metadata(
+                        &body,
+                        probe.model_span,
+                        probe.metadata_span,
+                        &route.upstream_model,
+                    ),
                     None => {
                         let mut v = value.clone();
                         v["model"] = Value::String(route.upstream_model.clone());
+                        drop_metadata(&mut v);
                         Bytes::from(serde_json::to_vec(&v).expect("serializable"))
                     }
                 }
@@ -2653,6 +2772,10 @@ pub async fn handle_passthrough(
 ) -> Response {
     let started = Instant::now();
     let requested = format!("{provider_name}/*");
+    // Cloning a `Bytes` is a refcount bump, not a copy. Passthrough
+    // forwards opaque bodies, but a caller that attributes its traffic
+    // does so the same way here as anywhere else.
+    let sent = body.clone();
     if let Some(key) = vk.as_deref() {
         if !key.allows_model(&requested, Some(&requested)) {
             let err = GatewayError::new(
@@ -2670,7 +2793,7 @@ pub async fn handle_passthrough(
                 &err,
                 started,
                 &headers,
-                None,
+                Some(&sent),
             );
             return error_response(&err);
         }
@@ -2689,7 +2812,7 @@ pub async fn handle_passthrough(
                 &err,
                 started,
                 &headers,
-                None,
+                Some(&sent),
             );
             return error_response(&err);
         }
@@ -2710,7 +2833,15 @@ pub async fn handle_passthrough(
                 .is_some_and(|v| v.contains("text/event-stream"));
             meter(
                 response,
-                build_hook(&state, &vk, "passthrough", &requested, &headers, started),
+                build_hook_with_input(
+                    &state,
+                    &vk,
+                    "passthrough",
+                    &requested,
+                    &headers,
+                    started,
+                    &sent,
+                ),
                 dialect,
                 stream,
             )
@@ -2724,7 +2855,7 @@ pub async fn handle_passthrough(
                 &err,
                 started,
                 &headers,
-                None,
+                Some(&sent),
             );
             error_response(&err)
         }

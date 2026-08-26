@@ -18,6 +18,27 @@ pub enum ErrorClass {
 }
 
 impl ErrorClass {
+    /// A stable snake_case name for logs and filters.
+    ///
+    /// Distinct from [`Self::openai_type`], which is constrained by what
+    /// the OpenAI error schema names and collapses classes this needs to
+    /// keep apart — a rate limit and an exhausted quota are the same
+    /// `429` to a client and very different things at 3am.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::Authentication => "authentication",
+            Self::Permission => "permission",
+            Self::NotFound => "not_found",
+            Self::PayloadTooLarge => "payload_too_large",
+            Self::RateLimited => "rate_limited",
+            Self::InsufficientQuota => "insufficient_quota",
+            Self::UpstreamError => "upstream_error",
+            Self::NoCapacity => "no_capacity",
+            Self::Timeout => "timeout",
+        }
+    }
+
     pub fn http_status(self) -> u16 {
         match self {
             Self::InvalidRequest => 400,

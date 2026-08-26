@@ -65,6 +65,7 @@ import {
   urlRange,
   urlSearch,
   type DimFilters,
+  urlMeta,
 } from "./route";
 import {
   api,
@@ -3049,6 +3050,16 @@ function Requests(props: { refresh: () => number }) {
   const [provider, setProvider] = urlParam("provider");
   const [model, setModel] = urlParam("model");
   const [vkey, setVkey] = urlParam("key");
+  // Caller dimensions (workflow, chart, agent, stage, …). Which keys
+  // exist is gateway config rather than something this page can name, so
+  // it holds a map and discovers the keys from what arrives.
+  const [meta, setMeta] = urlMeta();
+  const setMetaKey = (key: string, value: string) => {
+    const next = { ...meta() };
+    if (value) next[key] = value;
+    else delete next[key];
+    setMeta(next);
+  };
   // The window is sent to the gateway rather than filtered here: the
   // in-memory tail is ~90 seconds at a million requests a day, so
   // anything older has to be read from the flushed partitions, and only
@@ -3079,20 +3090,20 @@ function Requests(props: { refresh: () => number }) {
   // the old query means nothing under the new one.
   createEffect(
     on(
-      () => [range(), status(), provider(), model(), vkey()] as const,
+      () => [range(), status(), provider(), model(), vkey(), meta()] as const,
       () => { setCursor(null); setStack([]); },
       { defer: true },
     ),
   );
 
   const [records] = createResource(
-    () => [props.refresh(), query(), cursor()] as const,
-    ([, q, after]) => api.requests(q.errors, PAGE_SIZE, { ...q, after: after ?? undefined }),
+    () => [props.refresh(), query(), cursor(), meta()] as const,
+    ([, q, after, m]) => api.requests(q.errors, PAGE_SIZE, { ...q, after: after ?? undefined }, m),
   );
   // Totals for the whole window, independent of which page is open.
   const [summary] = createResource(
-    () => [props.refresh(), query()] as const,
-    ([, q]) => api.requestsSummary(q.errors, q),
+    () => [props.refresh(), query(), meta()] as const,
+    ([, q, m]) => api.requestsSummary(q.errors, q, m),
   );
   const [selected, setSelected] = createSignal<UsageRecord | null>(null);
   const [keys] = createResource(props.refresh, api.keys);
@@ -3106,6 +3117,27 @@ function Requests(props: { refresh: () => number }) {
       .sort()
       .map((v) => ({ value: v, label: v }));
 
+  // Which caller dimensions exist is the gateway's config, so the page
+  // reads them off the records instead of hard-coding a list — a new
+  // dimension added in config shows up here without a console release.
+  // A key currently being filtered on is kept even when the page it
+  // returns happens not to carry it, so a filter can always be cleared.
+  const metaKeys = createMemo(() => {
+    const seen = new Set<string>([
+      ...all().flatMap((r) => Object.keys(r.meta ?? {})),
+      ...Object.keys(meta()),
+    ]);
+    // The dimensions that answer "which piece of work is this" lead;
+    // anything else follows alphabetically.
+    const lead = ["workflow_id", "chart_id", "agent", "stage", "service", "generation"];
+    return [...seen].sort((a, b) => {
+      const ia = lead.indexOf(a);
+      const ib = lead.indexOf(b);
+      if (ia !== ib) return (ia < 0 ? lead.length : ia) - (ib < 0 ? lead.length : ib);
+      return a.localeCompare(b);
+    });
+  });
+
   // Only the free-text search narrows client-side; everything else is
   // already applied by the gateway, so re-applying it here would only
   // risk the two disagreeing.
@@ -3113,7 +3145,7 @@ function Requests(props: { refresh: () => number }) {
     const needle = search().trim().toLowerCase();
     if (!needle) return all();
     return all().filter((record) =>
-      `${record.requested} ${routeLabel(record)} ${record.vkey ?? ""} ${record.status} ${record.request_id} ${record.prompt ?? ""}`
+      `${record.requested} ${routeLabel(record)} ${record.vkey ?? ""} ${record.status} ${record.request_id} ${record.prompt ?? ""} ${Object.values(record.meta ?? {}).join(" ")} ${record.error_class ?? ""} ${record.seat ?? ""}`
         .toLowerCase()
         .includes(needle),
     );
@@ -3151,6 +3183,17 @@ function Requests(props: { refresh: () => number }) {
           onChange: setVkey,
           options: (keys()?.data ?? []).map((k) => ({ value: k.id, label: k.name, hint: k.id })),
         },
+        ...metaKeys().map((key) => ({
+          id: `meta.${key}`,
+          label: metaTermLabel(key),
+          value: meta()[key] ?? "",
+          onChange: (value: string) => setMetaKey(key, value),
+          options: facet((r) => r.meta?.[key]),
+          // Grouped apart from status/provider/model: those describe how
+          // the gateway handled a request, these describe what work it
+          // belonged to, and the two are answered at different moments.
+          group: "Caller context",
+        })),
       ]}
     />
     <Loading when={summary.loading && !summary()} skeleton="stats" rows={5}>
@@ -3289,6 +3332,45 @@ function prefetchBodies(record: UsageRecord): void {
   void fetchBodies(record).catch(() => {});
 }
 
+/// `workflow_id` reads as "Workflow id" — used for both the filter
+/// label and the drawer's term, so the two always agree.
+function metaTermLabel(key: string): string {
+  return key.replace(/_/g, " ").replace(/^./, (c) => c.toUpperCase());
+}
+
+/// A lag in whichever unit keeps it readable: milliseconds of queueing
+/// is a number, an hour of it is a backlog, and "3600000 ms" reads as
+/// neither.
+function formatDuration(ms: number): string {
+  if (ms < 1000) return `${formatNumber(ms)} ms`;
+  if (ms < 60_000) return `${(ms / 1000).toFixed(1)} s`;
+  if (ms < 3_600_000) return `${(ms / 60_000).toFixed(1)} min`;
+  return `${(ms / 3_600_000).toFixed(1)} h`;
+}
+
+/// The dimensions worth showing in a table cell, most identifying first.
+///
+/// Two at most: the cell competes with the prompt for width, and a row
+/// that lists every dimension a caller sent stops being scannable. The
+/// rest are one hover (or one click into the drawer) away.
+///
+/// Ordered by how much each one distinguishes one row from the next —
+/// `stage` moves call to call within a workflow, where `agent` is often
+/// the same value down the whole page and says correspondingly less.
+const CONTEXT_CHIP_KEYS = ["workflow_id", "stage", "agent", "service", "generation", "chart_id"];
+
+function contextChips(record: UsageRecord): string[] {
+  const meta = record.meta ?? {};
+  return CONTEXT_CHIP_KEYS.filter((key) => meta[key]).slice(0, 2).map((key) => meta[key]);
+}
+
+/// Every dimension, `key=value` per line, for the cell's tooltip.
+function contextTitle(record: UsageRecord): string {
+  return Object.entries(record.meta ?? {})
+    .map(([key, value]) => `${key}=${value}`)
+    .join("\n");
+}
+
 /// One request, opened: what was sent, what came back, and the metadata
 /// that describes the trip.
 ///
@@ -3338,6 +3420,14 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
             <div><dt>Requested</dt><dd class="mono">{record.requested}</dd></div>
             <div><dt>Endpoint</dt><dd class="mono">{record.endpoint}</dd></div>
             <div><dt>Virtual key</dt><dd class="mono">{record.vkey ?? "—"}</dd></div>
+            {/* Which *account* served it. `Route` names the provider; on a
+                pooled provider that is not enough to find the seat. */}
+            <Show when={record.seat}>
+              <div><dt>Seat</dt><dd class="mono">{record.seat}</dd></div>
+            </Show>
+            <Show when={record.error_class}>
+              <div><dt>Failure</dt><dd class="mono">{record.error_class}</dd></div>
+            </Show>
             <div><dt>Attempts</dt><dd>{record.attempts}{record.attempts > 1 ? " (retried)" : ""}</dd></div>
             <div><dt>Streaming</dt><dd>{record.stream ? "Yes" : "No"}</dd></div>
             <div><dt>Request id</dt><dd class="mono wrap">{record.request_id}</dd></div>
@@ -3352,10 +3442,29 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
             <div><dt>Total tokens</dt><dd>{formatNumber(record.input_tokens + record.output_tokens)}</dd></div>
             <div><dt>Cost</dt><dd>{formatUsd(record.cost_micro_usd / 1e6)}</dd></div>
             <div><dt>Latency</dt><dd>{formatNumber(record.latency_ms)} ms</dd></div>
+            <Show when={record.ttft_ms !== undefined}>
+              <div><dt>First byte</dt><dd>{formatNumber(record.ttft_ms ?? 0)} ms</dd></div>
+            </Show>
             <div><dt>Gateway overhead</dt><dd>{formatNumber(record.overhead_us)} µs</dd></div>
+            {/* Time spent in front of the gateway, which no gateway-side
+                number can see — a large value here means the caller's own
+                queue is the backlog, not this hop. */}
+            <Show when={record.queue_lag_ms !== undefined}>
+              <div><dt>Queued before arrival</dt><dd>{formatDuration(record.queue_lag_ms ?? 0)}</dd></div>
+            </Show>
             <div><dt>Time</dt><dd>{new Date(record.ts).toLocaleString()}</dd></div>
           </dl>
         </section>
+        <Show when={Object.keys(record.meta ?? {}).length}>
+          <section class="drawer-card context">
+            <h3>Caller context</h3>
+            <dl>
+              <For each={Object.entries(record.meta ?? {})}>{([key, value]) =>
+                <div><dt>{metaTermLabel(key)}</dt><dd class="mono wrap">{value}</dd></div>
+              }</For>
+            </dl>
+          </section>
+        </Show>
       </div>
       <div class="drawer-section">
         <SectionTitle
@@ -3425,6 +3534,7 @@ function RequestRows(props: {
           <thead><tr>
             <th>Time</th>
             <th>Route</th>
+            <Show when={!props.compact}><th>Context</th></Show>
             <Show when={!props.compact}><th>Prompt</th></Show>
             <Show when={!props.compact}><th>Tokens</th><th>Cost</th></Show>
             <th>Latency</th>
@@ -3449,6 +3559,15 @@ function RequestRows(props: {
               {routeLabel(record)}
             </td>
             <Show when={!props.compact}>
+              <td class="context-cell" title={contextTitle(record)}>
+                <Show when={contextChips(record).length} fallback={<span class="muted">—</span>}>
+                  <For each={contextChips(record)}>{(value) =>
+                    <span class="chip dim-chip">{value}</span>
+                  }</For>
+                </Show>
+              </td>
+            </Show>
+            <Show when={!props.compact}>
               <td class="prompt-cell" title={record.prompt ?? ""}>
                 <Show when={record.prompt} fallback={<span class="muted">—</span>}>{record.prompt}</Show>
               </td>
@@ -3458,7 +3577,15 @@ function RequestRows(props: {
               <td class="nowrap">{formatUsd(record.cost_micro_usd / 1e6)}</td>
             </Show>
             <td class="nowrap">{record.latency_ms} ms</td>
-            <td><Status text={String(record.status)} tone={record.status < 400 ? "success" : "danger"} /></td>
+            {/* The class is the title rather than a column: it only
+                exists on failures, and a column that is empty on the 99%
+                of rows that succeeded is a column nobody reads. */}
+            <td title={record.error_class ?? ""}>
+              <Status
+                text={record.error_class ?? String(record.status)}
+                tone={record.status < 400 ? "success" : "danger"}
+              />
+            </td>
           </tr>}</For></tbody>
         </table>
       </div>
