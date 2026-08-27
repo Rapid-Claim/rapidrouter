@@ -91,7 +91,7 @@ docker run --rm -m 8g \
   -v "$PWD":/work -w /work \
   -v rr-cargo-registry:/usr/local/cargo/registry \
   -v rr-target:/target -e CARGO_TARGET_DIR=/target \
-  -e CARGO_BUILD_JOBS=2 rust:1 <command>
+  -e CARGO_BUILD_JOBS=1 rust:1 <command>
 ```
 
 `rust:1` resolved to **1.98.0-aarch64-unknown-linux-gnu**.
@@ -163,7 +163,7 @@ management operations, against a store-backed gateway.
 Every pre-existing suite still passes, including `e2e_conformance`,
 `e2e_dialect_matrix`, `e2e_reliability`, `e2e_responses`,
 `e2e_subscriptions`, `e2e_passthrough`, `selection_properties`,
-`loom_models`, `fleet`, `backends`, `store`. That is the 429 total.
+`loom_models`, `fleet`, `backends`, `store`. That is the 432 total.
 
 ### Bugs found by these tests
 
