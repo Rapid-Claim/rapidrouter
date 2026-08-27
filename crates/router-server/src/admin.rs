@@ -1073,7 +1073,13 @@ async fn list_users(State(state): State<Arc<AppState>>) -> Response {
             })
         })
         .collect();
-    Json(json!({ "data": data })).into_response()
+    Json(json!({
+        "data": data,
+        // The declared services, so the console can offer them rather than
+        // making an operator type a name that has to match exactly.
+        "tenants": state.config.load().tenants.iter().collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 #[derive(Deserialize)]
@@ -1497,6 +1503,11 @@ async fn add_provider_keys(
     if let Err(response) = writable(&state) {
         return response;
     }
+    for key in &input.keys {
+        if let Err(message) = check_tenant(&state, key.tenant.as_deref()) {
+            return api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+        }
+    }
     let (version, mut doc) = match config_document(&state) {
         Ok(pair) => pair,
         Err(response) => return *response,
@@ -1873,6 +1884,9 @@ struct NewProvider {
 
 #[derive(Deserialize)]
 struct NewKey {
+    /// Which service owns this account; omitted = unassigned.
+    #[serde(default)]
+    tenant: Option<String>,
     name: String,
     /// `env.VAR`, `file:/path`, `store.name`, or a literal.
     value: String,
@@ -1887,6 +1901,9 @@ fn key_entry(key: &NewKey, fallback_models: &[String]) -> toml_edit::InlineTable
     let mut entry = toml_edit::InlineTable::new();
     entry.insert("name", key.name.clone().into());
     entry.insert("value", key.value.clone().into());
+    if let Some(tenant) = &key.tenant {
+        entry.insert("tenant", tenant.as_str().into());
+    }
     if let Some(weight) = key.weight {
         entry.insert("weight", weight.into());
     }
@@ -2082,6 +2099,9 @@ async fn add_provider_key(
 ) -> Response {
     if let Err(response) = writable(&state) {
         return response;
+    }
+    if let Err(message) = check_tenant(&state, input.tenant.as_deref()) {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
     }
     let (version, mut doc) = match config_document(&state) {
         Ok(pair) => pair,
@@ -2607,6 +2627,10 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                         "name": k.name,
                         "weight": k.weight,
                         "models": k.models,
+                        // Which service owns this account; `null` = nobody
+                        // owns it, and in a labelled pool that means it
+                        // serves nobody until someone assigns it.
+                        "tenant": k.tenant,
                         "health": k.breaker.health(now),
                         // The breaker only knows about failures. A seat
                         // sitting at 100% of its plan window has failed
@@ -2683,6 +2707,9 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                 "kind": format!("{:?}", p.kind),
                 "subscription": p.kind.is_subscription(),
                 "base_url": p.base_url,
+                // A pool nobody has divided up is shared by every caller.
+                // The console needs to know which it is looking at.
+                "managed": p.managed,
                 "keys": keys,
             })
         })

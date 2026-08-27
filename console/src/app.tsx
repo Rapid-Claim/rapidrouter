@@ -598,6 +598,7 @@ function Providers(props: { refresh: () => number }) {
       <Show when={current() ? selected() : ""} keyed>{(name) => (
         <ProviderAccounts
           provider={current()!}
+          tenants={providers()?.tenants ?? []}
           probes={probes()}
           checking={checking()}
           onCheck={runProbe}
@@ -645,6 +646,8 @@ function Providers(props: { refresh: () => number }) {
 /// seats can be sixty-five, and nothing on an ungrouped row says so.
 function ProviderAccounts(props: {
   provider: Provider;
+  /// Declared services, for the per-account owner picker.
+  tenants: string[];
   probes: Record<string, { status: string; detail: string }>;
   checking: string | null;
   onCheck: (provider: string, key?: string) => Promise<void>;
@@ -980,6 +983,7 @@ function ProviderAccounts(props: {
                   />
                 </th>
                 <SortHeader label="Credential" column="credential" sort={sort()} onSort={sortBy} />
+                <th>Service</th>
                 <SortHeader
                   label={provider().subscription ? "Plan windows" : "Limits"}
                   column="headroom"
@@ -995,6 +999,17 @@ function ProviderAccounts(props: {
                   providerKey={key}
                   kind={provider().kind}
                   subscription={provider().subscription}
+                  tenants={props.tenants}
+                  managed={provider().managed}
+                  onAssign={async (tenant) => {
+                    props.onError("");
+                    try {
+                      await api.setAccountTenant(provider().name, key.name, tenant);
+                      props.onDone();
+                    } catch (err) {
+                      props.onError(err instanceof Error ? err.message : "Could not change the owning service");
+                    }
+                  }}
                   checking={props.checking === "*" || props.checking === key.name}
                   probe={props.probes[key.name] ?? null}
                   group={groups().get(key.name) ?? null}
@@ -1019,7 +1034,7 @@ function ProviderAccounts(props: {
       </Show>
     </div>
 
-    <AddCredential provider={provider()} onDone={props.onDone} onError={props.onError} />
+    <AddCredential provider={provider()} tenants={props.tenants} onDone={props.onDone} onError={props.onError} />
 
     {/* Sticky to the bottom of the drawer's own scroll area rather than
         the viewport, so it belongs to the table it acts on and cannot
@@ -1749,10 +1764,42 @@ function DeviceLoginDialog(props: {
 }
 
 /// One credential as a table row.
+/// Assigning an account — or a key — to a service.
+///
+/// A select rather than a text box: the services are declared, so an
+/// operator should never be able to mistype one into a state where the
+/// account belongs to nobody.
+function ServicePicker(props: {
+  value: string | null;
+  tenants: string[];
+  label: string;
+  onChange: (tenant: string | null) => Promise<void>;
+}) {
+  const [busy, setBusy] = createSignal(false);
+  return <select
+    class="service-picker"
+    aria-label={props.label}
+    disabled={busy()}
+    value={props.value ?? ""}
+    onChange={async (e) => {
+      const next = e.currentTarget.value;
+      setBusy(true);
+      try { await props.onChange(next === "" ? null : next); }
+      finally { setBusy(false); }
+    }}
+  >
+    <option value="">Unassigned</option>
+    <For each={props.tenants}>{(t) => <option value={t}>{t}</option>}</For>
+  </select>;
+}
+
 function CredentialRow(props: {
   providerKey: ProviderKey;
   kind: string;
   subscription: boolean;
+  tenants: string[];
+  managed: boolean;
+  onAssign: (tenant: string | null) => Promise<void>;
   onRemove: () => void;
   onCheck: () => void;
   onLogin: () => void;
@@ -1879,6 +1926,14 @@ function CredentialRow(props: {
       </Show>
     </td>
     <td>
+      <ServicePicker
+        value={key().tenant}
+        tenants={props.tenants}
+        label={`Service owning ${key().name}`}
+        onChange={props.onAssign}
+      />
+    </td>
+    <td>
       <Show when={props.subscription} fallback={
         <Show when={key().limits.rpm || key().limits.tpm} fallback={<span class="muted">No ceiling set</span>}>
           <small>
@@ -1990,7 +2045,7 @@ function BaseUrlEditor(props: { provider: Provider; onDone: () => void; onError:
 /// Adding a credential to an existing provider, with the same per-kind
 /// capture as the add dialog: a setup token for Claude Code, an
 /// auth.json upload for Codex, a reference for metered keys.
-function AddCredential(props: { provider: Provider; onDone: () => void; onError: (msg: string) => void }) {
+function AddCredential(props: { provider: Provider; tenants: string[]; onDone: () => void; onError: (msg: string) => void }) {
   const [open, setOpen] = createSignal(false);
   const [name, setName] = createSignal("");
   const [value, setValue] = createSignal("");
@@ -1998,6 +2053,7 @@ function AddCredential(props: { provider: Provider; onDone: () => void; onError:
   const [seats, setSeats] = createSignal<Seat[]>([]);
   const [rpm, setRpm] = createSignal("");
   const [tpm, setTpm] = createSignal("");
+  const [tenant, setTenant] = createSignal("");
   const [pending, setPending] = createSignal(false);
   const kind = () => {
     const k = props.provider.kind.toLowerCase();
@@ -2020,6 +2076,7 @@ function AddCredential(props: { provider: Provider; onDone: () => void; onError:
               written.written.map((entry, i) => ({
                 name: seats()[i]?.name ?? entry.name,
                 value: entry.reference,
+                ...(tenant() ? { tenant: tenant() } : {}),
               })),
             );
             if (result.skipped.length) {
@@ -2038,6 +2095,7 @@ function AddCredential(props: { provider: Provider; onDone: () => void; onError:
           }
           await api.addProviderKey(props.provider.name, {
             name: name(), value: credential,
+            ...(tenant() ? { tenant: tenant() } : {}),
             ...(rpm() ? { rpm: Number(rpm()) } : {}),
             ...(tpm() ? { tpm: Number(tpm()) } : {}),
           });
@@ -2073,6 +2131,14 @@ function AddCredential(props: { provider: Provider; onDone: () => void; onError:
         </div>
         <Show when={kind() === "plain"}>
           <div class="field-row" style={{ "margin-top": "12px" }}>
+            <Show when={props.tenants.length}>
+              <label>Service <span class="optional">Optional</span>
+                <select value={tenant()} onChange={(e) => setTenant(e.currentTarget.value)}>
+                  <option value="">Unassigned</option>
+                  <For each={props.tenants}>{(t) => <option value={t}>{t}</option>}</For>
+                </select>
+              </label>
+            </Show>
             <label>Requests / min <span class="optional">Optional</span><input type="number" min="1" value={rpm()} onInput={(e) => setRpm(e.currentTarget.value)} /></label>
             <label>Tokens / min <span class="optional">Optional</span><input type="number" min="1" value={tpm()} onInput={(e) => setTpm(e.currentTarget.value)} /></label>
           </div>
@@ -2324,8 +2390,9 @@ function PoolEditor(props: {
 
 function Keys(props: { refresh: () => number; bump: () => void }) {
   const [keys, { refetch }] = createResource(props.refresh, api.keys);
-  const [providers] = createResource(props.refresh, api.providers);
+  const [providers, { refetch: refetchProviders }] = createResource(props.refresh, api.providers);
   const [creating, setCreating] = createSignal(false);
+  const [managing, setManaging] = createSignal("");
   const [revealed, setRevealed] = createSignal("");
   const [search, setSearch] = createSignal("");
   const [name, setName] = createSignal("");
@@ -2377,8 +2444,15 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
     <section class="panel">
       <SectionTitle title="Virtual keys" subtitle="Scoped credentials with limits, budgets, and immediate revocation" />
       <Loading when={keys.loading && !keys()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No virtual keys" action="Create a key for an application or team." />}>
-        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table><thead><tr><th>Name</th><th>Scope</th><th>Rate</th><th>Budget</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>
-          <For each={shown()}>{(key) => <KeyRow key={key} reload={reload} reveal={setRevealed} />}</For>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table"><table><thead><tr><th>Name</th><th>Scope</th><th>Service</th><th>Accounts</th><th>Rate</th><th>Budget</th><th>Status</th><th><span class="sr-only">Actions</span></th></tr></thead><tbody>
+          <For each={shown()}>{(key) => <KeyRow
+            key={key}
+            tenants={providers()?.tenants ?? []}
+            accounts={key.tenant ? accountsFor(providers()?.data ?? [], key.tenant) : null}
+            onManage={() => key.tenant && setManaging(key.tenant)}
+            reload={reload}
+            reveal={setRevealed}
+          />}</For>
         </tbody></table></div>
       </Show>
       </Loading>
@@ -2412,7 +2486,10 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
             />
           </label>
           <label>Service <span class="optional">Optional</span>
-            <input value={tenant()} placeholder="e.g. optimizer" onInput={(e) => setTenant(e.currentTarget.value)} />
+            <select value={tenant()} onChange={(e) => setTenant(e.currentTarget.value)}>
+              <option value="">Unassigned</option>
+              <For each={providers()?.tenants ?? []}>{(t) => <option value={t}>{t}</option>}</For>
+            </select>
             <small class="muted">Which service this key belongs to. Every service uses the whole account pool; the declared floors decide who pauses first when it runs low.</small>
           </label>
           <div class="disclosure" classList={{ open: advanced() }}>
@@ -2459,6 +2536,15 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
       </div>
     </Show>
 
+    <Show when={managing()} keyed>{(service) => (
+      <KeyAccounts
+        service={service}
+        providers={providers()?.data ?? []}
+        onClose={() => setManaging("")}
+        onChanged={async () => { await refetchProviders(); }}
+      />
+    )}</Show>
+
     <Show when={revealed()}>
       <div class="secret-banner" role="status">
         <div><strong>Copy this key now</strong><code>{revealed()}</code></div>
@@ -2468,8 +2554,107 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
   </div>;
 }
 
-function KeyRow(props: { key: VirtualKey; reload: () => Promise<void>; reveal: (value: string) => void }) {
-  return <tr><td><strong>{props.key.name}</strong><small class="mono">{props.key.id}</small></td><td>{props.key.models.length ? props.key.models.join(", ") : "All models"}<Show when={props.key.tenant}><small>{`service ${props.key.tenant}`}</small></Show></td><td>{props.key.rate?.rpm ? `${props.key.rate.rpm} RPM` : "Unlimited"}</td><td>{props.key.budget ? `${formatUsd(props.key.budget.usd)} / ${props.key.budget.period}` : "None"}</td><td><Status text={props.key.enabled ? "Active" : "Revoked"} tone={props.key.enabled ? "success" : "muted"} /></td><td class="actions"><button class="icon-button" title={`Rotate ${props.key.name}`} aria-label={`Rotate ${props.key.name}`} onClick={async () => { const result = await api.rotateKey(props.key.id); props.reveal(result.key); await props.reload(); }}><RefreshCw size={16} /></button><button class="icon-button danger" title={`Delete ${props.key.name}`} aria-label={`Delete ${props.key.name}`} onClick={async () => { if (confirm(`Delete ${props.key.name}?`)) { await api.deleteKey(props.key.id); await props.reload(); } }}><Trash2 size={16} /></button></td></tr>;
+/// Which accounts a key's service owns, and the two operations that change
+/// it: take one away, or bring one in.
+///
+/// Accounts belong to a *service*, not to a key — so this manages the whole
+/// service's pool, and every key of that service is affected. Said plainly
+/// in the subtitle, because the drawer is opened from one key and it would
+/// otherwise read as that key's private list.
+function KeyAccounts(props: {
+  service: string;
+  providers: Provider[];
+  onClose: () => void;
+  onChanged: () => Promise<void>;
+}) {
+  const [busy, setBusy] = createSignal("");
+  const [error, setError] = createSignal("");
+  const [adding, setAdding] = createSignal("");
+
+  const all = createMemo(() =>
+    props.providers.flatMap((p) => p.keys.map((k) => ({ provider: p.name, key: k }))),
+  );
+  const mine = createMemo(() => all().filter((a) => a.key.tenant === props.service));
+  const available = createMemo(() => all().filter((a) => a.key.tenant !== props.service));
+
+  const assign = async (provider: string, account: string, tenant: string | null) => {
+    setBusy(`${provider}/${account}`); setError("");
+    try { await api.setAccountTenant(provider, account, tenant); await props.onChanged(); }
+    catch (err) { setError(err instanceof Error ? err.message : "Failed"); }
+    finally { setBusy(""); }
+  };
+
+  return <Drawer
+    open
+    wide
+    title={`Accounts for ${props.service}`}
+    subtitle="Accounts belong to the service, so every key of this service shares them"
+    onClose={props.onClose}
+  >
+    <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+    <div class="drawer-section">
+      <SectionTitle title={`${mine().length} account${mine().length === 1 ? "" : "s"}`} subtitle="Removing one leaves it unassigned — it is not deleted" />
+      <Show when={mine().length} fallback={<Empty title="No accounts" action="This service cannot serve anything until it is given one." />}>
+        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
+          <table class="dense">
+            <thead><tr><th>Account</th><th>Provider</th><th>Health</th><th><span class="sr-only">Actions</span></th></tr></thead>
+            <tbody><For each={mine()}>{(a) => <tr>
+              <td><strong>{a.key.credential?.email ?? a.key.name}</strong></td>
+              <td class="muted">{a.provider}</td>
+              <td>{a.key.status ?? a.key.health}</td>
+              <td class="actions">
+                <button
+                  class="icon-button danger"
+                  title={`Remove ${a.key.name} from ${props.service}`}
+                  aria-label={`Remove ${a.key.name} from ${props.service}`}
+                  disabled={busy() === `${a.provider}/${a.key.name}`}
+                  onClick={() => assign(a.provider, a.key.name, null)}
+                ><Trash2 size={16} /></button>
+              </td>
+            </tr>}</For></tbody>
+          </table>
+        </div>
+      </Show>
+    </div>
+    <div class="drawer-section">
+      <SectionTitle title="Add an account" subtitle="Taking one from another service moves it — nothing is copied" />
+      <div class="field-row">
+        <label>Account
+          <select value={adding()} onChange={(e) => setAdding(e.currentTarget.value)}>
+            <option value="">Choose an account…</option>
+            <For each={available()}>{(a) => (
+              <option value={`${a.provider}\u0000${a.key.name}`}>
+                {`${a.provider} / ${a.key.credential?.email ?? a.key.name}`}
+                {a.key.tenant ? ` — currently ${a.key.tenant}` : " — unassigned"}
+              </option>
+            )}</For>
+          </select>
+        </label>
+        <button
+          class="button primary"
+          disabled={!adding() || Boolean(busy())}
+          onClick={async () => {
+            const [provider, account] = adding().split("\u0000");
+            if (!provider || !account) return;
+            await assign(provider, account, props.service);
+            setAdding("");
+          }}
+        >Add to {props.service}</button>
+      </div>
+    </div>
+  </Drawer>;
+}
+
+/// How many accounts one service owns, across every pool.
+function accountsFor(providers: Provider[], service: string): number {
+  return providers.reduce(
+    (total, p) => total + p.keys.filter((k) => k.tenant === service).length,
+    0,
+  );
+}
+
+function KeyRow(props: { key: VirtualKey; tenants: string[]; accounts: number | null; onManage: () => void; reload: () => Promise<void>; reveal: (value: string) => void }) {
+  return <tr><td><strong>{props.key.name}</strong><small class="mono">{props.key.id}</small></td><td>{props.key.models.length ? props.key.models.join(", ") : "All models"}</td><td><ServicePicker value={props.key.tenant ?? null} tenants={props.tenants} label={`Service for ${props.key.name}`} onChange={async (tenant) => { await api.updateKey(props.key.id, { tenant }); await props.reload(); }} /></td><td>{props.key.tenant ? <button class="button outline small" onClick={props.onManage}>{`${props.accounts ?? 0} account${props.accounts === 1 ? "" : "s"}`}</button> : <span class="muted">—</span>}</td><td>{props.key.rate?.rpm ? `${props.key.rate.rpm} RPM` : "Unlimited"}</td><td>{props.key.budget ? `${formatUsd(props.key.budget.usd)} / ${props.key.budget.period}` : "None"}</td><td><Status text={props.key.enabled ? "Active" : "Revoked"} tone={props.key.enabled ? "success" : "muted"} /></td><td class="actions"><button class="icon-button" title={`Rotate ${props.key.name}`} aria-label={`Rotate ${props.key.name}`} onClick={async () => { const result = await api.rotateKey(props.key.id); props.reveal(result.key); await props.reload(); }}><RefreshCw size={16} /></button><button class="icon-button danger" title={`Delete ${props.key.name}`} aria-label={`Delete ${props.key.name}`} onClick={async () => { if (confirm(`Delete ${props.key.name}?`)) { await api.deleteKey(props.key.id); await props.reload(); } }}><Trash2 size={16} /></button></td></tr>;
 }
 
 type TrendPoint = [number, number];

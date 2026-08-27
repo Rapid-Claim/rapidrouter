@@ -231,3 +231,81 @@ async fn moving_an_account_that_does_not_exist_is_a_404() {
         404
     );
 }
+
+/// An account can be given its service at the moment it is added, so a new
+/// account never has to spend a moment belonging to nobody.
+#[tokio::test]
+async fn an_account_can_be_added_straight_into_a_service() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+
+    let added = admin
+        .post(format!("{}/admin/api/providers/pool/keys", gw.url))
+        .json(&json!({ "name": "seat-3", "value": "sk-3", "tenant": "kris" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(added.status(), 200);
+
+    for _ in 0..5 {
+        assert_eq!(chat(&gw, "ck-aaaaaa-s3cret").await.status(), 200);
+    }
+    assert_eq!(
+        accounts_used(&gw),
+        BTreeSet::from(["sk-3".to_owned()]),
+        "the new account serves kris immediately, and nothing else does"
+    );
+}
+
+/// Adding an account for a service nobody declared is refused, rather than
+/// silently creating an account that serves nobody.
+#[tokio::test]
+async fn adding_an_account_for_a_ghost_service_is_refused() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+
+    let refused = admin
+        .post(format!("{}/admin/api/providers/pool/keys", gw.url))
+        .json(&json!({ "name": "seat-3", "value": "sk-3", "tenant": "ghost" }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 422);
+    let body: Value = refused.json().await.unwrap();
+    assert!(
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("no service named `ghost`"),
+        "got {body}"
+    );
+}
+
+/// Deleting an account removes it from its service's pool, and the service
+/// is then told it has nothing rather than quietly falling through.
+#[tokio::test]
+async fn deleting_an_account_takes_it_out_of_its_service() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+
+    assert_eq!(
+        move_account(&admin, &gw, "seat-2", json!("kris"))
+            .await
+            .status(),
+        200
+    );
+    assert_eq!(chat(&gw, "ck-aaaaaa-s3cret").await.status(), 200);
+
+    let removed = admin
+        .delete(format!("{}/admin/api/providers/pool/keys/seat-2", gw.url))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(removed.status(), 200);
+
+    assert_eq!(
+        chat(&gw, "ck-aaaaaa-s3cret").await.status(),
+        403,
+        "kris owns nothing again, and does not reach agi's seat-1"
+    );
+}

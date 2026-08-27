@@ -103,14 +103,14 @@ docker run --rm -m 8g \
 | G1 formatting | `cargo fmt --all --check` | **PASS** |
 | G2 compiles | `cargo check --workspace --all-targets` | **PASS**, no errors |
 | G3 lints | `cargo clippy --workspace --all-targets` | **PASS**, 0 warnings |
-| G4 tests | `cargo test --workspace` | **429 passed, 0 failed** |
+| G4 tests | `cargo test --workspace` | **432 passed, 0 failed** |
 | G5 console types | `npm run typecheck` | **PASS** |
 | G6 console build | `npm run build` | **PASS** (234 kB js, 46 kB css) |
 
 G1–G4 are the same four commands `.github/workflows/ci.yml` runs, so this is
 CI-equivalent.
 
-### New tests written for this change — 17
+### New tests written for this change — 20
 
 **Unit, `router-core/src/router.rs`** (6)
 
@@ -145,8 +145,8 @@ traffic went where it should, not that a status code was 200.
 | `the_relay_honours_the_labels` | `/passthrough/…` stays inside the caller's accounts — the bypass this work found |
 | `a_service_does_not_weaken_authentication` | a bad secret is still 401 |
 
-**End to end, `router-server/tests/e2e_account_moves.rs`** (4) — the
-management operation, against a store-backed gateway.
+**End to end, `router-server/tests/e2e_account_moves.rs`** (7) — the
+management operations, against a store-backed gateway.
 
 | Test | Proves |
 |---|---|
@@ -154,6 +154,9 @@ management operation, against a store-backed gateway.
 | `unassigning_an_account_takes_it_out_of_service` | `null` puts it back to belonging to nobody |
 | `moving_an_account_to_a_service_that_does_not_exist_is_refused` | 422, and the assignment is unchanged |
 | `moving_an_account_that_does_not_exist_is_a_404` | not a silent no-op |
+| `an_account_can_be_added_straight_into_a_service` | a new account can arrive already owned, and serves immediately |
+| `adding_an_account_for_a_ghost_service_is_refused` | 422 rather than an account that serves nobody |
+| `deleting_an_account_takes_it_out_of_its_service` | its service is told it owns nothing, and does not fall through |
 
 ### Regressions
 
@@ -178,11 +181,43 @@ Four, all mine, all fixed:
 
 ---
 
+## 3b · The management UI
+
+Both surfaces are built.
+
+**Providers drawer** — each credential row now has a **Service** column with
+a dropdown of the declared services (plus *Unassigned*). Changing it moves
+the account. The add-credential form offers the same dropdown, so an account
+can arrive already owned rather than spending a moment belonging to nobody.
+
+**Virtual keys page** — each key shows its **Service** (a dropdown that
+reassigns the key) and an **Accounts** button with the count its service
+owns. That opens a drawer listing those accounts across every pool, with:
+
+- **Remove** on each — unassigns it. The account is not deleted, and the
+  drawer says so.
+- **Add an account** — a picker of every account not already owned by this
+  service, each labelled with its current owner, so taking one from another
+  service is a visible act rather than an accident.
+
+The drawer's subtitle states the thing that is easy to get wrong: accounts
+belong to the *service*, not to the key you opened it from, so every key of
+that service is affected.
+
+Server side, the providers endpoint now reports each account's `tenant` and
+the pool's `managed` flag, plus the roster of declared services — so the
+console offers names rather than making an operator type one that has to
+match exactly.
+
+**Not verified by an automated test:** the console changes typecheck and
+build, and every API call behind them has an end-to-end test, but no
+browser test drives the new controls. The existing Playwright suite was not
+extended.
+
 ## 4 · What is not done
 
 | Item | Why it matters |
 |---|---|
-| **Console table** with per-service rows and the +/− control | The API exists and is tested; there is no UI. Today a move is a `curl`. `holding()` already returns the two counts each row needs. |
 | **Per-service usage metrics** | You cannot yet see what each service spends, which is what would tell you a service needs another account. |
 | **Session stickiness** (`x-rapid-session`) | A multi-turn agent run is spread across accounts, and prompt caching is per account — so an agent run may pay full price every turn. Unmeasured. Blocks the optimizer migration. |
 | **Optimizer and Caret migration** | Neither has been touched. Plan in [docs/components/account-pools.md](docs/components/account-pools.md) §7–§10. |
