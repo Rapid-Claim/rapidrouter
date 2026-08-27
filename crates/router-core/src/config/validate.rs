@@ -229,6 +229,7 @@ fn validate_virtual_keys(
                 prev_secret: None,
                 models: rk.models.clone(),
                 tenant: rk.tenant.clone(),
+                lease_accounts: rk.lease_accounts,
                 budget,
                 rate,
                 expires_ms,

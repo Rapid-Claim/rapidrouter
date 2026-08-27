@@ -461,6 +461,7 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
                 prev_secret: None,
                 models: models.clone(),
                 tenant: tenant.clone(),
+                lease_accounts: false,
                 budget,
                 rate,
                 expires_ms,

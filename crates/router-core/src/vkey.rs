@@ -40,6 +40,15 @@ pub struct VirtualKeyDef {
     /// every declared service.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
+    /// Whether this key may be handed an account's credential to spend
+    /// directly, rather than only spending it through the gateway.
+    ///
+    /// Off by default, and deliberately a separate switch from naming a
+    /// service: using an account through the gateway is weaker than
+    /// holding it. Only a caller that must drive a vendor CLI — which
+    /// cannot be pointed at us — should be able to take one.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub lease_accounts: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -57,6 +66,10 @@ pub struct VirtualKeyDef {
 
 fn default_true() -> bool {
     true
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -563,6 +576,7 @@ mod tests {
             prev_secret: None,
             models: Vec::new(),
             tenant: None,
+            lease_accounts: false,
             budget: None,
             rate: None,
             expires_ms: None,

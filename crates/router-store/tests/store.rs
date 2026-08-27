@@ -45,6 +45,7 @@ fn key_def(id: &str) -> VirtualKeyDef {
         prev_secret: None,
         models: vec!["openai/gpt-4o-mini".into()],
         tenant: None,
+        lease_accounts: false,
         budget: None,
         rate: None,
         expires_ms: None,

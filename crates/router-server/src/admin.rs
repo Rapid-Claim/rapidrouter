@@ -549,6 +549,8 @@ struct KeyInput {
     #[serde(default)]
     tenant: Option<String>,
     #[serde(default)]
+    lease_accounts: bool,
+    #[serde(default)]
     budget: Option<Budget>,
     #[serde(default)]
     rate: Option<RateLimit>,
@@ -564,6 +566,7 @@ struct KeyView<'a> {
     name: &'a str,
     models: &'a [String],
     tenant: Option<&'a str>,
+    lease_accounts: bool,
     budget: Option<Budget>,
     rate: Option<RateLimit>,
     expires_ms: Option<u64>,
@@ -578,6 +581,7 @@ fn key_view(def: &VirtualKeyDef) -> KeyView<'_> {
         name: &def.name,
         models: &def.models,
         tenant: def.tenant.as_deref(),
+        lease_accounts: def.lease_accounts,
         budget: def.budget,
         rate: def.rate,
         expires_ms: def.expires_ms,
@@ -659,6 +663,7 @@ async fn create_key(
         prev_secret: None,
         models: input.models,
         tenant: input.tenant,
+        lease_accounts: input.lease_accounts,
         budget: input.budget,
         rate: input.rate,
         expires_ms: input.expires_ms,

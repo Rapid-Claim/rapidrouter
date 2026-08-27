@@ -114,6 +114,45 @@ The console surface (not yet built) is a table per provider:
 account, and relabels it. `holding()` already returns the two counts each
 row needs.
 
+## 5b · Lending an account to a CLI that cannot be proxied
+
+Some clients cannot be pointed here. A vendor CLI signed in to a
+subscription talks to its own backend on its own terms, and standing in
+front of it would mean emulating that backend's whole auth flow
+([../guides/coding-agents.md](../guides/coding-agents.md#codex)).
+
+For those, the gateway stays the place accounts are **owned and allocated**
+and lends the credential out instead:
+
+```
+POST /v1/accounts/lease      Authorization: Bearer ck-…
+     { "provider": "codex" }
+
+→ { "provider": "codex", "account": "seat-07",
+    "email": "…", "expires_at_ms": …,
+    "auth": "<the credential document, ready to write into the CLI's home>" }
+```
+
+Same ownership rule as a routed request: a service is handed an account
+labelled for it, or nothing. `403` if it owns none here, `429` if it owns
+some and they are all out of quota.
+
+Two things make lending safe:
+
+- **The key must be allowed to.** `lease_accounts = true` on the virtual
+  key, off by default. Holding a credential is strictly more than spending
+  it through the gateway, so naming a service is not enough on its own.
+- **The refresh token never leaves.** The gateway is the only writer
+  permitted to rotate a credential; a borrower that could refresh would
+  invalidate the account for every other holder — one cooperative process
+  causing a fleet-wide outage. The document goes out with that field
+  blanked, which is also what the optimizer's own last-mile guard insists
+  on before it will use a credential.
+
+What this does *not* give you is spend visibility: traffic on a lent account
+goes straight to the vendor, so the gateway sees the lease and not the
+requests. That is the trade for supporting a client that cannot be proxied.
+
 ## 6 · Validation
 
 Refused when the config loads:
