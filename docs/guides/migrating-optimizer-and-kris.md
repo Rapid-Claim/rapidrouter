@@ -45,20 +45,12 @@ OPENAI_BASE_URL=http://<router>:8091/v1
 OPENAI_API_KEY=ck-…                      # same key, API-key mode
 ```
 
-Both forms are already documented and supported
-([coding-agents.md](coding-agents.md)). The gateway holds the ChatGPT
-subscription credentials upstream; **the CLI stops needing to know
-subscription seats exist at all.**
+The gateway holds the subscription credentials upstream; **the CLI stops
+needing to know subscription seats exist at all.** That is the whole idea.
 
-That last sentence is the whole optimizer migration. It is not "make the
-Codex CLI's subscription mode talk to us" — it is "stop using subscription
-mode in the CLI."
-
-### What is genuinely unverified
-
-The dialect matrix in CI exercises these *wire formats*, not the CLI
-binaries. Nobody has run the real `claude` or `codex` binary against
-rapid-router with a `ck-…` key. Do that once, first — §3.
+The Claude half of it works. **The Codex half does not** — the form above is
+what the old guide claimed and it turned out to be wrong when run. See §3,
+which is a measurement rather than a plan.
 
 ## 3 · Step 0 — done, and here is what it found
 
