@@ -60,31 +60,33 @@ The dialect matrix in CI exercises these *wire formats*, not the CLI
 binaries. Nobody has run the real `claude` or `codex` binary against
 rapid-router with a `ck-…` key. Do that once, first — §3.
 
-## 3 · Step 0 — prove it, before writing any code
+## 3 · Step 0 — done, and here is what it found
 
-Against a dev router, half a day at most:
+Run 2026-08-27 against a live rapid-router (mock upstream, two services, one
+labelled account each, real CLI binaries).
 
-```bash
-# a dev gateway with one labelled account and one key
-ANTHROPIC_BASE_URL=http://localhost:8080/anthropic \
-ANTHROPIC_AUTH_TOKEN=ck-… \
-  claude -p "say hello"
+| CLI | Result |
+|---|---|
+| `claude 2.1.238` | **Works.** Requests arrived, the virtual key was attributed, and only the account labelled for that key's service served them. |
+| `codex-cli 0.146.0` | **Does not work.** `OPENAI_BASE_URL` is ignored — the CLI went to `api.openai.com`. A `model_provider` in `config.toml` produced *no connection to the gateway at all*: its Responses transport opens a WebSocket (`wss://…/v1/responses`) the gateway does not serve, and `wire_api = "chat"` is rejected outright by that version. |
 
-OPENAI_BASE_URL=http://localhost:8080/v1 \
-OPENAI_API_KEY=ck-… \
-  codex exec "say hello"
-```
+Also verified in the same run: label enforcement over real HTTP. One service
+sent seven requests and another three; each drained only its own account's
+allowance, and the unassigned account served nobody.
 
-Check three things, not one:
+**Consequence for this migration.** Kris's Claude runtime can move now. The
+optimizer is Codex-first, so its main path is blocked until one of these
+changes:
 
-- It answers.
-- The **right account** served it — `GET /admin/api/requests` names the
-  credential, and the account should be one labelled for that key's service.
-- A **multi-turn** run works, not just a one-shot. Tool calls and streaming
-  are where a proxy usually breaks.
+1. **The gateway serves the WebSocket Responses transport.** This is the real
+   fix and it is on our side, not OpenAI's.
+2. A newer `codex-cli` honours a plain-HTTP `model_provider`.
+3. The optimizer's Codex work moves to a client that speaks plain HTTP.
 
-**If the Codex CLI refuses an arbitrary `OPENAI_BASE_URL`**, stop and say
-so. Everything below assumes it does not.
+Until then the optimizer keeps leasing Codex seats from `agipool` — which
+works — while its Claude runs can route. The code ships that way: Claude
+routing is on with the two variables, and Codex routing sits behind a third,
+`RAPID_OPTIMIZER_LLM_ROUTER_CODEX`, off by default and documented as unproven.
 
 ## 4 · Router-side preparation
 
@@ -278,8 +280,9 @@ they do, the gateway behaves exactly as it does today.
 
 ## 9 · Open questions
 
-1. **Codex CLI subscription mode** — assumed unnecessary once the CLI uses
-   API-key mode against the router. Confirm in §3.
+1. ~~Codex CLI subscription mode~~ — **answered, and worse than expected**:
+   the CLI cannot be pointed at the gateway at all (§3). The gateway would
+   need to serve the WebSocket Responses transport.
 2. **Prompt caching across a run** — unmeasured. §6.5. Could block §6.
 3. **`/passthrough/…` and stateful endpoints** — the relay now spreads
    across a service's accounts. Anything relaying files, batches or

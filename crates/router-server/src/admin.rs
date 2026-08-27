@@ -1073,13 +1073,7 @@ async fn list_users(State(state): State<Arc<AppState>>) -> Response {
             })
         })
         .collect();
-    Json(json!({
-        "data": data,
-        // The declared services, so the console can offer them rather than
-        // making an operator type a name that has to match exactly.
-        "tenants": state.config.load().tenants.iter().collect::<Vec<_>>(),
-    }))
-    .into_response()
+    Json(json!({ "data": data })).into_response()
 }
 
 #[derive(Deserialize)]
@@ -2714,7 +2708,13 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
             })
         })
         .collect();
-    Json(json!({ "data": data })).into_response()
+    Json(json!({
+        "data": data,
+        // The declared services, so the console can offer them rather than
+        // making an operator type a name that has to match exactly.
+        "tenants": state.config.load().tenants.iter().collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 /// One word for the state of a credential, folding together the three

@@ -4,8 +4,10 @@ Agents are the heaviest, most dialect-sensitive LLM clients you run —
 streaming tool use, parallel calls, prompt caching, very long sessions.
 Routing them through rapid-router gives you provider failover, key
 management, spend metering, and model swapping without touching the agent.
-Each client below is a scripted scenario in our CI
-([../api/02-dialects.md](../api/02-dialects.md)).
+The dialects below are scripted scenarios in our CI
+([../api/02-dialects.md](../api/02-dialects.md)) — that covers the wire
+formats, not the CLI binaries, which is why each entry says what was actually
+run against a live gateway and when.
 
 ## Claude Code
 
@@ -14,6 +16,10 @@ export ANTHROPIC_BASE_URL=http://localhost:8080/anthropic
 export ANTHROPIC_AUTH_TOKEN=<gateway key, if auth is enabled>
 claude
 ```
+
+**Verified** against `claude 2.1.238` on 2026-08-27: requests arrived, the
+virtual key was attributed, and the account labelled for that key's service
+served them.
 
 - Requests arrive in Anthropic's dialect; prompt-caching headers pass
   through, so cache hits (and their cost/latency wins) are preserved.
@@ -29,14 +35,21 @@ claude
 
 ## Codex
 
-Codex speaks the Responses API:
+**Not currently working — measured, not assumed.** Against `codex-cli
+0.146.0` on 2026-08-27:
 
-```bash
-export OPENAI_BASE_URL=http://localhost:8080/v1
-codex
-```
+- `OPENAI_BASE_URL` is **ignored**. The CLI went to `api.openai.com` and
+  never opened a connection to the gateway.
+- A `model_provider` in `config.toml` pointing at the gateway produced no
+  connection either: the Responses transport opens a **WebSocket**
+  (`wss://…/v1/responses`) that the gateway does not serve.
+- `wire_api = "chat"` is rejected by that version — *"no longer supported"*.
 
-`/v1/responses` relays the full surface to OpenAI/Azure targets and
+So a Codex CLI cannot presently be pointed here. Serving the WebSocket
+Responses transport is what would close the gap.
+
+`/v1/responses` itself is unaffected and works for any client that speaks
+plain HTTP Responses — it relays the full surface to OpenAI/Azure targets and
 translates the stateless core elsewhere
 ([../api/01-endpoints.md](../api/01-endpoints.md)).
 
