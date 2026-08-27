@@ -35,23 +35,44 @@ served them.
 
 ## Codex
 
-**Not currently working — measured, not assumed.** Against `codex-cli
-0.146.0` on 2026-08-27:
+`OPENAI_BASE_URL` does **not** work — measured against `codex-cli 0.146.0`
+on 2026-08-27, the CLI ignored it and went to `api.openai.com`. Neither does
+a `model_provider` in `config.toml`: that transport opens a WebSocket
+(`wss://…/v1/responses`) the gateway does not serve, and `wire_api = "chat"`
+is rejected by that version as no longer supported.
 
-- `OPENAI_BASE_URL` is **ignored**. The CLI went to `api.openai.com` and
-  never opened a connection to the gateway.
-- A `model_provider` in `config.toml` pointing at the gateway produced no
-  connection either: the Responses transport opens a **WebSocket**
-  (`wss://…/v1/responses`) that the gateway does not serve.
-- `wire_api = "chat"` is rejected by that version — *"no longer supported"*.
+The knob that *does* redirect it is **`chatgpt_base_url`** — the ChatGPT
+subscription backend, which is how the CLI talks when it is signed in to a
+plan rather than using an API key:
 
-So a Codex CLI cannot presently be pointed here. Serving the WebSocket
-Responses transport is what would close the gap.
+```toml
+# $CODEX_HOME/config.toml
+chatgpt_base_url = "http://localhost:8080"
+```
 
-`/v1/responses` itself is unaffected and works for any client that speaks
-plain HTTP Responses — it relays the full surface to OpenAI/Azure targets and
-translates the stateless core elsewhere
-([../api/01-endpoints.md](../api/01-endpoints.md)).
+Confirmed working: with that set, the CLI sends its whole backend
+conversation to the gateway. The gateway accepts the model call on
+`/backend-api/codex/responses`, the path that backend uses.
+
+**One thing still blocks a complete run**, and it is an auth-flow problem
+rather than a routing one. Before the first model call the CLI:
+
+1. fetches `/plugins/featured`, `/ps/plugins/{installed,suggested,list}`,
+   `/api/codex/settings/user`, `/api/codex/ps/mcp` and
+   `/codex/analytics-events/events` from that base — a gateway must answer
+   these or the CLI stalls; and
+2. **refreshes its access token unconditionally** against a hard-coded auth
+   host, so a fabricated `auth.json` is rejected and the run never reaches
+   the model.
+
+`CODEX_ACCESS_TOKEN` looks like the way round (2) but puts the CLI into
+"Agent Identity" mode, which refuses a non-production ChatGPT base outright.
+`CODEX_REFRESH_TOKEN_URL_OVERRIDE` exists and is the untested candidate: a
+gateway that also answers the refresh could hand back a virtual key and close
+the loop.
+
+So: routing a subscription Codex CLI needs a small ChatGPT-backend shim in
+the gateway — the side endpoints above plus the refresh — not just a route.
 
 ## Anything OpenAI-compatible (Cursor, Continue, aider, …)
 

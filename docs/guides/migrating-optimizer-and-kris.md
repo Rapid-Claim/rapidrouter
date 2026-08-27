@@ -60,7 +60,7 @@ labelled account each, real CLI binaries).
 | CLI | Result |
 |---|---|
 | `claude 2.1.238` | **Works.** Requests arrived, the virtual key was attributed, and only the account labelled for that key's service served them. |
-| `codex-cli 0.146.0` | **Does not work.** `OPENAI_BASE_URL` is ignored — the CLI went to `api.openai.com`. A `model_provider` in `config.toml` produced *no connection to the gateway at all*: its Responses transport opens a WebSocket (`wss://…/v1/responses`) the gateway does not serve, and `wire_api = "chat"` is rejected outright by that version. |
+| `codex-cli 0.146.0` | **Redirects, but does not complete.** Not via `OPENAI_BASE_URL` (ignored) or a `model_provider` (wants a WebSocket) — via **`chatgpt_base_url`**, the subscription backend, which sends the CLI's whole conversation to the gateway. The gateway now accepts the model call on `/backend-api/codex/responses`. What blocks a full run is the auth flow: the CLI answers to a handful of backend side-endpoints first, then refreshes its token against a hard-coded auth host and rejects a fabricated `auth.json`. See [coding-agents.md](coding-agents.md#codex). |
 
 Also verified in the same run: label enforcement over real HTTP. One service
 sent seven requests and another three; each drained only its own account's
@@ -70,8 +70,11 @@ allowance, and the unassigned account served nobody.
 optimizer is Codex-first, so its main path is blocked until one of these
 changes:
 
-1. **The gateway serves the WebSocket Responses transport.** This is the real
-   fix and it is on our side, not OpenAI's.
+1. **The gateway grows a small ChatGPT-backend shim**: the side endpoints the
+   CLI calls before its first model call, plus the token refresh — pointed at
+   with `CODEX_REFRESH_TOKEN_URL_OVERRIDE` — handing back a virtual key. This
+   is the real fix, it is on our side, and it is close: redirection already
+   works and the model endpoint is already served.
 2. A newer `codex-cli` honours a plain-HTTP `model_provider`.
 3. The optimizer's Codex work moves to a client that speaks plain HTTP.
 

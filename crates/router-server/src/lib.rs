@@ -632,6 +632,12 @@ pub fn build_router(state: Arc<AppState>) -> Router {
     let v1 = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/responses", post(responses))
+        // The Codex CLI in ChatGPT-subscription mode posts here, not to
+        // `/v1/responses` — same Responses body, the path its backend uses.
+        // Point its `chatgpt_base_url` at the gateway and it arrives on this
+        // route with a virtual key, so a subscription CLI can be routed
+        // without leaving subscription mode.
+        .route("/backend-api/codex/responses", post(responses))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/speech", post(audio_speech))
