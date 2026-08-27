@@ -59,7 +59,8 @@ curl http://localhost:8080/v1/chat/completions \
 | [components/console.md](components/console.md) | The web console: product pages, bundling into the binary, design system |
 | [components/virtual-keys.md](components/virtual-keys.md) | Virtual keys: scoped credentials, budgets, rate limits, lifecycle |
 | [components/agent-subscriptions.md](components/agent-subscriptions.md) | Serving traffic from Claude Code / Codex subscription seats, and what is not yet verified |
-| [components/account-pools.md](components/account-pools.md) | Dividing one pool of provider accounts between services: floors, surplus, and borrowing |
+| [components/account-pools.md](components/account-pools.md) | One pool of provider accounts, and the service label that says who may spend each one |
+| [guides/migrating-optimizer-and-kris.md](guides/migrating-optimizer-and-kris.md) | Moving the optimizer and Kris off their own credentials and onto the shared pool |
 
 ### Providers & operations
 | Doc | Contents |
