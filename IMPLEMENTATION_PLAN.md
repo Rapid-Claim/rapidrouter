@@ -198,3 +198,7 @@ been compiled is how a small pile of mechanical errors becomes a large one.
 - `COMPLETED.md` records exactly which commands were run and what they
   printed — not a claim that they were run.
 - Anything not tested is named as untested. No exceptions, no hedging.
+
+> **Superseded by `FINAL-PLAN.md` (2026-08-27).** This file records what was
+> planned before the lease endpoint, the console work and the live test rounds.
+> Its test-gate section is still accurate; nothing else here should be followed.

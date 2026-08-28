@@ -76,7 +76,7 @@ because the reasons still apply if anyone is tempted to re-add them:
 |---|---|
 | A per-key hash slice (`max_accounts`) | Invisible, unstable and unmovable — you could not say *which* accounts, and the assignment shifted under you. Measured: it also left ~40% of a 70-account pool idle while oversubscribing the rest. |
 | Floors + priority + cutoffs | Protected *access* at the end of the pool but never limited *consumption*, which was the actual worry. And "AGI gets the rest" made the lowest-priority service permanently paused. |
-| Borrowing, leases, a reconciler, hysteresis | All artifacts of partitioning the pool and then needing to un-partition it. Deleting the partition deleted the problem. |
+| Borrowing between services, ownership leases, a reconciler, hysteresis | All artifacts of partitioning the pool and then needing to un-partition it. Deleting the partition deleted the problem. **Not to be confused with `/v1/accounts/lease`** (§3c), which is a different thing entirely: lending a credential to a client that cannot be proxied, not moving ownership between services. |
 | A utilization gate on lending | Measured wrong: the router normalizes load, so a pool crosses any threshold together — the gate was open when nobody needed it and shut when they did. |
 | An `accounts = […]` pin on keys | A second mechanism answering the same question as the label. Two overlapping answers is how the relay bypass happened. |
 
@@ -103,14 +103,14 @@ docker run --rm -m 8g \
 | G1 formatting | `cargo fmt --all --check` | **PASS** |
 | G2 compiles | `cargo check --workspace --all-targets` | **PASS**, no errors |
 | G3 lints | `cargo clippy --workspace --all-targets` | **PASS**, 0 warnings |
-| G4 tests | `cargo test --workspace` | **432 passed, 0 failed** |
+| G4 tests | `cargo test --workspace` | **440 passed, 0 failed** |
 | G5 console types | `npm run typecheck` | **PASS** |
 | G6 console build | `npm run build` | **PASS** (234 kB js, 46 kB css) |
 
 G1–G4 are the same four commands `.github/workflows/ci.yml` runs, so this is
 CI-equivalent.
 
-### New tests written for this change — 20
+### New tests written for this change — 28
 
 **Unit, `router-core/src/router.rs`** (6)
 
@@ -213,6 +213,23 @@ match exactly.
 build, and every API call behind them has an end-to-end test, but no
 browser test drives the new controls. The existing Playwright suite was not
 extended.
+
+## 3c · Lending a credential (`POST /v1/accounts/lease`)
+
+Added after live testing showed a subscription-mode Codex CLI cannot be
+pointed at the gateway. A service asks with its virtual key, is handed an
+account **labelled for it**, and drives its own CLI with it. Same ownership
+rule; `403` if it owns none, `429` if all of its own are spent.
+
+Two guards: `lease_accounts` must be set on the key (holding a credential is
+more than spending it through us), and the refresh token is blanked on the
+way out (the gateway must be the only writer that rotates a credential).
+
+Five e2e tests in `e2e_account_lease.rs`, including that a live refresh token
+never appears in what goes out. Three unit tests on the defanging helper.
+
+**The trade:** traffic on a lent account goes straight to the vendor, so the
+gateway sees the lease and not the requests.
 
 ## 4 · What is not done
 
