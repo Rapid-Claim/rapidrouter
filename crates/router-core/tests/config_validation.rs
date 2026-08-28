@@ -869,5 +869,3 @@ models = ["fast"]
     )
     .expect("a group is a scopable model id");
 }
-
-

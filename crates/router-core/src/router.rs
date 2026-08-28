@@ -1388,7 +1388,7 @@ cooldown_secs = 1
         let r = t.resolve("openai/m").unwrap();
 
         for _ in 0..2_000 {
-            r.provider.admit_key("m", 0).unwrap();
+            r.provider.admit_key("m", None, 0).unwrap();
         }
 
         // Exactly level, not merely close: an independent weighted draw
@@ -1413,7 +1413,7 @@ keys = [
         );
         let r = t.resolve("openai/m").unwrap();
         for _ in 0..400 {
-            r.provider.admit_key("m", 0).unwrap();
+            r.provider.admit_key("m", None, 0).unwrap();
         }
         let leases = |name: &str| {
             r.provider
@@ -1440,7 +1440,7 @@ keys = [
         out.breaker.record_failure(0);
         out.breaker.record_failure(0);
         for _ in 0..300 {
-            let choice = r.provider.admit_key("m", 10).unwrap();
+            let choice = r.provider.admit_key("m", None, 10).unwrap();
             assert_ne!(choice.key.unwrap().name, "k0");
         }
         assert_eq!(out.leases(), 0);
@@ -1451,14 +1451,19 @@ keys = [
         out.breaker.record_success(400);
         for _ in 0..100 {
             assert_eq!(
-                r.provider.admit_key("m", 400).unwrap().key.unwrap().name,
+                r.provider
+                    .admit_key("m", None, 400)
+                    .unwrap()
+                    .key
+                    .unwrap()
+                    .name,
                 "k0"
             );
         }
         // Level again — and it stops taking every request.
         assert!(
             (0..40)
-                .filter_map(|_| r.provider.admit_key("m", 400))
+                .filter_map(|_| r.provider.admit_key("m", None, 400))
                 .any(|c| c.key.unwrap().name != "k0"),
             "a caught-up seat rejoins the rotation"
         );
@@ -1470,7 +1475,7 @@ keys = [
         let table = RoutingTable::from_config(&before);
         let r = table.resolve("openai/m").unwrap();
         for _ in 0..300 {
-            r.provider.admit_key("m", 0).unwrap();
+            r.provider.admit_key("m", None, 0).unwrap();
         }
         drop(r);
 
