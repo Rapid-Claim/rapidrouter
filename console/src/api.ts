@@ -183,32 +183,8 @@ export type UsageRecord = {
    * Extracted by the gateway at record time — absent on records written
    * before that shipped. */
   prompt?: string;
-  /** Caller-supplied dimensions read out of the request's `metadata` —
-   * which workflow, chart, agent and pipeline stage this call belongs to.
-   * Which keys appear is gateway config (`usage.trace_keys`), so treat
-   * this as an open map rather than a known shape. */
-  meta?: Record<string, string>;
-  /** Why a failed request failed, beyond its status: `rate_limited`,
-   * `insufficient_quota`, `timeout`, `no_capacity`, … */
-  error_class?: string;
-  /** The account that served it, as `provider/key`. */
-  seat?: string;
-  /** Milliseconds to the first response byte. */
-  ttft_ms?: number;
-  /** Milliseconds this request waited in the caller's queue before it
-   * reached the gateway, from the caller's own event timestamp. */
-  queue_lag_ms?: number;
 };
 
-/** Caller-dimension constraints, sent as `meta.<key>=<value>`. */
-export type MetaFilter = Record<string, string | undefined>;
-
-/** Append `meta.*` terms to a query string, skipping empty ones. */
-function appendMeta(params: URLSearchParams, meta?: MetaFilter) {
-  for (const [key, value] of Object.entries(meta ?? {})) {
-    if (value !== undefined && value !== "") params.set(`meta.${key}`, value);
-  }
-}
 
 export type UsageSlice = {
   name: string;
@@ -372,38 +348,32 @@ export const api = {
       key?: string;
       after?: string;
     },
-    meta?: MetaFilter,
   ) => {
     const params = new URLSearchParams({ limit: String(limit), errors: String(errors) });
     for (const [name, value] of Object.entries(window ?? {})) {
       if (value !== undefined && value !== "") params.set(name, String(value));
     }
-    appendMeta(params, meta);
     return request<{ data: UsageRecord[]; next: string | null }>(`/requests?${params}`);
   },
   /** Totals for the selected range and filters, independent of paging. */
   requestsSummary: (
     errors = false,
     window?: { since_ms?: number; until_ms?: number; provider?: string; model?: string; key?: string },
-    meta?: MetaFilter,
   ) => {
     const params = new URLSearchParams({ errors: String(errors) });
     for (const [name, value] of Object.entries(window ?? {})) {
       if (value !== undefined && value !== "") params.set(name, String(value));
     }
-    appendMeta(params, meta);
     return request<RequestsSummary>(`/requests/summary?${params}`);
   },
   /** Totals, groupings and a trend series for a window — one scan, one trip. */
   usageSummary: (
     window?: { since_ms?: number; until_ms?: number; provider?: string; model?: string; key?: string },
-    meta?: MetaFilter,
   ) => {
     const params = new URLSearchParams({ errors: "false" });
     for (const [name, value] of Object.entries(window ?? {})) {
       if (value !== undefined && value !== "") params.set(name, String(value));
     }
-    appendMeta(params, meta);
     return request<UsageSummary>(`/usage/summary?${params}`);
   },
   /** What was sent and what came back, for one request. */

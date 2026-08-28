@@ -251,23 +251,24 @@ them. Nothing in the repo does; the consumers were not audited.
 
 ## 5 · Note on the working tree
 
-This branch was lifted out of the main checkout, which had other people's
-uncommitted work interleaved in the same files. `proxy.rs` and `admin.rs`
-came across carrying half of somebody's `trace_keys` / `ttft_ms` /
-`HistoryFilter.meta` feature and did not compile. Both were reset to `HEAD`
-and this change re-applied cleanly on top.
+This branch was lifted out of the main checkout while somebody else's
+`trace_keys` / `ttft_ms` / `HistoryFilter.meta` work sat uncommitted in the
+same files, so it came across carrying part of that feature.
 
-Three files still carry ~31 lines of that work, because it is interleaved
-with mine and cannot be separated by hand: `config/raw.rs`, `config/mod.rs`,
-`config/validate.rs`. It is additive (new config fields), it compiles, and
-git will see it as already-present when this rebases onto a main that has it
-committed. `console/src/app.tsx` may likewise carry some of their console
-work; it typechecks and builds.
+**Removed on 2026-08-28, when the branch was rebased onto `origin/main`.**
+That work had by then been merged as #24 and reverted as #25, so carrying it
+here would have re-landed something main had deliberately backed out — under
+the wrong author. What was taken out: the `trace_keys` / `trace_value_chars`
+config fields and their validation, `DEFAULT_TRACE_KEYS`,
+`canonical_trace_key`, four tests in `config_validation.rs`, the
+`meta` / `MetaFilter` / `appendMeta` / `error_class` / `seat` / `ttft_ms` /
+`queue_lag_ms` surface in `console/src/api.ts`, and the meta filter, facets
+and detail-drawer rows in `console/src/app.tsx` — for which `Requests`,
+`RequestDrawer` and `RequestRows` were restored wholesale from `origin/main`,
+as was `console/src/styles.css`.
 
-**The main checkout was left untouched.** Nothing there was reverted,
-because whose work is whose could not be established with confidence.
-
----
+Verified afterwards: `git diff origin/main` adds no line mentioning any of
+those identifiers, and `tsc --noEmit` and the Rust suite are both clean.
 
 ## 6 · Repeating the verification
 

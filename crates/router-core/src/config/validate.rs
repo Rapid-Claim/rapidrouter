@@ -357,44 +357,6 @@ fn validate_usage(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> super::Usag
             "must be between 1 and 3650",
         ));
     }
-    // A dimension becomes a log column and a filter facet, so the cap is
-    // on how many can exist at all rather than on any one request.
-    if u.trace_keys.len() > 32 {
-        errors.push(ConfigError::new(
-            "usage.trace_keys",
-            "must list 32 keys or fewer",
-        ));
-    }
-    let mut trace_keys = BTreeSet::new();
-    for (i, key) in u.trace_keys.iter().enumerate() {
-        let canonical = super::canonical_trace_key(key.trim());
-        if canonical.is_empty() {
-            errors.push(ConfigError::new(
-                format!("usage.trace_keys[{i}]"),
-                "must not be empty",
-            ));
-            continue;
-        }
-        // The key lands in a query string (`?meta.workflow_id=…`) and in
-        // a JSON field name, so keep it to the shape both read cleanly.
-        if !canonical
-            .chars()
-            .all(|c| c.is_ascii_alphanumeric() || c == '_')
-        {
-            errors.push(ConfigError::new(
-                format!("usage.trace_keys[{i}]"),
-                "must be ASCII alphanumeric or underscore",
-            ));
-            continue;
-        }
-        trace_keys.insert(canonical.to_owned());
-    }
-    if !(8..=1024).contains(&u.trace_value_chars) {
-        errors.push(ConfigError::new(
-            "usage.trace_value_chars",
-            "must be between 8 and 1024",
-        ));
-    }
     super::UsageConfig {
         retention_days: u.retention_days,
         flush_interval: Duration::from_secs(u.flush_interval_secs),
@@ -402,8 +364,6 @@ fn validate_usage(raw: &RawConfig, errors: &mut Vec<ConfigError>) -> super::Usag
         capture_bodies,
         body_limit_bytes: u.body_limit_bytes,
         body_retention_days: u.body_retention_days,
-        trace_keys,
-        trace_value_chars: u.trace_value_chars,
     }
 }
 

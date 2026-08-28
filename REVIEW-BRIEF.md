@@ -283,13 +283,10 @@ see §6.1.
 - Nothing merged, pushed or deployed; three branches.
 - The optimizer's `agipool` source swap (§8.7).
 - Per-service usage metrics; no browser test drives the new console controls.
-- The rapidrouter main checkout holds other people's uncommitted work; this
-  branch was lifted out of it and carries some of theirs in the diff.
-  **This was understated in an earlier draft as "~31 lines in three config
-  files".** It is closer to ~110 lines of a `trace_keys` / `trace_value_chars`
-  feature across `config/{mod,raw,validate}.rs`, ~80 lines of tests for it in
-  `tests/config_validation.rs`, and the majority of the console diff
-  (`meta`/`MetaFilter`/facets/detail-drawer in `api.ts` and `app.tsx`, and most
-  of `styles.css`). All of it is inert on this branch — nothing consumes
-  `usage.trace_keys` and `UsageRecord` has no `meta`/`seat`/`ttft_ms` field —
-  but a reviewer told "31 lines" will misattribute several hundred.
+- The rapidrouter main checkout held other people's uncommitted work, and this
+  branch came across carrying part of it — the `trace_keys` / `ttft_ms` /
+  `meta` feature, roughly 110 lines of config plus ~80 lines of tests and most
+  of the console diff. **Removed 2026-08-28** when the branch was rebased onto
+  `origin/main`, where that feature had been merged (#24) and then reverted
+  (#25). See `COMPLETED.md` §5 for exactly what was taken out and how it was
+  verified.
