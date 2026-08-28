@@ -34,21 +34,16 @@ pub struct VirtualKeyDef {
     /// Which service this key belongs to.
     ///
     /// A tenant is a *service* — the AGI gateway, the Slack agent, the
-    /// optimizer — so many keys can belong to one, and a floor survives a
-    /// key rotation. It decides how deep into an account pool this key may
-    /// draw while the pool is under pressure; `None` is served last, behind
-    /// every declared service.
+    /// optimizer — so many keys can belong to one, and the allocation
+    /// survives a key rotation.
+    ///
+    /// It decides which accounts the key may spend, by matching the label on
+    /// each account: same name, may spend; different name, refused. There is
+    /// no borrowing and no ordering. On a pool where nothing is labelled the
+    /// tenant is irrelevant and every key reaches everything; on a pool where
+    /// anything is, `None` reaches nothing there.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub tenant: Option<String>,
-    /// Whether this key may be handed an account's credential to spend
-    /// directly, rather than only spending it through the gateway.
-    ///
-    /// Off by default, and deliberately a separate switch from naming a
-    /// service: using an account through the gateway is weaker than
-    /// holding it. Only a caller that must drive a vendor CLI — which
-    /// cannot be pointed at us — should be able to take one.
-    #[serde(default, skip_serializing_if = "is_false")]
-    pub lease_accounts: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub budget: Option<Budget>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -66,10 +61,6 @@ pub struct VirtualKeyDef {
 
 fn default_true() -> bool {
     true
-}
-
-fn is_false(value: &bool) -> bool {
-    !*value
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -576,7 +567,6 @@ mod tests {
             prev_secret: None,
             models: Vec::new(),
             tenant: None,
-            lease_accounts: false,
             budget: None,
             rate: None,
             expires_ms: None,

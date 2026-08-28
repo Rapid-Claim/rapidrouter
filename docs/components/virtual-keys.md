@@ -56,30 +56,35 @@ enabled     = true
 ## Which accounts a key can spend
 
 `models` answers "what may this key call". The **tenant** answers "which
-service is this, and how deep into the account pool may it draw when the
-pool runs low".
+service is this", and that decides which accounts it may spend.
 
 ```toml
 tenant = "optimizer"
 ```
 
-A key with a tenant reaches **every** account of every provider its
-`models` scope allows — the tenant does not hand it a subset. What the
-tenant decides is the order in which services stop being served as a pool
-drains: each one is admitted while more accounts are available than the
-services ranked above it need. Floors, priorities and the numbers behind
-that live in [account-pools.md](account-pools.md).
+The rule is a match, not an ordering. An account carries the name of the
+service that owns it; a key carries the name of the service it is; a request
+may spend the accounts whose label matches and **no others**. There is no
+borrowing, no priority and no overflow — a service that has exhausted its own
+accounts is refused while another service's sit idle. That is the trade the
+label buys, and it is the whole mechanism.
 
-A key with no tenant is served last, behind every declared service, on any
-pool that declares floors. On a pool that declares none — which is every
-pool until someone writes a `floors` block — nothing is gated and every key
-reaches everything.
+A pool where no account is labelled is **shared exactly as before**: every key
+reaches every account, tenant or not. This is what makes the feature inert
+until someone uses it, and it is why nothing changes for a provider nobody has
+divided up.
 
-Many keys may share one tenant, which is the point: a service's floor
-survives issuing, rotating and revoking the keys that spend it. Tenant
-names are checked when the key is written — on config load, in the console,
-and on the CLI — so a typo fails there rather than quietly demoting the key
-to last place.
+Once any account in a pool *is* labelled, the pool becomes managed and a key
+with **no** tenant reaches nothing there — a `403`, not last place. That is
+deliberate: degrading to an unlabelled overflow would quietly re-create
+borrowing. It also forces an ordering during rollout, because traffic on a
+static `server.auth_keys` gateway key can never carry a tenant at all: **every
+caller must be moved onto a `ck-` key before the first account is labelled.**
+
+Many keys may share one tenant, which is the point: a service's allocation
+survives issuing, rotating and revoking the keys that spend it. Tenant names
+are checked against the `tenants` roster wherever a key is written, so a typo
+fails there rather than producing a key that looks fine and owns nothing.
 
 ## Enforcement semantics
 

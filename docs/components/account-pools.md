@@ -114,44 +114,37 @@ The console surface (not yet built) is a table per provider:
 account, and relabels it. `holding()` already returns the two counts each
 row needs.
 
-## 5b · Lending an account to a CLI that cannot be proxied
+## 5b · Why there is no "lend me the credential" endpoint
 
-Some clients cannot be pointed here. A vendor CLI signed in to a
-subscription talks to its own backend on its own terms, and standing in
-front of it would mean emulating that backend's whole auth flow
-([../guides/coding-agents.md](../guides/coding-agents.md#codex)).
+There was one, briefly. `POST /v1/accounts/lease` handed a service one of its
+own accounts to spend directly, for a vendor CLI that could not be pointed
+here. It was **deleted on 2026-08-28** and should not come back without a new
+reason, because the reason it existed turned out to be false.
 
-For those, the gateway stays the place accounts are **owned and allocated**
-and lends the credential out instead:
+The belief was that codex-cli in subscription mode cannot be proxied. It can:
+a `model_provider` block in the run's `CODEX_HOME/config.toml` with
+`wire_api = "responses"` sends it anywhere, and the gateway holds the
+subscription seats so the CLI never needs to know they exist
+([../guides/coding-agents.md](../guides/coding-agents.md#codex)). What had
+failed earlier was `OPENAI_BASE_URL`, which that CLI ignores outright.
 
-```
-POST /v1/accounts/lease      Authorization: Bearer ck-…
-     { "provider": "codex" }
+Lending was worse on every axis once proxying worked:
 
-→ { "provider": "codex", "account": "seat-07",
-    "email": "…", "expires_at_ms": …,
-    "auth": "<the credential document, ready to write into the CLI's home>" }
-```
+- **No spend visibility.** Traffic on a lent account goes straight to the
+  vendor, so the gateway sees the lease and never the requests — giving up one
+  of the three things this whole design exists for.
+- **Per-run instead of per-request.** A lent credential pins one account for a
+  whole run; proxying picks per request and can route around a benched seat.
+- **It handed out live credential material over HTTP.** The guard was an
+  opt-in flag plus blanking the refresh token, and the blanking silently
+  missed the shape Claude actually uses, so the endpoint returned working
+  refresh tokens. A borrower's CLI rotating one would have killed the account
+  for every other holder.
 
-Same ownership rule as a routed request: a service is handed an account
-labelled for it, or nothing. `403` if it owns none here, `429` if it owns
-some and they are all out of quota.
-
-Two things make lending safe:
-
-- **The key must be allowed to.** `lease_accounts = true` on the virtual
-  key, off by default. Holding a credential is strictly more than spending
-  it through the gateway, so naming a service is not enough on its own.
-- **The refresh token never leaves.** The gateway is the only writer
-  permitted to rotate a credential; a borrower that could refresh would
-  invalidate the account for every other holder — one cooperative process
-  causing a fleet-wide outage. The document goes out with that field
-  blanked, which is also what the optimizer's own last-mile guard insists
-  on before it will use a credential.
-
-What this does *not* give you is spend visibility: traffic on a lent account
-goes straight to the vendor, so the gateway sees the lease and not the
-requests. That is the trade for supporting a client that cannot be proxied.
+If a client ever genuinely cannot be proxied, the shape above is the starting
+point — but derive the blanking from the credential parsers rather than a
+hand-written field list, refuse to lend from an unmanaged pool, give the lease
+a TTL and a usage record, and make the opt-in clearable.
 
 ## 6 · Validation
 

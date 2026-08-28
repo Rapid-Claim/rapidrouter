@@ -638,7 +638,6 @@ pub fn build_router(state: Arc<AppState>) -> Router {
         // route with a virtual key, so a subscription CLI can be routed
         // without leaving subscription mode.
         .route("/backend-api/codex/responses", post(responses))
-        .route("/v1/accounts/lease", post(lease_account))
         .route("/v1/completions", post(completions))
         .route("/v1/embeddings", post(embeddings))
         .route("/v1/audio/speech", post(audio_speech))
@@ -777,124 +776,6 @@ async fn responses(
     body: bytes::Bytes,
 ) -> Response {
     proxy::handle_responses(state, headers, body, vk.0).await
-}
-
-/// Hand a service one of its own accounts to use directly.
-///
-/// The gateway cannot proxy every client. A vendor CLI signed in to a
-/// subscription talks to its own backend on its own terms, and pointing it
-/// here means emulating that backend's auth flow. For those callers the
-/// gateway stays the place accounts are *owned and allocated*, and lends the
-/// credential out rather than standing in front of it.
-///
-/// Same ownership rule as a routed request: a service is given an account
-/// labelled for it, or nothing. Two things make lending safe:
-///
-/// - **The key must be allowed to.** Holding a credential is strictly more
-///   than spending it through us, so it is a separate opt-in.
-/// - **The refresh token never leaves.** The gateway is the only writer that
-///   may rotate a credential; a borrower that could refresh would invalidate
-///   the account for every other holder. The document goes out neutralized,
-///   which is also what the optimizer's own last-mile guard insists on.
-async fn lease_account(
-    State(state): State<Arc<AppState>>,
-    axum::Extension(vk): axum::Extension<VkCtx>,
-    axum::Json(input): axum::Json<LeaseRequest>,
-) -> Response {
-    let Some(vk) = vk.0 else {
-        return lease_error(
-            StatusCode::UNAUTHORIZED,
-            "a virtual key is required to lease an account",
-        );
-    };
-    if !vk.def.lease_accounts {
-        return lease_error(
-            StatusCode::FORBIDDEN,
-            format!(
-                "virtual key `{}` may not hold account credentials; \
-                 set `lease_accounts` on it if it must drive a vendor CLI",
-                vk.def.name
-            ),
-        );
-    }
-    let table = state.table.load();
-    let Some(provider) = table.providers().find(|p| p.name == input.provider) else {
-        return lease_error(
-            StatusCode::NOT_FOUND,
-            format!("unknown provider `{}`", input.provider),
-        );
-    };
-    let tenant = vk.def.tenant.as_deref();
-    let now = router_core::clock::now_ms();
-    let Some(key) = provider.lease_for(tenant, now) else {
-        let holding = provider.holding("*", tenant, now);
-        return if holding.owned == 0 {
-            lease_error(
-                StatusCode::FORBIDDEN,
-                format!(
-                    "{} owns no account on provider `{}`",
-                    vk.def
-                        .tenant
-                        .as_deref()
-                        .map(|t| format!("service `{t}`"))
-                        .unwrap_or_else(|| format!("virtual key `{}`", vk.def.name)),
-                    provider.name
-                ),
-            )
-        } else {
-            lease_error(
-                StatusCode::TOO_MANY_REQUESTS,
-                format!(
-                    "all {} of this service's accounts on `{}` are out of quota",
-                    holding.owned, provider.name
-                ),
-            )
-        };
-    };
-    let Some(seat) = key.seat().map(|s| s.current()) else {
-        return lease_error(
-            StatusCode::CONFLICT,
-            format!("account `{}` holds no lendable credential", key.name),
-        );
-    };
-    let Some(document) = router_core::credential::without_refresh_token(seat.document.expose())
-    else {
-        return lease_error(
-            StatusCode::CONFLICT,
-            format!(
-                "account `{}` credential is not a document we can lend",
-                key.name
-            ),
-        );
-    };
-    tracing::info!(
-        provider = %provider.name,
-        account = %key.name,
-        service = tenant.unwrap_or("-"),
-        vkey = %vk.def.name,
-        "account credential leased"
-    );
-    axum::Json(serde_json::json!({
-        "provider": provider.name,
-        "account": key.name,
-        "email": seat.email,
-        "expires_at_ms": seat.expires_at_ms,
-        "auth": document,
-    }))
-    .into_response()
-}
-
-#[derive(serde::Deserialize)]
-struct LeaseRequest {
-    provider: String,
-}
-
-fn lease_error(status: StatusCode, message: impl Into<String>) -> Response {
-    (
-        status,
-        axum::Json(serde_json::json!({ "error": { "message": message.into() } })),
-    )
-        .into_response()
 }
 
 async fn passthrough(

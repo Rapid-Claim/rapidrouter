@@ -151,8 +151,10 @@ fn validate_virtual_keys(
                 ));
             }
         }
-        // A tenant nobody declared is not a harmless label: the key would
-        // be served last on every pool, behind every declared service.
+        // A tenant nobody declared is not a harmless label. No account can
+        // carry a name that is not in the roster either, so the key would
+        // match nothing — on any divided pool it owns no account at all, and
+        // every request it makes there is refused.
         if let Some(tenant) = &rk.tenant
             && !tenants.contains(tenant)
         {
@@ -229,7 +231,6 @@ fn validate_virtual_keys(
                 prev_secret: None,
                 models: rk.models.clone(),
                 tenant: rk.tenant.clone(),
-                lease_accounts: rk.lease_accounts,
                 budget,
                 rate,
                 expires_ms,

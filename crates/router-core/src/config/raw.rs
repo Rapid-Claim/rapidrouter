@@ -94,10 +94,6 @@ pub struct RawVirtualKey {
     /// for that service, and no others.
     #[serde(default)]
     pub tenant: Option<String>,
-    /// Whether this key may be handed an account's credential to use
-    /// directly, for a CLI that cannot be pointed at the gateway.
-    #[serde(default)]
-    pub lease_accounts: bool,
     #[serde(default)]
     pub budget: Option<RawBudget>,
     #[serde(default)]

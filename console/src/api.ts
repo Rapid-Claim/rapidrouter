@@ -9,7 +9,7 @@ export type VirtualKey = {
   id: string;
   name: string;
   models: string[];
-  /** The service this key belongs to; decides pool priority. */
+  /** The service this key belongs to; it may spend only the accounts labelled for it. */
   tenant?: string;
   budget?: { usd: number; period: "daily" | "weekly" | "monthly" };
   rate?: { rpm?: number; tpm?: number };

@@ -573,21 +573,6 @@ impl ProviderRuntime {
         }
     }
 
-    /// One healthy account this service may spend, for a caller that will
-    /// use the credential itself rather than send traffic through us.
-    ///
-    /// Same ownership rule as everything else — a service is handed an
-    /// account labelled for it or nothing at all. No rate token is spent:
-    /// a lease says who may use the account, not that a request happened.
-    pub fn lease_for(&self, tenant: Option<&str>, now_ms: u64) -> Option<&KeyRuntime> {
-        let mine: Vec<&KeyRuntime> = self
-            .eligible(None)
-            .into_iter()
-            .filter(|k| self.owned_by(k, tenant) && k.breaker.looks_healthy(now_ms))
-            .collect();
-        (!mine.is_empty()).then(|| weighted_pick(&mine))
-    }
-
     /// What one service holds here: accounts labelled for it, and how many
     /// of those can serve right now.
     pub fn holding(&self, model: &str, tenant: Option<&str>, now_ms: u64) -> Holding {

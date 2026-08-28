@@ -2490,7 +2490,7 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
               <option value="">Unassigned</option>
               <For each={providers()?.tenants ?? []}>{(t) => <option value={t}>{t}</option>}</For>
             </select>
-            <small class="muted">Which service this key belongs to. Every service uses the whole account pool; the declared floors decide who pauses first when it runs low.</small>
+            <small class="muted">Which service this key belongs to. It may spend the accounts labelled for that service and no others. Leave unassigned on a pool where nothing is labelled — but note that once any account in a pool is labelled, an unassigned key reaches nothing there.</small>
           </label>
           <div class="disclosure" classList={{ open: advanced() }}>
             <button type="button" class="disclosure-toggle" aria-expanded={advanced()} onClick={() => setAdvanced((v) => !v)}>

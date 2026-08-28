@@ -315,10 +315,11 @@ keys = [
 "claude-max/claude-sonnet-4-5" = ["anthropic/claude-sonnet-4-5"]
 ```
 
-Because a seat is a key, a pool of seats can be *allocated*: each service
-gets a guaranteed floor of accounts and borrows from the others' surplus
-when its own are out of quota, instead of the pool going to whoever asks
-first ([account-pools.md](account-pools.md)).
+Because a seat is a key, a pool of seats can be *allocated*: each seat carries
+the name of the service that owns it, and a request may spend only the seats
+whose label matches — instead of the pool going to whoever asks first. No
+borrowing and no priority: a service that has exhausted its own seats is
+refused while another's sit idle ([account-pools.md](account-pools.md)).
 
 Two new `ProviderKind`s (`ClaudeSubscription`, `CodexSubscription`) with
 `wire_dialect` returning `Anthropic` and a Responses-shaped outbound

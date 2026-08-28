@@ -120,7 +120,7 @@ enum KeyCommand {
         /// Comma-separated models and/or aliases; omit for all models.
         #[arg(long, value_delimiter = ',')]
         models: Vec<String>,
-        /// Which service this key belongs to (`[tenants.<name>]`).
+        /// Which service this key belongs to; must be one of `tenants`.
         #[arg(long)]
         tenant: Option<String>,
         /// Spend cap as `AMOUNT/PERIOD`, e.g. `250/monthly`.
@@ -453,6 +453,49 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
                 rpm: *rpm,
                 tpm: *tpm,
             });
+            // A tenant nobody declared produces a key that looks fine and
+            // owns nothing: on any pool where accounts are labelled, every
+            // request it makes is refused. Config load and the console both
+            // reject the typo; this command writes straight to the store, so
+            // without this check it is the one way to create such a key — and
+            // the rollout guide tells operators to create their keys here.
+            if let Some(tenant) = tenant.as_deref() {
+                let (state, _) = store.read();
+                match state.config_text.as_deref() {
+                    // Store-held configuration is always TOML; see load_initial_config.
+                    Some(text) => match validate_store_config(&store, text, Format::Toml) {
+                        Ok(config) => {
+                            if !config.tenants.contains(tenant) {
+                                let known: Vec<&str> =
+                                    config.tenants.iter().map(String::as_str).collect();
+                                return fail(format!(
+                                    "`{tenant}` is not a declared service; \
+                                     add it to `tenants` first (declared: {})",
+                                    if known.is_empty() {
+                                        "none".to_owned()
+                                    } else {
+                                        known.join(", ")
+                                    }
+                                ));
+                            }
+                        }
+                        // The stored config does not parse. That is somebody
+                        // else's problem and not worth blocking a key on, but
+                        // it does mean the name went unchecked, so say so.
+                        Err(err) => eprintln!(
+                            "warning: could not read the service roster to check `{tenant}` ({err})"
+                        ),
+                    },
+                    // File-mode: the roster lives in a config this command
+                    // cannot see. Config load still rejects a bad name, but it
+                    // does so at startup rather than here.
+                    None => eprintln!(
+                        "warning: no stored configuration, so `{tenant}` was not checked \
+                         against the service roster"
+                    ),
+                }
+            }
+
             let generated = vkey::generate();
             let def = VirtualKeyDef {
                 id: generated.id.clone(),
@@ -461,7 +504,6 @@ fn key_command(cli: &Cli, command: &KeyCommand) -> ExitCode {
                 prev_secret: None,
                 models: models.clone(),
                 tenant: tenant.clone(),
-                lease_accounts: false,
                 budget,
                 rate,
                 expires_ms,
