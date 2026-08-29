@@ -1886,8 +1886,10 @@ label > small { display: block; }
   border-bottom: 1px solid var(--border);
 }
 /* A hundred accounts is a scroll, not a page — and a taller one now that
-   nothing is hidden behind a "narrow the search" line. */
-.account-list { max-height: 46vh; overflow-y: auto; max-width: 44rem; }
+   nothing is hidden behind a "narrow the search" line. The list uses the
+   drawer's content width so account details and row actions do not bunch up
+   on one side of an otherwise empty panel. */
+.account-list { width: 100%; max-height: 46vh; overflow-y: auto; }
 .account-list li:last-child { border-bottom: 0; }
 .account-name { font-weight: 500; overflow-wrap: anywhere; }
 
@@ -1903,6 +1905,7 @@ label > small { display: block; }
 
 .account-search {
   width: 100%;
+  max-width: 28rem;
   margin-bottom: 10px;
 }
 

@@ -175,6 +175,104 @@ test("creates and reveals a virtual key", async ({ page }) => {
   await expect(page.getByText(name)).not.toBeVisible();
 });
 
+async function openServiceAccountsDrawer(page: import("@playwright/test").Page) {
+  await page.setViewportSize({ width: 1600, height: 900 });
+  await page.route("**/admin/api/keys", (route) => route.fulfill({
+    json: {
+      data: [{
+        id: "vk-agi",
+        name: "agi",
+        models: [],
+        tenant: "agi",
+        tags: {},
+        enabled: true,
+        created_ms: 1,
+      }],
+    },
+  }));
+  await page.route("**/admin/api/providers", (route) => route.fulfill({
+    json: {
+      tenants: ["agi"],
+      data: [{
+        name: "codex",
+        kind: "codex_subscription",
+        subscription: true,
+        base_url: null,
+        managed: true,
+        keys: [
+          {
+            name: "owned",
+            weight: 1,
+            models: null,
+            tenant: "agi",
+            health: "healthy",
+            status: "ready",
+            benched_until_ms: null,
+            limits: { rpm: null, tpm: null },
+            quota: null,
+            credential: {
+              email: "owned@example.com",
+              account_id: "acct-owned",
+              expires_at_ms: null,
+              can_refresh: true,
+              expired: false,
+            },
+            last_check: null,
+            source_path: null,
+          },
+          {
+            name: "available",
+            weight: 1,
+            models: null,
+            tenant: null,
+            health: "healthy",
+            status: "ready",
+            benched_until_ms: null,
+            limits: { rpm: null, tpm: null },
+            quota: null,
+            credential: {
+              email: "available@example.com",
+              account_id: "acct-available",
+              expires_at_ms: null,
+              can_refresh: true,
+              expired: false,
+            },
+            last_check: null,
+            source_path: null,
+          },
+        ],
+      }],
+    },
+  }));
+
+  await page.goto("/console#keys");
+  await page.getByRole("button", { name: "1 account", exact: true }).click();
+  await expect(page.getByRole("dialog", { name: "Accounts for agi" })).toBeVisible();
+}
+
+test("service account rows fill the drawer body", async ({ page }) => {
+  await openServiceAccountsDrawer(page);
+
+  const widths = await page.evaluate(() => {
+    const body = document.querySelector<HTMLElement>(".drawer-body")!;
+    const list = document.querySelector<HTMLElement>(".account-list")!;
+    const style = getComputedStyle(body);
+    const content = body.clientWidth
+      - Number.parseFloat(style.paddingLeft)
+      - Number.parseFloat(style.paddingRight);
+    return { content, list: list.getBoundingClientRect().width };
+  });
+  expect(Math.abs(widths.content - widths.list)).toBeLessThanOrEqual(2);
+});
+
+test("service account search stays compact on a wide drawer", async ({ page }) => {
+  await openServiceAccountsDrawer(page);
+
+  const searchWidth = await page.getByRole("searchbox", { name: "Search this service's accounts" })
+    .evaluate((element) => element.getBoundingClientRect().width);
+  expect(searchWidth).toBeLessThanOrEqual(448);
+});
+
 // WCAG AA is a gate, not a hope: every page, in both themes, including
 // the contrast rule the design tokens exist to satisfy.
 for (const theme of ["light", "dark"] as const) {
