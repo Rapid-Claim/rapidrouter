@@ -96,8 +96,11 @@ fn vk_gate(vk: &VkRuntime, requested: &str, plan: &RoutePlan) -> Result<(), Gate
 }
 
 /// How a caller is named when it is refused.
-fn service_of(vk: Option<&VkRuntime>) -> String {
-    match vk.and_then(|v| v.def.tenant.as_deref()) {
+///
+/// Takes the service rather than the key, because a request can carry one
+/// without holding a virtual key at all — a static gateway key may name it.
+fn service_of(tenant: Option<&str>) -> String {
+    match tenant {
         Some(tenant) => format!("service `{tenant}`"),
         None => "this key".to_owned(),
     }
@@ -108,13 +111,13 @@ fn service_of(vk: Option<&VkRuntime>) -> String {
 /// Deliberately not "the provider is out of quota": other services may be
 /// serving happily on their own accounts. The count is what tells an
 /// operator whether to move one across.
-fn out_of_quota(route: &ResolvedRoute, vk: Option<&VkRuntime>, holding: Holding) -> GatewayError {
+fn out_of_quota(route: &ResolvedRoute, tenant: Option<&str>, holding: Holding) -> GatewayError {
     GatewayError::new(
         ErrorClass::RateLimited,
         format!(
             "{} has no account left on provider `{}`: all {} of its accounts are \
              out of quota for model `{}`",
-            service_of(vk),
+            service_of(tenant),
             route.provider.name,
             holding.owned,
             route.upstream_model
@@ -126,12 +129,12 @@ fn out_of_quota(route: &ResolvedRoute, vk: Option<&VkRuntime>, holding: Holding)
 /// The answer when a caller owns no account here at all — an unassigned
 /// key, or a service nobody has given an account to. A configuration
 /// problem, not a capacity one.
-fn no_accounts(route: &ResolvedRoute, vk: Option<&VkRuntime>) -> GatewayError {
+fn no_accounts(route: &ResolvedRoute, tenant: Option<&str>) -> GatewayError {
     GatewayError::new(
         ErrorClass::Permission,
         format!(
             "{} owns no account on provider `{}` that can serve model `{}`",
-            service_of(vk),
+            service_of(tenant),
             route.provider.name,
             route.upstream_model
         ),
@@ -489,12 +492,22 @@ pub async fn handle_chat(
     inbound: InboundChat,
     headers: HeaderMap,
     vk: Option<Arc<VkRuntime>>,
+    tenant: Option<String>,
 ) -> Response {
     let started = Instant::now();
     let dialect = inbound.dialect();
     let requested = inbound.model().to_owned();
     let stream = inbound.stream();
-    match run_chat(&state, &inbound, &headers, started, vk.as_deref()).await {
+    match run_chat(
+        &state,
+        &inbound,
+        &headers,
+        started,
+        vk.as_deref(),
+        tenant.as_deref(),
+    )
+    .await
+    {
         Ok(response) => meter(
             response,
             build_hook_with_input(
@@ -610,15 +623,13 @@ async fn run_chat(
     headers: &HeaderMap,
     started: Instant,
     vk: Option<&VkRuntime>,
+    tenant: Option<&str>,
 ) -> Result<Response, GatewayError> {
     let table = state.table.load();
     let plan = table.plan(inbound.model())?;
     if let Some(vk) = vk {
         vk_gate(vk, inbound.model(), &plan)?;
     }
-    // Which service this request belongs to. A property of the key, so it
-    // is read once and applies to every target of the plan.
-    let tenant = vk.and_then(|v| v.def.tenant.as_deref());
     let in_dialect = inbound.dialect();
     let stream = inbound.stream();
 
@@ -705,12 +716,12 @@ async fn run_chat(
                 // the provider itself has nothing healthy.
                 let holding = route.provider.holding(&route.upstream_model, tenant, now);
                 last_error = Some(if holding.owned == 0 {
-                    no_accounts(route, vk)
+                    no_accounts(route, tenant)
                 } else if route
                     .provider
                     .all_keys_benched(&route.upstream_model, tenant, now)
                 {
-                    out_of_quota(route, vk, holding)
+                    out_of_quota(route, tenant, holding)
                 } else {
                     GatewayError::new(
                         ErrorClass::NoCapacity,
@@ -1681,12 +1692,23 @@ pub async fn handle_relay(
     headers: HeaderMap,
     body: Bytes,
     vk: Option<Arc<VkRuntime>>,
+    tenant: Option<String>,
 ) -> Response {
     let started = Instant::now();
     let requested = json::probe(&body)
         .map(|p| p.model)
         .unwrap_or_else(|| "unknown".to_owned());
-    match run_relay(&state, endpoint, &headers, body, started, vk.as_deref()).await {
+    match run_relay(
+        &state,
+        endpoint,
+        &headers,
+        body,
+        started,
+        vk.as_deref(),
+        tenant.as_deref(),
+    )
+    .await
+    {
         Ok(response) => meter(
             response,
             build_hook(&state, &vk, endpoint.name(), &requested, &headers, started),
@@ -1716,6 +1738,7 @@ async fn run_relay(
     body: Bytes,
     started: Instant,
     vk: Option<&VkRuntime>,
+    tenant: Option<&str>,
 ) -> Result<Response, GatewayError> {
     let (model, span) = match json::probe(&body) {
         Some(probe) => (probe.model, Some(probe.model_span)),
@@ -1739,9 +1762,6 @@ async fn run_relay(
     if let Some(vk) = vk {
         vk_gate(vk, &model, &plan)?;
     }
-    // Which service this request belongs to. A property of the key, so it
-    // is read once and applies to every target of the plan.
-    let tenant = vk.and_then(|v| v.def.tenant.as_deref());
     let mut attempts = 0u32;
     let mut last_error: Option<GatewayError> = None;
 
@@ -1768,12 +1788,12 @@ async fn run_relay(
             let Some(choice) = route.provider.admit_key(&route.upstream_model, tenant, now) else {
                 let holding = route.provider.holding(&route.upstream_model, tenant, now);
                 last_error = Some(if holding.owned == 0 {
-                    no_accounts(route, vk)
+                    no_accounts(route, tenant)
                 } else if route
                     .provider
                     .all_keys_benched(&route.upstream_model, tenant, now)
                 {
-                    out_of_quota(route, vk, holding)
+                    out_of_quota(route, tenant, holding)
                 } else {
                     GatewayError::new(ErrorClass::NoCapacity, "no healthy key")
                         .with_provider(&route.provider.name)
@@ -1835,6 +1855,7 @@ const MULTIPART_ROUTE_PREFIX_CAP: usize = 1024 * 1024;
 /// Relay a multipart request without collecting the upload. For official
 /// SDKs, the small `model` form field is discovered in the multipart
 /// prefix. Callers can always provide `x-rapid-model` explicitly.
+#[allow(clippy::too_many_arguments)] // a relay forwards a whole request, plus who is asking
 pub async fn handle_stream_relay(
     state: Arc<AppState>,
     path: &'static str,
@@ -1842,6 +1863,7 @@ pub async fn handle_stream_relay(
     headers: HeaderMap,
     body: Body,
     vk: Option<Arc<VkRuntime>>,
+    tenant: Option<String>,
     needs_model: bool,
 ) -> Response {
     let started = Instant::now();
@@ -1879,6 +1901,7 @@ pub async fn handle_stream_relay(
         body,
         &model,
         vk.as_deref(),
+        tenant.as_deref(),
     )
     .await
     {
@@ -1904,6 +1927,7 @@ pub async fn handle_provider_relay(
     endpoint: &'static str,
     headers: HeaderMap,
     vk: Option<Arc<VkRuntime>>,
+    tenant: Option<String>,
 ) -> Response {
     let started = Instant::now();
     let provider = headers
@@ -1923,6 +1947,7 @@ pub async fn handle_provider_relay(
         Body::empty(),
         "",
         vk.as_deref(),
+        tenant.as_deref(),
     )
     .await
     {
@@ -1994,6 +2019,7 @@ fn multipart_field(prefix: &[u8], field: &str) -> Option<String> {
     (!value.is_empty() && value.len() <= 512).then(|| value.to_owned())
 }
 
+#[allow(clippy::too_many_arguments)] // same, one level down
 async fn run_stream_relay(
     state: &AppState,
     method: http::Method,
@@ -2002,6 +2028,7 @@ async fn run_stream_relay(
     body: Body,
     model: &str,
     vk: Option<&VkRuntime>,
+    tenant: Option<&str>,
 ) -> Result<Response, GatewayError> {
     let table = state.table.load();
     let (provider, upstream_model) = if !model.is_empty() {
@@ -2063,8 +2090,6 @@ async fn run_stream_relay(
         }
         (provider, String::new())
     };
-
-    let tenant = vk.and_then(|v| v.def.tenant.as_deref());
     let choice = provider
         .admit_key(&upstream_model, tenant, clock::now_ms())
         .ok_or_else(|| {
@@ -2072,7 +2097,7 @@ async fn run_stream_relay(
                 ErrorClass::NoCapacity,
                 format!(
                     "{} has no usable account on provider `{}`",
-                    service_of(vk),
+                    service_of(tenant),
                     provider.name
                 ),
             )
@@ -2430,6 +2455,7 @@ pub async fn handle_responses(
     headers: HeaderMap,
     body: Bytes,
     vk: Option<Arc<VkRuntime>>,
+    tenant: Option<String>,
 ) -> Response {
     let started = Instant::now();
     let value = serde_json::from_slice::<Value>(&body).ok();
@@ -2443,7 +2469,16 @@ pub async fn handle_responses(
         .is_some_and(|v| v["stream"] == Value::Bool(true));
     // Cloning a `Bytes` is a refcount bump, not a copy.
     let sent = body.clone();
-    match run_responses(&state, &headers, body, started, vk.as_deref()).await {
+    match run_responses(
+        &state,
+        &headers,
+        body,
+        started,
+        vk.as_deref(),
+        tenant.as_deref(),
+    )
+    .await
+    {
         Ok(response) => meter(
             response,
             build_hook_with_input(
@@ -2480,6 +2515,7 @@ async fn run_responses(
     body: Bytes,
     started: Instant,
     vk: Option<&VkRuntime>,
+    tenant: Option<&str>,
 ) -> Result<Response, GatewayError> {
     let value: Value = serde_json::from_slice(&body).map_err(|err| {
         GatewayError::new(
@@ -2502,9 +2538,6 @@ async fn run_responses(
     if let Some(vk) = vk {
         vk_gate(vk, &model, &plan)?;
     }
-    // Which service this request belongs to. A property of the key, so it
-    // is read once and applies to every target of the plan.
-    let tenant = vk.and_then(|v| v.def.tenant.as_deref());
 
     // Parsed lazily, at most once, only when some target needs translation.
     let mut internal: Option<router_core::chat::ChatRequest> = None;
@@ -2625,12 +2658,12 @@ async fn run_responses(
             let Some(choice) = route.provider.admit_key(&route.upstream_model, tenant, now) else {
                 let holding = route.provider.holding(&route.upstream_model, tenant, now);
                 last_error = Some(if holding.owned == 0 {
-                    no_accounts(route, vk)
+                    no_accounts(route, tenant)
                 } else if route
                     .provider
                     .all_keys_benched(&route.upstream_model, tenant, now)
                 {
-                    out_of_quota(route, vk, holding)
+                    out_of_quota(route, tenant, holding)
                 } else {
                     GatewayError::new(ErrorClass::NoCapacity, "no healthy key")
                         .with_provider(&route.provider.name)
@@ -2731,6 +2764,7 @@ pub async fn handle_passthrough(
     headers: HeaderMap,
     body: Bytes,
     vk: Option<Arc<VkRuntime>>,
+    tenant: Option<String>,
 ) -> Response {
     let started = Instant::now();
     let requested = format!("{provider_name}/*");
@@ -2783,7 +2817,7 @@ pub async fn handle_passthrough(
         query,
         &headers,
         body,
-        vk.as_deref(),
+        tenant.as_deref(),
     )
     .await
     {
@@ -2832,7 +2866,7 @@ async fn run_passthrough(
     query: Option<String>,
     headers: &HeaderMap,
     body: Bytes,
-    vk: Option<&VkRuntime>,
+    tenant: Option<&str>,
 ) -> Result<Response, GatewayError> {
     let table = state.table.load();
     let provider = table
@@ -2874,14 +2908,13 @@ async fn run_passthrough(
     // account. Taking `keys.first()` here ignored health, load balancing
     // and the service that owns the account alike, which made this
     // endpoint a way around all three.
-    let tenant = vk.and_then(|v| v.def.tenant.as_deref());
     let choice = provider.admit_any(tenant, clock::now_ms());
     if provider.auth == AuthMode::Key && choice.is_none() {
         return Err(GatewayError::new(
             ErrorClass::NoCapacity,
             format!(
                 "{} has no usable account on provider `{provider_name}`",
-                service_of(vk)
+                service_of(tenant)
             ),
         )
         .with_provider(provider_name));

@@ -84,7 +84,10 @@ d, opt, kris, none = pathlib.Path(sys.argv[1]), *sys.argv[2:5]
 [server]
 host = "__HOST__"
 port = __PORT__
-auth_keys = ["e2e-master-key"]
+# Two static keys: one naming a service, one not. The named one stands for a
+# caller nobody can reconfigure — it sends a bare shared secret and the
+# gateway decides on arrival which service that is.
+auth_keys = ["e2e-master-key", {{ key = "e2e-kris-static", tenant = "kris" }}]
 
 [console]
 admin_keys = ["e2e-master-key"]
@@ -214,21 +217,39 @@ check "it claimed the serving account, not another" \
       "acct-kris"
 
 echo
+echo "a caller that cannot be reconfigured"
+# The whole point: this key carries no service in the request, only in the
+# gateway's config. It must reach kris's accounts on a divided pool, while
+# the unnamed static key beside it reaches nothing.
+sk() { curl -s -m 20 -o /dev/null -w "%{http_code}" -X POST "$GW/v1/responses" \
+  -H "Authorization: Bearer $1" -H "Content-Type: application/json" \
+  -d "{\"model\":\"gpt-5.6-sol\",\"input\":\"ping\",\"stream\":false}"; }
+: > "$UP_LOG"
+check "a static key naming a service reaches that service's accounts" "$(sk e2e-kris-static)" 200
+check "  and it was that service's account that served"               "$(seats_used)" "acct-kris"
+check "a static key naming none still reaches nothing"                "$(sk e2e-master-key)" 403
+
+echo
 echo "warning the operator at startup"
 # The rollout's one unforgiving step: labelling the first account cuts off
 # every caller that cannot name a service. This fixture is exactly that
 # state — labelled accounts plus a static gateway key — so the warning has
 # to be in the log, or the operator finds out from a 403 instead.
-grep -q "cannot name a service" "$WORK/gateway.log" \
-  && ok "a divided pool warns that master-key traffic will be refused" \
-  || bad "a divided pool warns that master-key traffic will be refused" "nothing in the gateway log"
+grep -q "names no service" "$WORK/gateway.log" \
+  && ok "a divided pool warns about the static key that names no service" \
+  || bad "a divided pool warns about the static key that names no service" "nothing in the gateway log"
 grep -q "name no service" "$WORK/gateway.log" \
   && ok "and names the virtual keys that own nothing" \
   || bad "and names the virtual keys that own nothing" "nothing in the gateway log"
 
 echo
 echo "moving an account between services"
-check "an unassigned account serves nobody" "$(seats_used)" "acct-kris,acct-opt"
+# Assert what it means rather than an exact cumulative list: acct-spare is
+# labelled for nobody, so no amount of traffic from anyone may reach it.
+case "$(seats_used)" in
+  *acct-spare*) bad "an unassigned account serves nobody" "acct-spare served traffic" ;;
+  *) ok "an unassigned account serves nobody" ;;
+esac
 curl -s -m 10 -o /dev/null -X PUT \
   "$GW/admin/api/providers/codex/keys/seat-spare/tenant" \
   -H "Authorization: Bearer e2e-master-key" -H 'Content-Type: application/json' \

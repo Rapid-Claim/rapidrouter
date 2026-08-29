@@ -28,13 +28,15 @@ impl<F: Fn(&str) -> Option<String>> EnvSource for F {
 pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Vec<ConfigError>> {
     let mut errors = Vec::new();
 
-    let server = validate_server(&raw, env, &mut errors);
+    // Before the server block, because a static key may now name a service
+    // and that name is checked against this roster like any other.
+    let tenants = validate_tenants(&raw, &mut errors);
+    let server = validate_server(&raw, &tenants, env, &mut errors);
     let providers = validate_providers(&raw, env, &mut errors);
     let aliases = validate_aliases(&raw, &providers, &mut errors);
     let fallbacks = validate_fallbacks(&raw, &providers, &aliases, &mut errors);
     let groups = validate_groups(&raw, &providers, &aliases, &mut errors);
     let reliability = validate_reliability(&raw, &mut errors);
-    let tenants = validate_tenants(&raw, &mut errors);
     validate_account_tenants(&raw, &tenants, &mut errors);
     let virtual_keys =
         validate_virtual_keys(&raw, &providers, &aliases, &groups, &tenants, &mut errors);
@@ -65,6 +67,7 @@ pub(super) fn validate(raw: RawConfig, env: &dyn EnvSource) -> Result<Config, Ve
 
 fn validate_server(
     raw: &RawConfig,
+    tenants: &BTreeSet<String>,
     env: &dyn EnvSource,
     errors: &mut Vec<ConfigError>,
 ) -> ServerConfig {
@@ -76,9 +79,27 @@ fn validate_server(
         ));
     }
     let mut auth_keys = Vec::new();
-    for (i, value) in s.auth_keys.iter().enumerate() {
-        match resolve_secret(value, env) {
-            Ok(secret) => auth_keys.push(secret),
+    for (i, entry) in s.auth_keys.iter().enumerate() {
+        // A service named here must be declared, for the same reason it must
+        // be on an account: a typo would otherwise attribute this key's
+        // traffic to a service that does not exist, which on a divided pool
+        // means every request it carries is refused.
+        if let Some(tenant) = entry.tenant()
+            && !tenants.contains(tenant)
+        {
+            errors.push(ConfigError::new(
+                format!("server.auth_keys[{i}].tenant"),
+                format!(
+                    "no service named `{tenant}` is declared \
+                     (add it to the top-level `tenants` list)"
+                ),
+            ));
+        }
+        match resolve_secret(entry.value(), env) {
+            Ok(secret) => auth_keys.push(super::StaticKey {
+                secret,
+                tenant: entry.tenant().map(str::to_owned),
+            }),
             Err(msg) => errors.push(ConfigError::new(format!("server.auth_keys[{i}]"), msg)),
         }
     }

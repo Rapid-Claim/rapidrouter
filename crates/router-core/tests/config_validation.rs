@@ -86,7 +86,7 @@ fn full_valid_config_resolves() {
 
     assert_eq!(config.server.port, 9090);
     assert_eq!(config.server.auth_keys.len(), 1);
-    assert!(config.server.auth_keys[0].verify("ck-test"));
+    assert!(config.server.auth_keys[0].secret.verify("ck-test"));
 
     let openai = &config.providers["openai"];
     assert_eq!(openai.kind, ProviderKind::OpenAi);
@@ -868,4 +868,66 @@ models = ["fast"]
         &[],
     )
     .expect("a group is a scopable model id");
+}
+
+/// A static gateway key may name the service its traffic belongs to.
+///
+/// This is the only way a caller that cannot be reconfigured ever gets a
+/// service: a shared key is a password, not an identity, so nothing the
+/// caller sends can say who it is. Without this, dividing a pool refuses
+/// every such caller at once.
+#[test]
+fn a_static_gateway_key_can_name_its_service() {
+    let config = load(
+        "tenants = [\"agi\"]\n\n\
+         [server]\nauth_keys = [{ key = \"master-secret\", tenant = \"agi\" }]\n\n\
+         [providers.openai]\nkeys = [{ name = \"k\", value = \"sk\" }]\n",
+        &[],
+    )
+    .expect("a static key naming a declared service is valid");
+    assert_eq!(config.server.auth_keys.len(), 1);
+    assert!(config.server.auth_keys[0].secret.verify("master-secret"));
+    assert_eq!(config.server.auth_keys[0].tenant.as_deref(), Some("agi"));
+}
+
+/// The old spelling keeps its old meaning exactly, which is what lets this
+/// ship to a gateway whose config nobody has touched.
+#[test]
+fn a_bare_static_key_still_names_no_service() {
+    let config = load(
+        "[server]\nauth_keys = [\"master-secret\"]\n\n\
+         [providers.openai]\nkeys = [{ name = \"k\", value = \"sk\" }]\n",
+        &[],
+    )
+    .expect("a bare string is still a valid key");
+    assert!(config.server.auth_keys[0].secret.verify("master-secret"));
+    assert_eq!(config.server.auth_keys[0].tenant, None);
+}
+
+/// Both spellings in one list, because a migration will have both.
+#[test]
+fn the_two_spellings_coexist() {
+    let config = load(
+        "tenants = [\"agi\"]\n\n\
+         [server]\nauth_keys = [\"plain\", { key = \"named\", tenant = \"agi\" }]\n\n\
+         [providers.openai]\nkeys = [{ name = \"k\", value = \"sk\" }]\n",
+        &[],
+    )
+    .expect("a mixed list is valid");
+    assert_eq!(config.server.auth_keys[0].tenant, None);
+    assert_eq!(config.server.auth_keys[1].tenant.as_deref(), Some("agi"));
+}
+
+/// A typo here is as dangerous as one on an account: it attributes real
+/// traffic to a service that does not exist, and on a divided pool that
+/// means every request on this key is refused.
+#[test]
+fn a_static_key_naming_an_undeclared_service_is_refused() {
+    assert_invalid(
+        "tenants = [\"agi\"]\n\n\
+         [server]\nauth_keys = [{ key = \"s\", tenant = \"agiii\" }]\n",
+        &[],
+        "server.auth_keys[0].tenant",
+        "no service named `agiii` is declared",
+    );
 }

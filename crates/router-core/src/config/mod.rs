@@ -77,12 +77,23 @@ pub struct Config {
     pub pricing: BTreeMap<String, Price>,
 }
 
+/// A static gateway key and the service its traffic belongs to.
+///
+/// `tenant` is `None` for a key written as a bare string, which is every key
+/// that predates this. Such traffic names no service, so on a divided pool it
+/// can spend nothing — which is the situation naming one here exists to fix.
+#[derive(Debug, Clone)]
+pub struct StaticKey {
+    pub secret: SecretString,
+    pub tenant: Option<String>,
+}
+
 #[derive(Debug)]
 pub struct ServerConfig {
     pub host: String,
     pub port: u16,
     pub max_body_size: u64,
-    pub auth_keys: Vec<SecretString>,
+    pub auth_keys: Vec<StaticKey>,
     pub require_auth: bool,
     pub drain_timeout: Duration,
 }
