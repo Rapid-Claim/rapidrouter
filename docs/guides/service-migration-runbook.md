@@ -213,3 +213,91 @@ Baseline taken 2026-08-29, after the deploy of the ownership change:
 active, **0 restarts**, **0 error lines** in two hours, seat maintenance
 renewing normally, and `/passthrough/` — the one behaviour that deploy altered
 — **completely unused**, so that change is inert in practice.
+
+---
+
+# What actually happened — 2026-08-29
+
+The migration ran. This section is the record, including the four things the
+plan above got wrong, because those are the parts worth reading.
+
+## Where it ended up
+
+```
+services: agi, kris, optimizer
+codex     managed=true    optimizer 12 · agi 107
+claude    managed=false   undivided
+openai    managed=false   undivided
+keys      litellm · WNS · Ashutosh → agi      optimizer → optimizer
+```
+
+Proven with a real optimizer issue: the agent's `CODEX_HOME` carried the
+gateway's `model_provider` block and **no `auth.json`**; two requests reached
+the gateway on the optimizer's key (`gpt-5.6-sol`, both `200`, the second
+11,982 input tokens); the agent replied. No local seat was touched.
+
+## What the plan got wrong
+
+**1. `RAPID_MASTER_KEY` is not the request-auth key.** It is the *store sealing*
+key — 32 bytes of base64 that encrypt control-plane secrets and derive session
+keys. The access notes describing it as request auth are wrong, and that error
+hid the next one.
+
+**2. There is no request auth at all.** `server.auth_keys` is empty and
+`require_auth` is unset, so the gate is off:
+
+```rust
+let gate_active = !config.server.auth_keys.is_empty() || config.server.require_auth;
+```
+
+`https://router.rapidclaims.ai/v1/chat/completions` answered **200 to an
+unauthenticated request from the open internet.** Four source IPs have ever
+used the data plane, all internal, so it has not been found — but it is open,
+and the accounts behind it are paid subscriptions. The "12,406 master-key
+requests" in the earlier analysis were in fact *anonymous* requests.
+
+**3. Almost nothing needed migrating.** litellm, WNS and Ashutosh were already
+virtual keys; they only needed a service set, server-side, with no caller
+change. 99.2% of all traffic is litellm alone. The static-key work from
+`static-key-service` was still worth having — anonymous callers exist and
+cannot be reconfigured — but the feared mass cutover did not.
+
+**4. Dividing a pool strands every account left unlabelled.** Not 10 of 117 —
+**all 117** had to be labelled, or the other 107 would have served nobody and
+taken litellm's 1.5M requests with them. This is the single most important
+correction and it is easy to get wrong, because "give the optimizer ten" sounds
+like the rest keep working.
+
+## The order that worked
+
+Each step verified before the next; health 200 and zero restarts throughout.
+
+1. Declare `tenants` — config v132. Nothing enforced.
+2. Set the service on the three existing keys, via the admin API.
+3. Label **all 117 codex accounts in one atomic import** — v137, 10 optimizer /
+   107 agi. One commit, so there was never an instant where `agi` held a single
+   account absorbing litellm's traffic. Doing this as 117 API calls would have
+   produced exactly that.
+4. Point the optimizer at the gateway; restart with no agent runs in flight.
+5. Move the optimizer's two own accounts into the gateway, labelled
+   `optimizer` — hence 12.
+
+## Gaps this left, worst first
+
+1. **The data plane is open.** Codex is now incidentally protected by the
+   ownership rule; **Claude and OpenAI are not.**
+2. **Usage records carry no account and no service** — `vkey, provider, model,
+   status, tokens` only. "Which account served this" is unanswerable and
+   per-service spend can only be inferred from the key. That undermines the
+   reason for the migration and should be next.
+3. **An account can exist in two systems at once.** The two moved credentials
+   still exist in the optimizer's local store. Routing means it will not use
+   them, but unset the variables and both processes would refresh the same
+   OAuth token — the credential-collapse bug. Remove them there.
+4. **Accounts are keyed by name, identity is the email.** Adding
+   `sofia.renner@shadowagi.com` failed on a duplicate *name* against a
+   different login of the same person. It should key on, or warn about, email.
+5. **CLI-created keys lag one store-refresh interval**; admin-API ones apply at
+   once. The symptom is a puzzling `401` on a key you just made.
+6. **No console path to declare a service** — `tenants` is config-only, so the
+   Service column looks broken until someone edits the gateway config.
