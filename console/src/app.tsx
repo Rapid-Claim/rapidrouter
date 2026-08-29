@@ -999,17 +999,7 @@ function ProviderAccounts(props: {
                   providerKey={key}
                   kind={provider().kind}
                   subscription={provider().subscription}
-                  tenants={props.tenants}
                   managed={provider().managed}
-                  onAssign={async (tenant) => {
-                    props.onError("");
-                    try {
-                      await api.setAccountTenant(provider().name, key.name, tenant);
-                      props.onDone();
-                    } catch (err) {
-                      props.onError(err instanceof Error ? err.message : "Could not change the owning service");
-                    }
-                  }}
                   checking={props.checking === "*" || props.checking === key.name}
                   probe={props.probes[key.name] ?? null}
                   group={groups().get(key.name) ?? null}
@@ -1797,9 +1787,7 @@ function CredentialRow(props: {
   providerKey: ProviderKey;
   kind: string;
   subscription: boolean;
-  tenants: string[];
   managed: boolean;
-  onAssign: (tenant: string | null) => Promise<void>;
   onRemove: () => void;
   onCheck: () => void;
   onLogin: () => void;
@@ -1926,33 +1914,14 @@ function CredentialRow(props: {
       </Show>
     </td>
     <td>
-      <ServicePicker
-        value={key().tenant}
-        tenants={props.tenants}
-        label={`Service owning ${key().name}`}
-        onChange={async (tenant) => {
-          // The first label on a shared pool is the one destructive click in
-          // this console. It divides the provider, and from that moment every
-          // caller without a service name — which is all master-key traffic,
-          // since a static gateway key cannot carry one — is refused here.
-          // There is no halfway state to back out into, so ask once.
-          if (!props.managed && tenant !== null) {
-            const ok = confirm(
-              `Assign ${key().name} to "${tenant}"?\n\n`
-              + `Nothing on this provider is assigned yet. Assigning the first account `
-              + `divides the pool: from then on, only keys naming a service can use it, `
-              + `and any caller still on the master key will be refused.\n\n`
-              + `Move every caller onto its own key first.`,
-            );
-            if (!ok) return;
-          }
-          await props.onAssign(tenant);
-        }}
-      />
-      {/* An unassigned account in a divided pool is the quiet failure: it
-          reports healthy and in quota, and serves nobody. */}
-      <Show when={props.managed && !key().tenant}>
-        <small class="muted">Serves nobody — this provider is divided by service</small>
+      {/* Read-only here on purpose. Assigning belongs in one place — the
+          service's own drawer — because that is where you can see what a
+          service holds and what taking an account would cost the service
+          it came from. A picker repeated down 117 rows shows neither. */}
+      <Show when={key().tenant} fallback={
+        <span class="muted">{props.managed ? "unassigned — serves nobody" : "—"}</span>
+      }>
+        <span class="pill">{key().tenant}</span>
       </Show>
     </td>
     <td>
@@ -2591,15 +2560,51 @@ function KeyAccounts(props: {
 }) {
   const [busy, setBusy] = createSignal("");
   const [error, setError] = createSignal("");
-  const [adding, setAdding] = createSignal("");
+  const [filter, setFilter] = createSignal("");
 
   const all = createMemo(() =>
     props.providers.flatMap((p) => p.keys.map((k) => ({ provider: p.name, key: k }))),
   );
-  const mine = createMemo(() => all().filter((a) => a.key.tenant === props.service));
-  const available = createMemo(() => all().filter((a) => a.key.tenant !== props.service));
+  const label = (a: { key: ProviderKey }) => a.key.credential?.email ?? a.key.name;
+  const mine = createMemo(() =>
+    all().filter((a) => a.key.tenant === props.service).sort((x, y) => label(x).localeCompare(label(y))),
+  );
+
+  // Candidates are ranked by what taking one costs: unassigned accounts are
+  // free, and one held by another service is a transfer out of that service.
+  const candidates = createMemo(() => {
+    const q = filter().trim().toLowerCase();
+    return all()
+      .filter((a) => a.key.tenant !== props.service)
+      .filter((a) => !q || label(a).toLowerCase().includes(q) || a.provider.toLowerCase().includes(q))
+      .sort((x, y) =>
+        Number(Boolean(x.key.tenant)) - Number(Boolean(y.key.tenant))
+        || label(x).localeCompare(label(y)));
+  });
+
+  const byProvider = createMemo(() => {
+    const counts = new Map<string, number>();
+    for (const a of mine()) counts.set(a.provider, (counts.get(a.provider) ?? 0) + 1);
+    return [...counts].sort();
+  });
+  const unhealthy = createMemo(() => mine().filter((a) => (a.key.health ?? "") !== "healthy").length);
 
   const assign = async (provider: string, account: string, tenant: string | null) => {
+    // Dividing a pool for the first time is the one irreversible-feeling
+    // click here. From that moment only keys naming a service can use the
+    // provider, and anything still on a plain gateway key is refused — so
+    // ask once, while there is still nothing to undo.
+    const pool = props.providers.find((p) => p.name === provider);
+    if (tenant !== null && pool && !pool.managed) {
+      const ok = confirm(
+        `Give ${account} to "${tenant}"?\n\n`
+        + `Nothing on ${provider} is assigned yet. Assigning the first account divides `
+        + `the pool: from then on only keys naming a service can use it, every account `
+        + `left unassigned serves nobody, and any caller without a service is refused.\n\n`
+        + `Assign the rest of ${provider} too, in the same sitting.`,
+      );
+      if (!ok) return;
+    }
     setBusy(`${provider}/${account}`); setError("");
     try { await api.setAccountTenant(provider, account, tenant); await props.onChanged(); }
     catch (err) { setError(err instanceof Error ? err.message : "Failed"); }
@@ -2614,55 +2619,77 @@ function KeyAccounts(props: {
     onClose={props.onClose}
   >
     <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
-    <div class="drawer-section">
-      <SectionTitle title={`${mine().length} account${mine().length === 1 ? "" : "s"}`} subtitle="Removing one leaves it unassigned — it is not deleted" />
-      <Show when={mine().length} fallback={<Empty title="No accounts" action="This service cannot serve anything until it is given one." />}>
-        <div class="table-wrap" tabindex="0" role="region" aria-label="Scrollable table">
-          <table class="dense">
-            <thead><tr><th>Account</th><th>Provider</th><th>Health</th><th><span class="sr-only">Actions</span></th></tr></thead>
-            <tbody><For each={mine()}>{(a) => <tr>
-              <td><strong>{a.key.credential?.email ?? a.key.name}</strong></td>
-              <td class="muted">{a.provider}</td>
-              <td>{a.key.status ?? a.key.health}</td>
-              <td class="actions">
-                <button
-                  class="icon-button danger"
-                  title={`Remove ${a.key.name} from ${props.service}`}
-                  aria-label={`Remove ${a.key.name} from ${props.service}`}
-                  disabled={busy() === `${a.provider}/${a.key.name}`}
-                  onClick={() => assign(a.provider, a.key.name, null)}
-                ><Trash2 size={16} /></button>
-              </td>
-            </tr>}</For></tbody>
-          </table>
-        </div>
+
+    {/* What this service holds, in one line, because the count alone does not
+        answer "can it actually serve" — a pool of ten with eight benched cannot. */}
+    <div class="account-summary">
+      <div>
+        <strong>{mine().length}</strong>
+        <span class="muted">{mine().length === 1 ? " account" : " accounts"}</span>
+      </div>
+      <For each={byProvider()}>{([name, n]) => <span class="pill">{name} · {n}</span>}</For>
+      <Show when={unhealthy()}>
+        <span class="pill warning">{unhealthy()} not ready</span>
       </Show>
     </div>
+
     <div class="drawer-section">
-      <SectionTitle title="Add an account" subtitle="Taking one from another service moves it — nothing is copied" />
-      <div class="field-row">
-        <label>Account
-          <select value={adding()} onChange={(e) => setAdding(e.currentTarget.value)}>
-            <option value="">Choose an account…</option>
-            <For each={available()}>{(a) => (
-              <option value={`${a.provider}\u0000${a.key.name}`}>
-                {`${a.provider} / ${a.key.credential?.email ?? a.key.name}`}
-                {a.key.tenant ? ` — currently ${a.key.tenant}` : " — unassigned"}
-              </option>
-            )}</For>
-          </select>
-        </label>
-        <button
-          class="button primary"
-          disabled={!adding() || Boolean(busy())}
-          onClick={async () => {
-            const [provider, account] = adding().split("\u0000");
-            if (!provider || !account) return;
-            await assign(provider, account, props.service);
-            setAdding("");
-          }}
-        >Add to {props.service}</button>
-      </div>
+      <Show when={mine().length} fallback={
+        <Empty title="No accounts yet" action="Until this service is given one, every request it makes is refused." />
+      }>
+        <ul class="account-list">
+          <For each={mine()}>{(a) => <li>
+            <span class="account-name">{label(a)}</span>
+            <span class="muted">{a.provider}</span>
+            <span classList={{ dot: true, ok: (a.key.health ?? "") === "healthy" }}
+                  title={a.key.status ?? a.key.health ?? "unknown"} />
+            {/* "Release", not a bin: the account is not deleted, it goes back
+                to being unassigned and can be given to anyone. */}
+            <button
+              class="button outline small"
+              disabled={busy() === `${a.provider}/${a.key.name}`}
+              title={`Release ${label(a)} from ${props.service}`}
+              onClick={() => assign(a.provider, a.key.name, null)}
+            >Release</button>
+          </li>}</For>
+        </ul>
+      </Show>
+    </div>
+
+    <div class="drawer-section">
+      <SectionTitle
+        title="Add an account"
+        subtitle="Taking one from another service moves it — nothing is copied"
+      />
+      {/* A search box and a short list, because a <select> of 117 accounts is
+          a scroll, not a choice. */}
+      <input
+        class="account-search"
+        type="search"
+        placeholder="Search accounts…"
+        value={filter()}
+        onInput={(e) => setFilter(e.currentTarget.value)}
+        aria-label="Search accounts to add"
+      />
+      <Show when={candidates().length} fallback={<p class="muted">No account matches.</p>}>
+        <ul class="account-list candidates">
+          <For each={candidates().slice(0, 12)}>{(a) => <li>
+            <span class="account-name">{label(a)}</span>
+            <span class="muted">{a.provider}</span>
+            <Show when={a.key.tenant} fallback={<span class="pill">unassigned</span>}>
+              <span class="pill warning">{`takes from ${a.key.tenant}`}</span>
+            </Show>
+            <button
+              class="button outline small"
+              disabled={Boolean(busy())}
+              onClick={() => assign(a.provider, a.key.name, props.service)}
+            >Add</button>
+          </li>}</For>
+        </ul>
+        <Show when={candidates().length > 12}>
+          <p class="muted">{candidates().length - 12} more — narrow the search to see them.</p>
+        </Show>
+      </Show>
     </div>
   </Drawer>;
 }
