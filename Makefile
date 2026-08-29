@@ -136,6 +136,16 @@ fmt: ## Format in place
 lint: ## Clippy over every target, warnings denied (as CI does)
 	RUSTFLAGS="-D warnings" $(CARGO) clippy --workspace --all-targets
 
+.PHONY: e2e
+e2e: ## Account ownership over real HTTP, against a recording fake vendor
+	$(CARGO) build -p router-bin
+	scripts/e2e/run.sh
+
+.PHONY: e2e-hold
+e2e-hold: ## Same, but leave the gateway up so the real agent CLIs can drive it
+	$(CARGO) build -p router-bin
+	scripts/e2e/run.sh --hold
+
 .PHONY: verify
 verify: ## fmt check + lint + test — run before pushing
 	$(CARGO) fmt --all --check

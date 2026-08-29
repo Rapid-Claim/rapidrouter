@@ -984,18 +984,43 @@ async fn codex_responses(
                             "name": "get_weather", "arguments": "{\"city\":\"SF\"}"}})
         ));
     } else {
+        // The full item lifecycle, as the real backend sends it. Deltas alone
+        // are not enough: `response.completed` carries an empty output, so a
+        // client that never saw an item has nothing to attach the text to and
+        // reports an empty turn. Measured against codex-cli 0.146.0 driving a
+        // real gateway on 2026-08-28.
+        events.push(format!(
+            "event: response.output_item.added\ndata: {}\n\n",
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"id": "msg_mock", "type": "message", "status": "in_progress",
+                            "role": "assistant", "content": []}})
+        ));
         for delta in ["Hello", " from", " Codex"] {
             events.push(format!(
                 "event: response.output_text.delta\ndata: {}\n\n",
-                json!({"type": "response.output_text.delta", "delta": delta})
+                json!({"type": "response.output_text.delta", "item_id": "msg_mock",
+                       "output_index": 0, "content_index": 0, "delta": delta})
             ));
         }
+        events.push(format!(
+            "event: response.output_item.done\ndata: {}\n\n",
+            json!({"type": "response.output_item.done", "output_index": 0,
+                   "item": {"id": "msg_mock", "type": "message", "status": "completed",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "Hello from Codex",
+                                         "annotations": []}]}})
+        ));
     }
 
     events.push(format!(
         "event: response.completed\ndata: {}\n\n",
         json!({"type": "response.completed", "response": {
-            // EMPTY, as the real backend sends it.
+            // Near-empty, as the real backend sends it — but `id` is present.
+            // codex-cli 0.146.0 refuses the stream without it ("failed to
+            // parse ResponseCompleted: missing field `id`"), which is how we
+            // learned the omission was wrong: measured against the real CLI
+            // driving a real gateway on 2026-08-28.
+            "id": "resp_mock",
             "output": [],
             "usage": {"input_tokens": 11, "output_tokens": 3, "total_tokens": 14,
                       "input_tokens_details": {"cached_tokens": 4},

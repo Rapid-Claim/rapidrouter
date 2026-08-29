@@ -75,7 +75,12 @@ fast = "openai/gpt-4o"
     });
     let route = table.resolve("openai/gpt-4o").unwrap();
     c.bench_function("admit_key", |b| {
-        b.iter(|| route.provider.admit_key(black_box("gpt-4o"), 1000).unwrap())
+        b.iter(|| {
+            route
+                .provider
+                .admit_key(black_box("gpt-4o"), None, 1000)
+                .unwrap()
+        })
     });
 }
 

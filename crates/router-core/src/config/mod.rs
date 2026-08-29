@@ -10,7 +10,7 @@ pub mod presets;
 mod raw;
 mod validate;
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 use std::path::Path;
 use std::time::Duration;
@@ -66,6 +66,8 @@ pub struct Config {
     /// Routing groups by name, each a weighted primary and fallback pool.
     pub groups: BTreeMap<String, RoutingGroup>,
     pub reliability: Reliability,
+    /// The services that may own accounts and be named on a key.
+    pub tenants: BTreeSet<String>,
     /// File-declared virtual keys; managed mode appends store-held keys.
     pub virtual_keys: Vec<crate::vkey::VirtualKeyDef>,
     pub console: ConsoleConfig,
@@ -333,6 +335,8 @@ pub struct ApiKey {
     pub secret: SecretString,
     pub weight: f64,
     pub models: Option<Vec<String>>,
+    /// The service this account belongs to; `None` = unassigned.
+    pub tenant: Option<String>,
     /// This key's own request/token ceilings; see [`raw::RawKey`].
     pub rpm: Option<u64>,
     pub tpm: Option<u64>,

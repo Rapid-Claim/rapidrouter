@@ -44,6 +44,7 @@ fn key_def(id: &str) -> VirtualKeyDef {
         secret_hash: vkey::hash_secret("test-secret"),
         prev_secret: None,
         models: vec!["openai/gpt-4o-mini".into()],
+        tenant: None,
         budget: None,
         rate: None,
         expires_ms: None,

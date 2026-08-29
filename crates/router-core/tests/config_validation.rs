@@ -499,6 +499,63 @@ fn virtual_key_duplicate_ids_rejected() {
     assert_invalid(&doc, &[], "virtual_keys[1].id", "duplicate");
 }
 
+const TENANTS: &str = "tenants = [\"agi\", \"optimizer\"]\n";
+
+#[test]
+fn a_key_names_the_service_it_belongs_to() {
+    let config = load(&format!("{TENANTS}{}", vk_block("tenant = \"agi\"\n")), &[]).unwrap();
+    assert_eq!(config.virtual_keys[0].tenant.as_deref(), Some("agi"));
+    assert!(config.tenants.contains("optimizer"));
+}
+
+#[test]
+fn a_key_may_not_name_a_service_nobody_declared() {
+    assert_invalid(
+        &vk_block("tenant = \"ghost\"\n"),
+        &[],
+        "virtual_keys[0].tenant",
+        "no service named `ghost` is declared",
+    );
+}
+
+/// A typo on an account would leave it owned by nobody, serving nobody.
+#[test]
+fn an_account_may_not_name_a_service_nobody_declared() {
+    assert_invalid(
+        "[providers.openai]\nkeys = [{ name = \"k\", value = \"sk\", tenant = \"ghost\" }]\n",
+        &[],
+        "providers.openai.keys[0].tenant",
+        "no service named `ghost` is declared",
+    );
+}
+
+#[test]
+fn duplicate_service_names_are_rejected() {
+    assert_invalid(
+        "tenants = [\"agi\", \"agi\"]\n",
+        &[],
+        "tenants[1]",
+        "duplicate service `agi`",
+    );
+}
+
+#[test]
+fn account_labels_resolve_onto_the_provider() {
+    let config = load(
+        &format!(
+            "{TENANTS}[providers.openai]\nkeys = [\n\
+               {{ name = \"a\", value = \"sk\", tenant = \"agi\" }},\n\
+               {{ name = \"b\", value = \"sk\" }},\n\
+             ]\n"
+        ),
+        &[],
+    )
+    .unwrap();
+    let keys = &config.providers["openai"].keys;
+    assert_eq!(keys[0].tenant.as_deref(), Some("agi"));
+    assert_eq!(keys[1].tenant, None, "unassigned");
+}
+
 #[test]
 fn virtual_key_scope_must_name_known_provider_or_alias() {
     assert_invalid(

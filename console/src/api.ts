@@ -9,6 +9,8 @@ export type VirtualKey = {
   id: string;
   name: string;
   models: string[];
+  /** The service this key belongs to; it may spend only the accounts labelled for it. */
+  tenant?: string;
   budget?: { usd: number; period: "daily" | "weekly" | "monthly" };
   rate?: { rpm?: number; tpm?: number };
   expires_ms?: number;
@@ -22,6 +24,8 @@ export type ProviderKey = {
   name: string;
   weight: number;
   models: string[] | null;
+  /** The service that owns this account; null = unassigned. */
+  tenant: string | null;
   health: "healthy" | "probing" | "open" | "benched";
   /** Breaker, plan quota and credential validity folded into one word. */
   status?: "ready" | "near_limit" | "exhausted" | "probing" | "open" | "benched";
@@ -95,6 +99,8 @@ export type Provider = {
   kind: string;
   subscription: boolean;
   base_url: string | null;
+  /** True when at least one account here is labelled for a service. */
+  managed: boolean;
   keys: ProviderKey[];
 };
 
@@ -178,6 +184,7 @@ export type UsageRecord = {
    * before that shipped. */
   prompt?: string;
 };
+
 
 export type UsageSlice = {
   name: string;
@@ -379,7 +386,13 @@ export const api = {
       reason?: string;
     }>(`/requests/${encodeURIComponent(id)}/bodies?ts=${ts}`),
   fleet: () => request<any>("/fleet"),
-  providers: () => request<{ data: Provider[] }>("/providers"),
+  providers: () => request<{ data: Provider[]; tenants: string[] }>("/providers"),
+  /** Move one account to a service, or `null` to unassign it. */
+  setAccountTenant: (provider: string, account: string, tenant: string | null) =>
+    request<{ version: number }>(
+      `/providers/${encodeURIComponent(provider)}/keys/${encodeURIComponent(account)}/tenant`,
+      { method: "PUT", body: JSON.stringify({ tenant }) },
+    ),
   catalog: () =>
     request<{
       presets: CatalogPreset[];

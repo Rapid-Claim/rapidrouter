@@ -33,6 +33,7 @@ name        = "checkout-service"
 id          = "9f3a2c"
 secret_hash = "blake3:…"
 models      = ["openai/gpt-4o-mini", "smart", "fast"]   # models, groups, or aliases
+tenant      = "optimizer"                               # which service this key belongs to
 budget      = { usd = 250, period = "monthly" }
 rate_limit  = { rpm = 600, tpm = 400_000 }
 expires     = "2027-01-01T00:00:00Z"                     # optional
@@ -43,12 +44,47 @@ enabled     = true
 - **Scope** is an allowlist of models, routing groups, and/or aliases (a
   group or alias keeps the scope stable while you repoint what is behind
   it). No scope = all configured models.
+- **Tenant** is the service this key belongs to, and decides how deep into
+  an account pool it may draw when the pool is under pressure — see below.
 - **Budget** is spend per period, priced from provider-reported usage.
 - **Rate limits** are requests/min and tokens/min (input + output;
   provider-cached tokens excluded).
 - **Tags** flow into usage records and metrics labels are *not* generated
   from them (cardinality stays bounded); they exist for console filtering
   and exports.
+
+## Which accounts a key can spend
+
+`models` answers "what may this key call". The **tenant** answers "which
+service is this", and that decides which accounts it may spend.
+
+```toml
+tenant = "optimizer"
+```
+
+The rule is a match, not an ordering. An account carries the name of the
+service that owns it; a key carries the name of the service it is; a request
+may spend the accounts whose label matches and **no others**. There is no
+borrowing, no priority and no overflow — a service that has exhausted its own
+accounts is refused while another service's sit idle. That is the trade the
+label buys, and it is the whole mechanism.
+
+A pool where no account is labelled is **shared exactly as before**: every key
+reaches every account, tenant or not. This is what makes the feature inert
+until someone uses it, and it is why nothing changes for a provider nobody has
+divided up.
+
+Once any account in a pool *is* labelled, the pool becomes managed and a key
+with **no** tenant reaches nothing there — a `403`, not last place. That is
+deliberate: degrading to an unlabelled overflow would quietly re-create
+borrowing. It also forces an ordering during rollout, because traffic on a
+static `server.auth_keys` gateway key can never carry a tenant at all: **every
+caller must be moved onto a `ck-` key before the first account is labelled.**
+
+Many keys may share one tenant, which is the point: a service's allocation
+survives issuing, rotating and revoking the keys that spend it. Tenant names
+are checked against the `tenants` roster wherever a key is written, so a typo
+fails there rather than producing a key that looks fine and owns nothing.
 
 ## Enforcement semantics
 
@@ -58,6 +94,7 @@ Enforcement happens in the auth layer, before routing, in this order:
 |---|---|---|
 | Key exists, enabled, unexpired | `401 authentication` | constant-time verify |
 | Model in scope | `403 permission` — names the model and key | checked after model extraction, before any upstream work |
+| Pool pressure | `429 rate_limited` — names the service and the counts | applied at credential selection, per attempt, per target |
 | Rate limits | `429 rate_limited` + `retry-after` | atomic token buckets; race-free under concurrency (loom/proptest-verified) |
 | Budget | `429 insufficient_quota` | see lag note below |
 
@@ -85,6 +122,8 @@ key count is under a configured cardinality cap.
 ```bash
 rapid-router key create --name checkout-service \
   --models openai/gpt-4o-mini,fast --budget-usd 250/monthly --rpm 600
+
+rapid-router key create --name bulk-batch --tenant optimizer
 # → prints the full key once
 
 rapid-router key ls | rotate <id> | disable <id> | enable <id> | rm <id>

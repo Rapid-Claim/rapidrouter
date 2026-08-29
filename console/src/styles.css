@@ -1838,3 +1838,21 @@ table.dense small.danger { color: var(--danger); }
 .jb { color: var(--json-bool); }
 .jz { color: var(--muted); }
 .jp { color: var(--muted); }
+
+/* Assigning an account or a key to a service, inline in a table row:
+   compact enough not to widen the column, and obviously interactive. */
+.service-picker {
+  min-height: 26px;
+  padding: 2px 6px;
+  font-size: 11.5px;
+  max-width: 11rem;
+}
+.service-picker:disabled { opacity: 0.6; }
+
+/* An in-row button that opens something, sized to sit inside a table cell
+   without stretching the row. */
+.button.small { min-height: 24px; padding: 2px 9px; font-size: 11.5px; }
+
+/* Helper text under a field. `small` is inline, so it has to be told to
+   take its own line before .muted's margin means anything. */
+label > small { display: block; }

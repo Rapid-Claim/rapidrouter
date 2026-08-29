@@ -17,6 +17,11 @@ pub struct RawConfig {
     /// weighted primary pool and a weighted fallback pool.
     pub groups: BTreeMap<String, RawGroup>,
     pub reliability: RawReliability,
+    /// The services that draw on account pools, by name. Declaring one
+    /// here is what makes its name usable on an account or on a key —
+    /// which turns a typo into a startup error instead of an account that
+    /// silently serves nobody.
+    pub tenants: Vec<String>,
     /// File-mode virtual keys (hash form) — GitOps shops declare them
     /// here; managed mode keeps them in the store instead.
     pub virtual_keys: Vec<RawVirtualKey>,
@@ -85,6 +90,10 @@ pub struct RawVirtualKey {
     pub secret_hash: String,
     #[serde(default)]
     pub models: Vec<String>,
+    /// Which service this key belongs to. It may use the accounts labelled
+    /// for that service, and no others.
+    #[serde(default)]
+    pub tenant: Option<String>,
     #[serde(default)]
     pub budget: Option<RawBudget>,
     #[serde(default)]
@@ -285,6 +294,13 @@ pub struct RawKey {
     /// Restrict this key to specific models; omitted = all models.
     #[serde(default)]
     pub models: Option<Vec<String>>,
+    /// Which service owns this account. Omitted = unassigned.
+    ///
+    /// One field, so an account cannot belong to two services and cannot
+    /// be forgotten by all of them. Moving an account between services is
+    /// an edit to this one word.
+    #[serde(default)]
+    pub tenant: Option<String>,
     /// This key's own ceiling, independent of any virtual key's.
     ///
     /// Provider accounts are rate limited per credential, so the limit

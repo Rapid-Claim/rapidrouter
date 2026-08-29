@@ -48,6 +48,10 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
             axum::routing::delete(delete_model),
         )
         .route(
+            "/providers/{name}/keys/{key}/tenant",
+            put(set_account_tenant),
+        )
+        .route(
             "/providers/{name}/keys/{key}",
             axum::routing::delete(delete_provider_key),
         )
@@ -541,6 +545,9 @@ struct KeyInput {
     name: String,
     #[serde(default)]
     models: Vec<String>,
+    /// Which service this key belongs to.
+    #[serde(default)]
+    tenant: Option<String>,
     #[serde(default)]
     budget: Option<Budget>,
     #[serde(default)]
@@ -556,6 +563,7 @@ struct KeyView<'a> {
     id: &'a str,
     name: &'a str,
     models: &'a [String],
+    tenant: Option<&'a str>,
     budget: Option<Budget>,
     rate: Option<RateLimit>,
     expires_ms: Option<u64>,
@@ -569,6 +577,7 @@ fn key_view(def: &VirtualKeyDef) -> KeyView<'_> {
         id: &def.id,
         name: &def.name,
         models: &def.models,
+        tenant: def.tenant.as_deref(),
         budget: def.budget,
         rate: def.rate,
         expires_ms: def.expires_ms,
@@ -582,6 +591,22 @@ async fn list_keys(State(state): State<Arc<AppState>>) -> Response {
     let mut defs: Vec<VirtualKeyDef> = state.vkeys.load().iter().map(|rt| rt.def.clone()).collect();
     defs.sort_by(|a, b| a.name.cmp(&b.name));
     Json(json!({ "data": defs.iter().map(key_view).collect::<Vec<_>>() })).into_response()
+}
+
+/// Reject a service this gateway does not know.
+///
+/// A misspelled name is not a harmless label: the key would own no account
+/// in any labelled pool, which looks like a working key right up until the
+/// pool is busy.
+fn check_tenant(state: &AppState, tenant: Option<&str>) -> Result<(), String> {
+    let Some(tenant) = tenant else {
+        return Ok(());
+    };
+    if state.config.load().tenants.contains(tenant) {
+        Ok(())
+    } else {
+        Err(format!("no service named `{tenant}` is declared"))
+    }
 }
 
 async fn create_key(
@@ -615,6 +640,9 @@ async fn create_key(
             );
         }
     }
+    if let Err(message) = check_tenant(&state, input.tenant.as_deref()) {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+    }
     let mut tags = input.tags;
     if let Some(team) = authz.grant.teams.first() {
         // Recorded, not user-supplied: this is what scopes later edits.
@@ -630,6 +658,7 @@ async fn create_key(
         secret_hash: vkey::hash_secret(&generated.secret),
         prev_secret: None,
         models: input.models,
+        tenant: input.tenant,
         budget: input.budget,
         rate: input.rate,
         expires_ms: input.expires_ms,
@@ -659,6 +688,9 @@ struct KeyUpdate {
     name: Option<String>,
     #[serde(default)]
     models: Option<Vec<String>>,
+    /// `Some(None)` moves the key off every service; absent leaves it alone.
+    #[serde(default)]
+    tenant: Option<Option<String>>,
     #[serde(default)]
     budget: Option<Option<Budget>>,
     #[serde(default)]
@@ -690,6 +722,12 @@ async fn update_key(
     }
     if let Some(models) = input.models {
         def.models = models;
+    }
+    if let Some(tenant) = input.tenant {
+        if let Err(message) = check_tenant(&state, tenant.as_deref()) {
+            return api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+        }
+        def.tenant = tenant;
     }
     if let Some(budget) = input.budget {
         def.budget = budget;
@@ -1459,6 +1497,11 @@ async fn add_provider_keys(
     if let Err(response) = writable(&state) {
         return response;
     }
+    for key in &input.keys {
+        if let Err(message) = check_tenant(&state, key.tenant.as_deref()) {
+            return api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+        }
+    }
     let (version, mut doc) = match config_document(&state) {
         Ok(pair) => pair,
         Err(response) => return *response,
@@ -1835,6 +1878,9 @@ struct NewProvider {
 
 #[derive(Deserialize)]
 struct NewKey {
+    /// Which service owns this account; omitted = unassigned.
+    #[serde(default)]
+    tenant: Option<String>,
     name: String,
     /// `env.VAR`, `file:/path`, `store.name`, or a literal.
     value: String,
@@ -1849,6 +1895,9 @@ fn key_entry(key: &NewKey, fallback_models: &[String]) -> toml_edit::InlineTable
     let mut entry = toml_edit::InlineTable::new();
     entry.insert("name", key.name.clone().into());
     entry.insert("value", key.value.clone().into());
+    if let Some(tenant) = &key.tenant {
+        entry.insert("tenant", tenant.as_str().into());
+    }
     if let Some(weight) = key.weight {
         entry.insert("weight", weight.into());
     }
@@ -1980,6 +2029,63 @@ async fn delete_provider(State(state): State<Arc<AppState>>, Path(name): Path<St
     commit_document(&state, version, doc).await
 }
 
+#[derive(Deserialize)]
+struct AccountTenant {
+    /// `null` unassigns the account.
+    #[serde(default)]
+    tenant: Option<String>,
+}
+
+/// Move one account to a service — the whole management operation.
+///
+/// One field on one account, so a move cannot be half-applied and an
+/// account cannot end up owned by two services or by none by accident. The
+/// service it came from is implied: the account already knew.
+async fn set_account_tenant(
+    State(state): State<Arc<AppState>>,
+    Path((name, key)): Path<(String, String)>,
+    Json(input): Json<AccountTenant>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    if let Err(message) = check_tenant(&state, input.tenant.as_deref()) {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let Some(keys) = doc
+        .get_mut("providers")
+        .and_then(|p| p.as_table_like_mut())
+        .and_then(|p| p.get_mut(&name))
+        .and_then(|p| p.get_mut("keys"))
+        .and_then(|k| k.as_array_mut())
+    else {
+        return api_error(StatusCode::NOT_FOUND, format!("no provider `{name}`"));
+    };
+    let Some(entry) = keys
+        .iter_mut()
+        .filter_map(|value| value.as_inline_table_mut())
+        .find(|table| table.get("name").and_then(|n| n.as_str()) == Some(key.as_str()))
+    else {
+        return api_error(
+            StatusCode::NOT_FOUND,
+            format!("provider `{name}` has no account `{key}`"),
+        );
+    };
+    match &input.tenant {
+        Some(tenant) => {
+            entry.insert("tenant", toml_edit::Value::from(tenant.as_str()));
+        }
+        None => {
+            entry.remove("tenant");
+        }
+    }
+    commit_document(&state, version, doc).await
+}
+
 async fn add_provider_key(
     State(state): State<Arc<AppState>>,
     Path(name): Path<String>,
@@ -1987,6 +2093,9 @@ async fn add_provider_key(
 ) -> Response {
     if let Err(response) = writable(&state) {
         return response;
+    }
+    if let Err(message) = check_tenant(&state, input.tenant.as_deref()) {
+        return api_error(StatusCode::UNPROCESSABLE_ENTITY, message);
     }
     let (version, mut doc) = match config_document(&state) {
         Ok(pair) => pair,
@@ -2512,6 +2621,10 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                         "name": k.name,
                         "weight": k.weight,
                         "models": k.models,
+                        // Which service owns this account; `null` = nobody
+                        // owns it, and in a labelled pool that means it
+                        // serves nobody until someone assigns it.
+                        "tenant": k.tenant,
                         "health": k.breaker.health(now),
                         // The breaker only knows about failures. A seat
                         // sitting at 100% of its plan window has failed
@@ -2588,11 +2701,20 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                 "kind": format!("{:?}", p.kind),
                 "subscription": p.kind.is_subscription(),
                 "base_url": p.base_url,
+                // A pool nobody has divided up is shared by every caller.
+                // The console needs to know which it is looking at.
+                "managed": p.managed,
                 "keys": keys,
             })
         })
         .collect();
-    Json(json!({ "data": data })).into_response()
+    Json(json!({
+        "data": data,
+        // The declared services, so the console can offer them rather than
+        // making an operator type a name that has to match exactly.
+        "tenants": state.config.load().tenants.iter().collect::<Vec<_>>(),
+    }))
+    .into_response()
 }
 
 /// One word for the state of a credential, folding together the three
