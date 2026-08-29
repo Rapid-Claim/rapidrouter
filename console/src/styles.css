@@ -1900,3 +1900,20 @@ label > small { display: block; }
   width: 100%;
   margin-bottom: 10px;
 }
+
+/* The service roster. Chips rather than a table: it is a short list of
+   words, and each one only needs its name, what it holds, and a way out. */
+.service-roster { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.service-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 6px 4px 11px;
+  border: 1px solid var(--border);
+  border-radius: 999px;
+}
+/* Removal is disabled while anything still points at the service, because
+   deleting one that is in use strands whatever pointed at it. */
+.service-chip .icon-button:disabled { opacity: 0.3; }
+.service-add { display: inline-flex; gap: 6px; align-items: center; }
+.service-add input { min-height: 30px; max-width: 12rem; }

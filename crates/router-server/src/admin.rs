@@ -31,6 +31,8 @@ pub fn router(state: Arc<AppState>) -> Router<Arc<AppState>> {
         .route("/requests/summary", get(requests_summary))
         .route("/usage/summary", get(usage_summary))
         .route("/requests/{id}/bodies", get(request_bodies))
+        .route("/tenants", post(create_tenant))
+        .route("/tenants/{name}", axum::routing::delete(delete_tenant))
         .route("/providers", get(providers).post(create_provider))
         .route(
             "/providers/{name}",
@@ -2027,6 +2029,162 @@ async fn delete_provider(State(state): State<Arc<AppState>>, Path(name): Path<St
         return api_error(StatusCode::NOT_FOUND, format!("no provider `{name}`"));
     }
     commit_document(&state, version, doc).await
+}
+
+#[derive(Deserialize)]
+struct NewTenant {
+    name: String,
+}
+
+/// Declare a service.
+///
+/// The roster is the vocabulary every other control here draws on — the
+/// pickers on a key, the filter on the credentials table, the bulk assign.
+/// Until this existed the only way to add a word to it was to edit the
+/// gateway's config by hand, which meant the console could show the whole
+/// operation and not let anyone begin it.
+async fn create_tenant(
+    State(state): State<Arc<AppState>>,
+    Json(input): Json<NewTenant>,
+) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let name = input.name.trim().to_owned();
+    // Stricter than the config loader, deliberately: a name typed here is
+    // about to be copied onto accounts and keys and read back in log lines
+    // and error messages, and there is no reason to allow one that reads
+    // badly in any of them. Existing configs keep whatever they already say.
+    if name.is_empty()
+        || name.len() > 64
+        || !name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "a service name must be 1-64 characters of letters, digits, `-` or `_`",
+        );
+    }
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    let list = doc
+        .entry("tenants")
+        .or_insert_with(|| toml_edit::value(toml_edit::Array::new()));
+    let Some(array) = list.as_array_mut() else {
+        return api_error(
+            StatusCode::UNPROCESSABLE_ENTITY,
+            "`tenants` in the configuration is not a list",
+        );
+    };
+    if array.iter().any(|v| v.as_str() == Some(name.as_str())) {
+        return api_error(
+            StatusCode::CONFLICT,
+            format!("service `{name}` is already declared"),
+        );
+    }
+    array.push(name.as_str());
+    commit_document(&state, version, doc).await
+}
+
+/// Remove a service, but only once nothing still points at it.
+///
+/// Deleting a name that is still in use is the quiet way to break this
+/// feature: an account whose service no longer exists is owned by nobody,
+/// and on a divided pool it serves nobody while still reporting healthy and
+/// in quota. A key naming it owns nothing and every request it makes is
+/// refused. Neither failure says why, and neither is visible until traffic
+/// arrives — so this refuses, and names exactly what is in the way.
+async fn delete_tenant(State(state): State<Arc<AppState>>, Path(name): Path<String>) -> Response {
+    if let Err(response) = writable(&state) {
+        return response;
+    }
+    let config = state.config.load();
+    if !config.tenants.contains(&name) {
+        return api_error(StatusCode::NOT_FOUND, format!("no service `{name}`"));
+    }
+
+    let accounts: Vec<String> = config
+        .providers
+        .iter()
+        .flat_map(|(provider, p)| {
+            p.keys
+                .iter()
+                .filter(|k| k.tenant.as_deref() == Some(name.as_str()))
+                .map(move |k| format!("{provider}/{}", k.name))
+        })
+        .collect();
+    let keys: Vec<String> = state
+        .vkeys
+        .load()
+        .iter()
+        .filter(|rt| rt.def.tenant.as_deref() == Some(name.as_str()))
+        .map(|rt| rt.def.name.clone())
+        .collect();
+    // A static gateway key is the worst one to strand: its callers present a
+    // shared secret and often cannot be reconfigured at all, so they would
+    // simply start failing with nothing to change on their side.
+    let static_keys = config
+        .server
+        .auth_keys
+        .iter()
+        .filter(|k| k.tenant.as_deref() == Some(name.as_str()))
+        .count();
+
+    if !accounts.is_empty() || !keys.is_empty() || static_keys > 0 {
+        let mut blockers = Vec::new();
+        if !accounts.is_empty() {
+            blockers.push(format!(
+                "{} account{} ({})",
+                accounts.len(),
+                if accounts.len() == 1 { "" } else { "s" },
+                preview(&accounts)
+            ));
+        }
+        if !keys.is_empty() {
+            blockers.push(format!(
+                "{} virtual key{} ({})",
+                keys.len(),
+                if keys.len() == 1 { "" } else { "s" },
+                keys.join(", ")
+            ));
+        }
+        if static_keys > 0 {
+            blockers.push(format!("{static_keys} static gateway key(s)"));
+        }
+        return api_error(
+            StatusCode::CONFLICT,
+            format!(
+                "service `{name}` still has {}. Move them to another service first — \
+                 deleting it would leave them owned by nobody.",
+                blockers.join(", ")
+            ),
+        );
+    }
+
+    let (version, mut doc) = match config_document(&state) {
+        Ok(pair) => pair,
+        Err(response) => return *response,
+    };
+    if let Some(array) = doc.get_mut("tenants").and_then(|v| v.as_array_mut()) {
+        array.retain(|v| v.as_str() != Some(name.as_str()));
+    }
+    commit_document(&state, version, doc).await
+}
+
+/// The first few of a list, for an error an operator has to act on.
+fn preview(items: &[String]) -> String {
+    const SHOWN: usize = 3;
+    if items.len() <= SHOWN {
+        return items.join(", ");
+    }
+    format!(
+        "{}, and {} more",
+        items[..SHOWN].join(", "),
+        items.len() - SHOWN
+    )
 }
 
 #[derive(Deserialize)]

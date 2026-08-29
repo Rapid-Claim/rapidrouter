@@ -2478,6 +2478,36 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
   const [tpm, setTpm] = createSignal("");
   const [advanced, setAdvanced] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [newService, setNewService] = createSignal("");
+  const [serviceBusy, setServiceBusy] = createSignal("");
+
+  const tenants = () => providers()?.tenants ?? [];
+  // What each service holds, so the roster is not just a list of words —
+  // and so the thing that blocks a deletion is visible before you try it.
+  const serviceHolds = (name: string) => ({
+    accounts: accountsFor(providers()?.data ?? [], name),
+    keys: (keys()?.data ?? []).filter((k) => k.tenant === name).length,
+  });
+  const addService = async () => {
+    const name = newService().trim();
+    if (!name) return;
+    setServiceBusy(name); setError("");
+    try { await api.addTenant(name); setNewService(""); await refetchProviders(); }
+    catch (err) { setError(err instanceof Error ? err.message : "Could not add the service"); }
+    finally { setServiceBusy(""); }
+  };
+  const removeService = async (name: string) => {
+    const held = serviceHolds(name);
+    if (held.accounts || held.keys) {
+      setError(`\u201c${name}\u201d still has ${held.accounts} account(s) and ${held.keys} key(s). Move them first.`);
+      return;
+    }
+    if (!confirm(`Remove the service \u201c${name}\u201d?`)) return;
+    setServiceBusy(name); setError("");
+    try { await api.deleteTenant(name); await refetchProviders(); }
+    catch (err) { setError(err instanceof Error ? err.message : "Could not remove the service"); }
+    finally { setServiceBusy(""); }
+  };
   const reload = async () => { await refetch(); props.bump(); };
 
   const modelOptions = createMemo<Option[]>(() => {
@@ -2515,6 +2545,49 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
       filters={[]}
       extra={<button class="button primary" onClick={() => setCreating(true)}><Plus size={15} />Create key</button>}
     />
+    {/* The roster has to be editable somewhere, and this is where its words
+        are used. Until it was, every service control on this page offered
+        nothing but "Unassigned" and the only way to add one was to hand-edit
+        the gateway's config. */}
+    <section class="panel">
+      <SectionTitle
+        title="Services"
+        subtitle="Accounts and keys are assigned to a service; a name has to exist here first"
+      />
+      <div class="service-roster">
+        <For each={tenants()} fallback={<p class="muted">No services yet. Add one to start assigning accounts.</p>}>
+          {(name) => {
+            const held = serviceHolds(name);
+            const inUse = held.accounts > 0 || held.keys > 0;
+            return <span class="service-chip">
+              <strong>{name}</strong>
+              <span class="muted">{held.accounts} acct · {held.keys} key{held.keys === 1 ? "" : "s"}</span>
+              <button
+                class="icon-button"
+                disabled={Boolean(serviceBusy()) || inUse}
+                title={inUse
+                  ? `In use by ${held.accounts} account(s) and ${held.keys} key(s) — move them first`
+                  : `Remove ${name}`}
+                aria-label={`Remove the service ${name}`}
+                onClick={() => void removeService(name)}
+              ><Trash2 size={13} /></button>
+            </span>;
+          }}
+        </For>
+        <div class="service-add">
+          <input
+            type="text"
+            value={newService()}
+            placeholder="New service…"
+            aria-label="New service name"
+            onInput={(e) => setNewService(e.currentTarget.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void addService(); }}
+          />
+          <button class="button outline small" disabled={!newService().trim() || Boolean(serviceBusy())} onClick={() => void addService()}>Add</button>
+        </div>
+      </div>
+    </section>
+
     <section class="panel">
       <SectionTitle title="Virtual keys" subtitle="Scoped credentials with limits, budgets, and immediate revocation" />
       <Loading when={keys.loading && !keys()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No virtual keys" action="Create a key for an application or team." />}>

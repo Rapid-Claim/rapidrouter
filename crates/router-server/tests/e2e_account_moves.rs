@@ -309,3 +309,167 @@ async fn deleting_an_account_takes_it_out_of_its_service() {
         "kris owns nothing again, and does not reach agi's seat-1"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Declaring and removing a service.
+//
+// The roster is the vocabulary every service control draws on, and until it
+// could be edited here the console could show the whole operation and not let
+// anyone begin it. Removal is the half that needs the care: a name deleted
+// while anything still points at it strands whatever pointed, silently.
+// ---------------------------------------------------------------------------
+
+async fn add_tenant(admin: &reqwest::Client, gw: &Gateway, name: &str) -> reqwest::Response {
+    admin
+        .post(format!("{}/admin/api/tenants", gw.url))
+        .json(&json!({ "name": name }))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn remove_tenant(admin: &reqwest::Client, gw: &Gateway, name: &str) -> reqwest::Response {
+    admin
+        .delete(format!("{}/admin/api/tenants/{name}", gw.url))
+        .send()
+        .await
+        .unwrap()
+}
+
+async fn roster(admin: &reqwest::Client, gw: &Gateway) -> BTreeSet<String> {
+    let body: Value = admin
+        .get(format!("{}/admin/api/providers", gw.url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    body["tenants"]
+        .as_array()
+        .expect("the roster is a list")
+        .iter()
+        .map(|v| v.as_str().unwrap().to_owned())
+        .collect()
+}
+
+#[tokio::test]
+async fn a_service_can_be_declared_and_then_used() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+
+    assert_eq!(add_tenant(&admin, &gw, "optimizer").await.status(), 200);
+    assert!(roster(&admin, &gw).await.contains("optimizer"));
+
+    // Declaring it is what makes it usable everywhere else — the point of
+    // the roster is that a name has to exist before it can be worn.
+    assert_eq!(
+        move_account(&admin, &gw, "seat-2", json!("optimizer"))
+            .await
+            .status(),
+        200,
+    );
+}
+
+#[tokio::test]
+async fn a_service_name_has_to_be_one_worth_reading() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+    for bad in ["", "   ", "has space", "punct!", &"x".repeat(65)] {
+        let response = add_tenant(&admin, &gw, bad).await;
+        assert_eq!(
+            response.status(),
+            422,
+            "`{bad}` should be refused: it is about to be copied onto accounts and into log lines",
+        );
+    }
+    assert_eq!(
+        add_tenant(&admin, &gw, "agi").await.status(),
+        409,
+        "duplicate"
+    );
+}
+
+#[tokio::test]
+async fn a_service_still_holding_accounts_cannot_be_deleted() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+
+    // `agi` owns seat-1. Deleting it would leave that account owned by
+    // nobody — reporting healthy and in quota while serving no one.
+    let response = remove_tenant(&admin, &gw, "agi").await;
+    assert_eq!(response.status(), 409);
+    let body: Value = response.json().await.unwrap();
+    let message = body["error"]["message"].as_str().unwrap();
+    assert!(
+        message.contains("account"),
+        "says what is in the way: {message}"
+    );
+    assert!(message.contains("pool/seat-1"), "names it: {message}");
+    assert!(
+        roster(&admin, &gw).await.contains("agi"),
+        "and did not delete it"
+    );
+}
+
+#[tokio::test]
+async fn a_service_still_named_by_a_key_cannot_be_deleted() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+
+    // `kris` owns no account, but a virtual key names it. Deleting it would
+    // leave that key owning nothing, and every request it makes refused.
+    let response = remove_tenant(&admin, &gw, "kris").await;
+    assert_eq!(response.status(), 409);
+    let message = response.json::<Value>().await.unwrap()["error"]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    assert!(message.contains("kris-key"), "names the key: {message}");
+}
+
+#[tokio::test]
+async fn a_service_nothing_points_at_can_be_deleted() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+
+    assert_eq!(add_tenant(&admin, &gw, "temporary").await.status(), 200);
+    assert_eq!(remove_tenant(&admin, &gw, "temporary").await.status(), 200);
+    assert!(!roster(&admin, &gw).await.contains("temporary"));
+
+    // And once it is gone it cannot be worn, which is the roster doing its
+    // job: a typo becomes an error rather than an account owned by nobody.
+    assert_eq!(
+        move_account(&admin, &gw, "seat-2", json!("temporary"))
+            .await
+            .status(),
+        422,
+    );
+}
+
+#[tokio::test]
+async fn deleting_a_service_that_does_not_exist_says_so() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+    assert_eq!(
+        remove_tenant(&admin, &gw, "never-existed").await.status(),
+        404
+    );
+}
+
+#[tokio::test]
+async fn a_freed_service_can_be_deleted_after_its_accounts_move_away() {
+    let gw = gateway().await;
+    let admin = admin(&gw).await;
+
+    assert_eq!(remove_tenant(&admin, &gw, "agi").await.status(), 409);
+    // Unassign its only account, and the blocker is gone.
+    assert_eq!(
+        move_account(&admin, &gw, "seat-1", Value::Null)
+            .await
+            .status(),
+        200,
+    );
+    assert_eq!(remove_tenant(&admin, &gw, "agi").await.status(), 200);
+    assert!(!roster(&admin, &gw).await.contains("agi"));
+}

@@ -387,6 +387,14 @@ export const api = {
     }>(`/requests/${encodeURIComponent(id)}/bodies?ts=${ts}`),
   fleet: () => request<any>("/fleet"),
   providers: () => request<{ data: Provider[]; tenants: string[] }>("/providers"),
+  /** Declare a service. Names are letters, digits, `-` or `_`. */
+  addTenant: (name: string) =>
+    request<{ version: number }>("/tenants", { method: "POST", body: JSON.stringify({ name }) }),
+  /** Remove a service. Refused while any account, virtual key or static
+   *  gateway key still names it — deleting one that is still in use would
+   *  leave whatever pointed at it owned by nobody. */
+  deleteTenant: (name: string) =>
+    request<{ version: number }>(`/tenants/${encodeURIComponent(name)}`, { method: "DELETE" }),
   /** Move one account to a service, or `null` to unassign it. */
   setAccountTenant: (provider: string, account: string, tenant: string | null) =>
     request<{ version: number }>(
