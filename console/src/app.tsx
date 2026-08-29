@@ -669,9 +669,12 @@ function ProviderAccounts(props: {
 
   const [search, setSearch] = createSignal("");
   const [domain, setDomain] = createSignal("");
+  // "" = any, "\u0000" = unassigned only. A sentinel rather than null so the
+  // combobox can offer "Unassigned" as an ordinary choice.
+  const [service, setService] = createSignal("");
   const [dupesOnly, setDupesOnly] = createSignal(false);
   const [picked, setPicked] = createSignal<string[]>([]);
-  const [busy, setBusy] = createSignal<"" | "check" | "remove">("");
+  const [busy, setBusy] = createSignal<"" | "check" | "remove" | "assign">("");
   const [progress, setProgress] = createSignal("");
 
   // Seats by the account they sign in as, each group freshest-first so
@@ -703,6 +706,23 @@ function ProviderAccounts(props: {
     .filter((group) => group.length > 1)
     .reduce((total, group) => total + group.length - 1, 0));
 
+  // Services this provider's accounts are split across, with counts, plus
+  // an "Unassigned" entry — on a divided pool those are the accounts that
+  // serve nobody, which is the thing you most need to be able to isolate.
+  const serviceOptions = createMemo(() => {
+    const counts = new Map<string, number>();
+    let none = 0;
+    for (const key of keys()) {
+      if (key.tenant) counts.set(key.tenant, (counts.get(key.tenant) ?? 0) + 1);
+      else none += 1;
+    }
+    const out = [...counts].sort().map(([name, n]) => ({
+      value: name, label: name, hint: String(n),
+    }));
+    if (none) out.push({ value: "\u0000", label: "Unassigned", hint: String(none) });
+    return out;
+  });
+
   const domains = createMemo(() => {
     const counts = new Map<string, number>();
     for (const key of keys()) {
@@ -717,9 +737,11 @@ function ProviderAccounts(props: {
   const matching = createMemo(() => {
     const needle = search().trim().toLowerCase();
     const wanted = domain();
+    const wantedService = service();
     const onlyDupes = dupesOnly();
     return keys().filter((key) => {
       if (wanted && seatDomain(key) !== wanted) return false;
+      if (wantedService === "\u0000" ? key.tenant : wantedService && key.tenant !== wantedService) return false;
       if (onlyDupes && !isDuplicate(key)) return false;
       return !needle || seatHaystack(key).includes(needle);
     });
@@ -809,8 +831,8 @@ function ProviderAccounts(props: {
     if (dupesOnly() && !redundant()) setDupesOnly(false);
   });
 
-  const filtering = () => Boolean(search().trim() || domain() || dupesOnly());
-  const clearFilters = () => { setSearch(""); setDomain(""); setDupesOnly(false); };
+  const filtering = () => Boolean(search().trim() || domain() || service() || dupesOnly());
+  const clearFilters = () => { setSearch(""); setDomain(""); setService(""); setDupesOnly(false); };
 
   const probeSummary = () => {
     const entries = Object.values(props.probes);
@@ -844,6 +866,25 @@ function ProviderAccounts(props: {
       setBusy("");
       setProgress("");
     }
+  };
+
+  // Assigning a divided pool one row at a time is not a workable operation:
+  // 117 accounts is 117 confirmations. Worse, done sequentially there is a
+  // window where the service that owns most of the pool holds only the few
+  // already moved — so the bulk path is the safe one as well as the quick one.
+  const assignSelected = async (tenant: string | null) => {
+    const names = picked();
+    if (!names.length) return;
+    if (!tenant && !confirm(`Unassign ${names.length} account${names.length === 1 ? "" : "s"}?\n\nOn a divided pool an unassigned account serves nobody.`)) return;
+    setBusy("assign"); props.onError("");
+    let failed = 0;
+    for (const name of names) {
+      try { await api.setAccountTenant(provider().name, name, tenant); }
+      catch { failed += 1; }
+    }
+    setBusy(""); setPicked([]);
+    if (failed) props.onError(`${failed} of ${names.length} could not be changed.`);
+    props.onDone();
   };
 
   const removeSelected = async () => {
@@ -949,6 +990,19 @@ function ProviderAccounts(props: {
               allowEmpty
             />
           </Show>
+          {/* On a divided pool of 119, "which are the optimizer's" and
+              "which are stranded" are the two questions actually asked of
+              this table, and neither was answerable before. */}
+          <Show when={props.tenants.length}>
+            <Combobox
+              value={service()}
+              options={serviceOptions()}
+              onSelect={setService}
+              label="Service"
+              placeholder="Any service"
+              allowEmpty
+            />
+          </Show>
           <Show when={filtering()}>
             <button type="button" class="button ghost" onClick={clearFilters}>Clear filters</button>
           </Show>
@@ -983,7 +1037,7 @@ function ProviderAccounts(props: {
                   />
                 </th>
                 <SortHeader label="Credential" column="credential" sort={sort()} onSort={sortBy} />
-                <th>Service</th>
+                <SortHeader label="Service" column="service" sort={sort()} onSort={sortBy} />
                 <SortHeader
                   label={provider().subscription ? "Plan windows" : "Limits"}
                   column="headroom"
@@ -1059,6 +1113,22 @@ function ProviderAccounts(props: {
             <Show when={busy() === "remove"} fallback={<Trash2 size={15} />}><RefreshCw size={15} class="spin" /></Show>
           </button>
         </div>
+        <Show when={props.tenants.length}>
+          <select
+            class="service-picker"
+            aria-label={`Assign ${selected().length} selected accounts to a service`}
+            disabled={Boolean(busy())}
+            onChange={(e) => {
+              const v = e.currentTarget.value;
+              e.currentTarget.value = "";
+              if (v) void assignSelected(v === "\u0000" ? null : v);
+            }}
+          >
+            <option value="" selected>Assign to…</option>
+            <For each={props.tenants}>{(name) => <option value={name}>{name}</option>}</For>
+            <option value="\u0000">Unassigned</option>
+          </select>
+        </Show>
         <button class="button ghost" disabled={Boolean(busy())} onClick={() => setPicked([])}>Clear</button>
       </div>
     </Show>
@@ -1458,7 +1528,7 @@ function planWindowLabel(length_s: number): string {
 }
 
 /// The credential columns an operator can order the table by.
-type CredColumn = "credential" | "headroom" | "token" | "health";
+type CredColumn = "credential" | "service" | "headroom" | "token" | "health";
 type CredSort = { column: CredColumn; dir: "asc" | "desc" };
 
 /// The direction a column starts in when it is first clicked. Every one
@@ -1466,6 +1536,8 @@ type CredSort = { column: CredColumn; dir: "asc" | "desc" };
 /// room left, soonest expiry, healthiest, A first. Clicking again flips.
 const CRED_SORT_DIR: Record<CredColumn, "asc" | "desc"> = {
   credential: "asc",
+  // A first, so the services group together and Unassigned lands last.
+  service: "asc",
   headroom: "desc",
   token: "asc",
   health: "asc",
@@ -1510,6 +1582,11 @@ function credSortValue(key: ProviderKey, column: CredColumn, subscription: boole
       return key.credential?.expires_at_ms ?? null;
     case "health":
       return CRED_HEALTH_RANK[key.status ?? key.health] ?? 5;
+    // Unassigned sorts after every named service rather than before it:
+    // on a divided pool those are the accounts serving nobody, and the
+    // question the column is clicked to answer is "which are stranded".
+    case "service":
+      return key.tenant ?? "\uffff";
   }
 }
 
@@ -1770,7 +1847,6 @@ function ServicePicker(props: {
     class="service-picker"
     aria-label={props.label}
     disabled={busy()}
-    value={props.value ?? ""}
     onChange={async (e) => {
       const next = e.currentTarget.value;
       setBusy(true);
@@ -1778,8 +1854,15 @@ function ServicePicker(props: {
       finally { setBusy(false); }
     }}
   >
-    <option value="">Unassigned</option>
-    <For each={props.tenants}>{(t) => <option value={t}>{t}</option>}</For>
+    {/* `selected` on the option, not `value` on the select. The options are
+        rendered by <For>, so they do not exist yet when a value set on the
+        select is applied — the browser finds no match, falls back to the
+        first option, and never re-applies. That showed every assigned key as
+        "Unassigned" while the account counts beside it were right. */}
+    <option value="" selected={!props.value}>Unassigned</option>
+    <For each={props.tenants}>{(t) =>
+      <option value={t} selected={t === props.value}>{t}</option>
+    }</For>
   </select>;
 }
 
@@ -2395,6 +2478,36 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
   const [tpm, setTpm] = createSignal("");
   const [advanced, setAdvanced] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [newService, setNewService] = createSignal("");
+  const [serviceBusy, setServiceBusy] = createSignal("");
+
+  const tenants = () => providers()?.tenants ?? [];
+  // What each service holds, so the roster is not just a list of words —
+  // and so the thing that blocks a deletion is visible before you try it.
+  const serviceHolds = (name: string) => ({
+    accounts: accountsFor(providers()?.data ?? [], name),
+    keys: (keys()?.data ?? []).filter((k) => k.tenant === name).length,
+  });
+  const addService = async () => {
+    const name = newService().trim();
+    if (!name) return;
+    setServiceBusy(name); setError("");
+    try { await api.addTenant(name); setNewService(""); await refetchProviders(); }
+    catch (err) { setError(err instanceof Error ? err.message : "Could not add the service"); }
+    finally { setServiceBusy(""); }
+  };
+  const removeService = async (name: string) => {
+    const held = serviceHolds(name);
+    if (held.accounts || held.keys) {
+      setError(`\u201c${name}\u201d still has ${held.accounts} account(s) and ${held.keys} key(s). Move them first.`);
+      return;
+    }
+    if (!confirm(`Remove the service \u201c${name}\u201d?`)) return;
+    setServiceBusy(name); setError("");
+    try { await api.deleteTenant(name); await refetchProviders(); }
+    catch (err) { setError(err instanceof Error ? err.message : "Could not remove the service"); }
+    finally { setServiceBusy(""); }
+  };
   const reload = async () => { await refetch(); props.bump(); };
 
   const modelOptions = createMemo<Option[]>(() => {
@@ -2432,6 +2545,49 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
       filters={[]}
       extra={<button class="button primary" onClick={() => setCreating(true)}><Plus size={15} />Create key</button>}
     />
+    {/* The roster has to be editable somewhere, and this is where its words
+        are used. Until it was, every service control on this page offered
+        nothing but "Unassigned" and the only way to add one was to hand-edit
+        the gateway's config. */}
+    <section class="panel">
+      <SectionTitle
+        title="Services"
+        subtitle="Accounts and keys are assigned to a service; a name has to exist here first"
+      />
+      <div class="service-roster">
+        <For each={tenants()} fallback={<p class="muted">No services yet. Add one to start assigning accounts.</p>}>
+          {(name) => {
+            const held = serviceHolds(name);
+            const inUse = held.accounts > 0 || held.keys > 0;
+            return <span class="service-chip">
+              <strong>{name}</strong>
+              <span class="muted">{held.accounts} acct · {held.keys} key{held.keys === 1 ? "" : "s"}</span>
+              <button
+                class="icon-button"
+                disabled={Boolean(serviceBusy()) || inUse}
+                title={inUse
+                  ? `In use by ${held.accounts} account(s) and ${held.keys} key(s) — move them first`
+                  : `Remove ${name}`}
+                aria-label={`Remove the service ${name}`}
+                onClick={() => void removeService(name)}
+              ><Trash2 size={13} /></button>
+            </span>;
+          }}
+        </For>
+        <div class="service-add">
+          <input
+            type="text"
+            value={newService()}
+            placeholder="New service…"
+            aria-label="Add a service"
+            onInput={(e) => setNewService(e.currentTarget.value)}
+            onKeyDown={(e) => { if (e.key === "Enter") void addService(); }}
+          />
+          <button class="button outline small" disabled={!newService().trim() || Boolean(serviceBusy())} onClick={() => void addService()}>Add</button>
+        </div>
+      </div>
+    </section>
+
     <section class="panel">
       <SectionTitle title="Virtual keys" subtitle="Scoped credentials with limits, budgets, and immediate revocation" />
       <Loading when={keys.loading && !keys()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No virtual keys" action="Create a key for an application or team." />}>
