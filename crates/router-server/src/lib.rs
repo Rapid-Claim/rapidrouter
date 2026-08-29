@@ -138,6 +138,10 @@ impl AppState {
     ) -> Arc<Self> {
         let table = RoutingTable::from_config(&config);
         let defs = Self::collect_vkey_defs(&config, store.as_deref());
+        // Boot builds the table here rather than through apply_config, so the
+        // warning has to be raised in both places or it only ever fires on a
+        // reload — which is the one moment nobody is watching for it.
+        warn_on_orphaned_callers(&table, &defs, &config);
         let vkeys = VkTable::build(&defs, None);
         let pricing = usage::Pricing::from_config(&config);
         let node_id = store
@@ -209,6 +213,7 @@ impl AppState {
         )));
         self.pricing
             .store(Arc::new(usage::Pricing::from_config(&config)));
+        warn_on_orphaned_callers(&table, &defs, &config);
         self.table.store(Arc::new(table));
         self.config.store(Arc::new(config));
         let _ = self.events.send(json!({ "type": "config_applied" }));
@@ -776,6 +781,54 @@ async fn responses(
     body: bytes::Bytes,
 ) -> Response {
     proxy::handle_responses(state, headers, body, vk.0).await
+}
+
+/// Say out loud when dividing a pool has left callers with nothing.
+///
+/// Refusing a key that names no service on a divided provider is the right
+/// behaviour — degrading to the unlabelled accounts would quietly recreate
+/// the free-for-all the labels exist to end. But the first symptom of it is
+/// a 403 in production, and possibly long after the label that caused it.
+/// The person who applied that label is the one who can still fix it
+/// cheaply, so say it on every load and reload, while somebody is watching.
+fn warn_on_orphaned_callers(
+    table: &router_core::router::RoutingTable,
+    defs: &[router_core::vkey::VirtualKeyDef],
+    config: &router_core::config::Config,
+) {
+    let divided: Vec<&str> = table
+        .providers()
+        .filter(|p| p.managed)
+        .map(|p| p.name.as_str())
+        .collect();
+    if divided.is_empty() {
+        return;
+    }
+    let orphaned: Vec<&str> = defs
+        .iter()
+        .filter(|d| d.enabled && d.tenant.is_none())
+        .map(|d| d.name.as_str())
+        .collect();
+    if !orphaned.is_empty() {
+        tracing::warn!(
+            providers = ?divided,
+            keys = ?orphaned,
+            "these virtual keys name no service, so they can spend nothing on \
+             the providers listed — give each one a `tenant`"
+        );
+    }
+    // The one that cannot be fixed by editing a key: a static gateway key
+    // has no field for a service, so traffic presenting one is refused on
+    // every divided provider and the only remedy is to move that caller
+    // onto a `ck-` key.
+    if !config.server.auth_keys.is_empty() {
+        tracing::warn!(
+            providers = ?divided,
+            "traffic on a static `server.auth_keys` key cannot name a service \
+             and will be refused on the providers listed; move those callers \
+             onto virtual keys with a `tenant`"
+        );
+    }
 }
 
 async fn passthrough(

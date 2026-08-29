@@ -214,6 +214,19 @@ check "it claimed the serving account, not another" \
       "acct-kris"
 
 echo
+echo "warning the operator at startup"
+# The rollout's one unforgiving step: labelling the first account cuts off
+# every caller that cannot name a service. This fixture is exactly that
+# state — labelled accounts plus a static gateway key — so the warning has
+# to be in the log, or the operator finds out from a 403 instead.
+grep -q "cannot name a service" "$WORK/gateway.log" \
+  && ok "a divided pool warns that master-key traffic will be refused" \
+  || bad "a divided pool warns that master-key traffic will be refused" "nothing in the gateway log"
+grep -q "name no service" "$WORK/gateway.log" \
+  && ok "and names the virtual keys that own nothing" \
+  || bad "and names the virtual keys that own nothing" "nothing in the gateway log"
+
+echo
 echo "moving an account between services"
 check "an unassigned account serves nobody" "$(seats_used)" "acct-kris,acct-opt"
 curl -s -m 10 -o /dev/null -X PUT \

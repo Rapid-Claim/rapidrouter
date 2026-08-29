@@ -1930,8 +1930,30 @@ function CredentialRow(props: {
         value={key().tenant}
         tenants={props.tenants}
         label={`Service owning ${key().name}`}
-        onChange={props.onAssign}
+        onChange={async (tenant) => {
+          // The first label on a shared pool is the one destructive click in
+          // this console. It divides the provider, and from that moment every
+          // caller without a service name — which is all master-key traffic,
+          // since a static gateway key cannot carry one — is refused here.
+          // There is no halfway state to back out into, so ask once.
+          if (!props.managed && tenant !== null) {
+            const ok = confirm(
+              `Assign ${key().name} to "${tenant}"?\n\n`
+              + `Nothing on this provider is assigned yet. Assigning the first account `
+              + `divides the pool: from then on, only keys naming a service can use it, `
+              + `and any caller still on the master key will be refused.\n\n`
+              + `Move every caller onto its own key first.`,
+            );
+            if (!ok) return;
+          }
+          await props.onAssign(tenant);
+        }}
       />
+      {/* An unassigned account in a divided pool is the quiet failure: it
+          reports healthy and in quota, and serves nobody. */}
+      <Show when={props.managed && !key().tenant}>
+        <small class="muted">Serves nobody — this provider is divided by service</small>
+      </Show>
     </td>
     <td>
       <Show when={props.subscription} fallback={

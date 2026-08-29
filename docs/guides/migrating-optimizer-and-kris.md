@@ -36,52 +36,74 @@ Both services keep spawning the same CLIs. What changes is *where the CLI
 points* and *what credential it presents*:
 
 ```bash
-# Claude Code
+# Claude Code — an environment variable is enough
 ANTHROPIC_BASE_URL=http://<router>:8091/anthropic
 ANTHROPIC_AUTH_TOKEN=ck-…                # the service's virtual key
-
-# Codex
-OPENAI_BASE_URL=http://<router>:8091/v1
-OPENAI_API_KEY=ck-…                      # same key, API-key mode
 ```
+
+Codex is **not** configured by environment variable. It needs a block in the
+run's `CODEX_HOME/config.toml`:
+
+```toml
+model_provider = "rapidrouter"
+
+[model_providers.rapidrouter]
+base_url = "http://<router>:8091/v1"
+env_key  = "RAPID_ROUTER_KEY"   # the CLI reads the virtual key from here
+wire_api = "responses"          # load-bearing — see §3
+```
+
+...and `RAPID_ROUTER_KEY=ck-…` exported into the run.
 
 The gateway holds the subscription credentials upstream; **the CLI stops
 needing to know subscription seats exist at all.** That is the whole idea.
 
-The Claude half of it works. **The Codex half does not** — the form above is
-what the old guide claimed and it turned out to be wrong when run. See §3,
-which is a measurement rather than a plan.
-
 ## 3 · Step 0 — done, and here is what it found
 
-Run 2026-08-27 against a live rapid-router (mock upstream, two services, one
-labelled account each, real CLI binaries).
+> **`OPENAI_BASE_URL` does not work, and fails in the worst possible way.**
+> codex-cli 0.146.0 ignores it silently: no warning, no error. The run
+> succeeds, talks to `api.openai.com`, and spends a subscription seat nobody
+> allocated — and the gateway never sees it. An earlier draft of this guide
+> told operators to set it. If you followed that, you were not routed.
 
-| CLI | Result |
+Two runs against a live rapid-router with real CLI binaries.
+
+**2026-08-27** — what failed:
+
+| Attempt | Result |
 |---|---|
-| `claude 2.1.238` | **Works.** Requests arrived, the virtual key was attributed, and only the account labelled for that key's service served them. |
-| `codex-cli 0.146.0` | **Redirects, but does not complete.** Not via `OPENAI_BASE_URL` (ignored) or a `model_provider` (wants a WebSocket) — via **`chatgpt_base_url`**, the subscription backend, which sends the CLI's whole conversation to the gateway. The gateway now accepts the model call on `/backend-api/codex/responses`. What blocks a full run is the auth flow: the CLI answers to a handful of backend side-endpoints first, then refreshes its token against a hard-coded auth host and rejects a fabricated `auth.json`. See [coding-agents.md](coding-agents.md#codex). |
+| `OPENAI_BASE_URL` | Ignored. Went to `api.openai.com` and spent a real account. |
+| `wire_api = "chat"` | Rejected outright by this version. |
+| `model_provider` without `wire_api` | Opened a transport the gateway does not serve. Recorded at the time as "wants a WebSocket", which led to the wrong conclusion that Codex could not be routed at all. |
+| `chatgpt_base_url` | Redirects — but the CLI then refreshes its token against a hard-coded auth host and rejects a fabricated `auth.json`. |
 
-Also verified in the same run: label enforcement over real HTTP. One service
-sent seven requests and another three; each drained only its own account's
-allowance, and the unassigned account served nobody.
+**2026-08-28** — what works:
 
-**Consequence for this migration.** Kris's Claude runtime can move now. The
-optimizer is Codex-first, so its main path is blocked until one of these
-changes:
+`model_provider` **with `wire_api = "responses"`** sends the CLI wherever you
+point it. Verified against a clean `CODEX_HOME` with no `auth.json` and every
+vendor credential scrubbed from the environment, so a fallback would have
+failed loudly rather than quietly: exactly two requests, both to the gateway —
+`GET /v1/models` and `POST /v1/responses` carrying the virtual key as a bearer
+— and zero contact with `api.openai.com`.
 
-1. **The gateway grows a small ChatGPT-backend shim**: the side endpoints the
-   CLI calls before its first model call, plus the token refresh — pointed at
-   with `CODEX_REFRESH_TOKEN_URL_OVERRIDE` — handing back a virtual key. This
-   is the real fix, it is on our side, and it is close: redirection already
-   works and the model endpoint is already served.
-2. A newer `codex-cli` honours a plain-HTTP `model_provider`.
-3. The optimizer's Codex work moves to a client that speaks plain HTTP.
+The missing `wire_api` was the whole of it. Nothing about the CLI or the
+gateway had to change.
 
-Until then the optimizer keeps leasing Codex seats from `agipool` — which
-works — while its Claude runs can route. The code ships that way: Claude
-routing is on with the two variables, and Codex routing sits behind a third,
-`RAPID_OPTIMIZER_LLM_ROUTER_CODEX`, off by default and documented as unproven.
+Also verified end to end, with the optimizer's own runner driving
+`codex app-server` (the transport it really spawns — not `codex exec`, which
+is a different one): the gateway served from an account labelled `optimizer`
+and put **that seat's** credential upstream, confirmed from the vendor's side.
+Never another service's seat, including under an injected 429. Label
+enforcement over real HTTP: one service exhausted its own account's allowance
+and was refused rather than overflowing; another service was unaffected; an
+unassigned account served nobody.
+
+**Consequence for this migration.** Both services can move. Codex routing
+still sits behind `RAPID_OPTIMIZER_LLM_ROUTER_CODEX`, off by default, for one
+remaining reason: every test so far has answered from a stand-in for the
+vendor. Nothing has yet put a **real** Codex subscription seat behind the
+gateway, and no test run has used tools — which is most of what the optimizer
+does. One real account and one real issue closes that.
 
 ## 4 · Router-side preparation
 
@@ -182,7 +204,7 @@ Only the middle step survives, and it changes shape:
 | Runtime | Today | After |
 |---|---|---|
 | Claude Code | lease → `CLAUDE_CODE_OAUTH_TOKEN=<seat token>` | `ANTHROPIC_BASE_URL` + `ANTHROPIC_AUTH_TOKEN=ck-…` |
-| Codex | lease → `writeSelectedCodexAuthJSON` into the run's `CODEX_HOME` | `OPENAI_BASE_URL` + `OPENAI_API_KEY=ck-…`; **no `auth.json` at all** |
+| Codex | lease → `writeSelectedCodexAuthJSON` into the run's `CODEX_HOME` | a `model_provider` block written into the run's `CODEX_HOME/config.toml` + `RAPID_ROUTER_KEY=ck-…`; **no `auth.json` at all**. Not `OPENAI_BASE_URL` — see §3 |
 
 The per-run `CODEX_HOME` machinery stays — the CLI still wants a home
 directory, and `internal/app/issues/agent.go` relies on one `CODEX_HOME` per
@@ -275,9 +297,11 @@ they do, the gateway behaves exactly as it does today.
 
 ## 9 · Open questions
 
-1. ~~Codex CLI subscription mode~~ — **answered, and worse than expected**:
-   the CLI cannot be pointed at the gateway at all (§3). The gateway would
-   need to serve the WebSocket Responses transport.
+1. ~~Codex CLI subscription mode~~ — **answered, and better than the first
+   attempt suggested**: `model_provider` with `wire_api = "responses"` points
+   the CLI at the gateway, and the gateway holds the seats (§3). What remains
+   open is the far end — no test has put a *real* subscription seat behind the
+   gateway, and none has used tools.
 2. **Prompt caching across a run** — unmeasured. §6.5. Could block §6.
 3. **`/passthrough/…` and stateful endpoints** — the relay now spreads
    across a service's accounts. Anything relaying files, batches or
