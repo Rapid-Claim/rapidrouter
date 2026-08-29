@@ -86,6 +86,35 @@ survives issuing, rotating and revoking the keys that spend it. Tenant names
 are checked against the `tenants` roster wherever a key is written, so a typo
 fails there rather than producing a key that looks fine and owns nothing.
 
+## Callers that cannot be reconfigured
+
+Not every caller can be handed a `ck-` key. Scripts, notebooks and services
+nobody owns present the shared gateway key, and a shared key **cannot** name a
+service — it is a password, not an identity, and everyone using it sends the
+same bytes.
+
+Without a way to attribute that traffic, dividing a pool refuses all of it at
+once. So a static key may name a service itself:
+
+```toml
+tenants = ["agi"]
+
+[server]
+auth_keys = [
+  "legacy-key",                                # names no service
+  { key = "store.master", tenant = "agi" },    # attributed to agi
+]
+```
+
+The caller sends the byte-identical request it always sent. The gateway decides
+on arrival which service that key's traffic belongs to, and from then on it is
+treated exactly like a virtual key naming the same service.
+
+A bare string keeps its old meaning, so a config nobody has edited behaves
+exactly as before. The name is checked against `tenants` like any other, and
+the gateway warns at startup about any static key still naming nothing once a
+pool is divided.
+
 ## Enforcement semantics
 
 Enforcement happens in the auth layer, before routing, in this order:

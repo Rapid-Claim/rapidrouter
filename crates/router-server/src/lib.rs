@@ -47,7 +47,18 @@ const DEFAULT_LIVENESS_WINDOW: Duration = Duration::from_secs(15);
 /// access). Inserted by the auth layer, consumed by dispatch for scope,
 /// limit, and budget enforcement and usage attribution.
 #[derive(Clone, Default)]
-pub struct VkCtx(pub Option<Arc<VkRuntime>>);
+pub struct VkCtx {
+    /// The virtual key that authenticated, when one did.
+    pub key: Option<Arc<VkRuntime>>,
+    /// Which service this request belongs to.
+    ///
+    /// Usually the virtual key's, but a static gateway key may name one too —
+    /// which is the only way traffic from a caller nobody can reconfigure ever
+    /// gets a service, since a shared password cannot identify who presented
+    /// it. `None` means the request names no service and can therefore spend
+    /// nothing on a divided pool.
+    pub tenant: Option<String>,
+}
 
 /// One console session: when it lapses, and who it belongs to.
 #[derive(Debug, Clone)]
@@ -723,7 +734,7 @@ async fn chat_completions(
     body: bytes::Bytes,
 ) -> Response {
     match proxy::InboundChat::from_openai(body) {
-        Ok(inbound) => proxy::handle_chat(state, inbound, headers, vk.0).await,
+        Ok(inbound) => proxy::handle_chat(state, inbound, headers, vk.key, vk.tenant).await,
         Err(err) => proxy::error_response(&err),
     }
 }
@@ -735,7 +746,7 @@ async fn anthropic_messages(
     body: bytes::Bytes,
 ) -> Response {
     match proxy::InboundChat::from_anthropic(&body) {
-        Ok(inbound) => proxy::handle_chat(state, inbound, headers, vk.0).await,
+        Ok(inbound) => proxy::handle_chat(state, inbound, headers, vk.key, vk.tenant).await,
         Err(err) => proxy::error_response_in(router_providers::Dialect::Anthropic, &err),
     }
 }
@@ -769,7 +780,7 @@ async fn genai_generate(
         }
     };
     match proxy::InboundChat::from_gemini(&body, model.to_owned(), stream) {
-        Ok(inbound) => proxy::handle_chat(state, inbound, headers, vk.0).await,
+        Ok(inbound) => proxy::handle_chat(state, inbound, headers, vk.key, vk.tenant).await,
         Err(err) => proxy::error_response_in(dialect, &err),
     }
 }
@@ -780,7 +791,7 @@ async fn responses(
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Response {
-    proxy::handle_responses(state, headers, body, vk.0).await
+    proxy::handle_responses(state, headers, body, vk.key, vk.tenant).await
 }
 
 /// Say out loud when dividing a pool has left callers with nothing.
@@ -817,16 +828,24 @@ fn warn_on_orphaned_callers(
              the providers listed — give each one a `tenant`"
         );
     }
-    // The one that cannot be fixed by editing a key: a static gateway key
-    // has no field for a service, so traffic presenting one is refused on
-    // every divided provider and the only remedy is to move that caller
-    // onto a `ck-` key.
-    if !config.server.auth_keys.is_empty() {
+    // A static key can name a service now, so only the ones that do not are
+    // a problem — and they are the sharpest kind, because the callers
+    // presenting them often cannot be reconfigured at all. Give the key's
+    // position rather than the key.
+    let unnamed: Vec<usize> = config
+        .server
+        .auth_keys
+        .iter()
+        .enumerate()
+        .filter(|(_, key)| key.tenant.is_none())
+        .map(|(i, _)| i)
+        .collect();
+    if !unnamed.is_empty() {
         tracing::warn!(
             providers = ?divided,
-            "traffic on a static `server.auth_keys` key cannot name a service \
-             and will be refused on the providers listed; move those callers \
-             onto virtual keys with a `tenant`"
+            auth_keys = ?unnamed,
+            "traffic on these static gateway keys names no service and can \
+             spend nothing on the providers listed; give each one a `tenant`"
         );
     }
 }
@@ -841,7 +860,10 @@ async fn passthrough(
     body: bytes::Bytes,
 ) -> Response {
     let query = uri.query().map(str::to_owned);
-    proxy::handle_passthrough(state, provider, rest, method, query, headers, body, vk.0).await
+    proxy::handle_passthrough(
+        state, provider, rest, method, query, headers, body, vk.key, vk.tenant,
+    )
+    .await
 }
 
 async fn completions(
@@ -850,7 +872,15 @@ async fn completions(
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Response {
-    proxy::handle_relay(state, Endpoint::Completions, headers, body, vk.0).await
+    proxy::handle_relay(
+        state,
+        Endpoint::Completions,
+        headers,
+        body,
+        vk.key,
+        vk.tenant,
+    )
+    .await
 }
 
 async fn embeddings(
@@ -859,7 +889,15 @@ async fn embeddings(
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Response {
-    proxy::handle_relay(state, Endpoint::Embeddings, headers, body, vk.0).await
+    proxy::handle_relay(
+        state,
+        Endpoint::Embeddings,
+        headers,
+        body,
+        vk.key,
+        vk.tenant,
+    )
+    .await
 }
 
 async fn audio_speech(
@@ -868,7 +906,15 @@ async fn audio_speech(
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Response {
-    proxy::handle_relay(state, Endpoint::AudioSpeech, headers, body, vk.0).await
+    proxy::handle_relay(
+        state,
+        Endpoint::AudioSpeech,
+        headers,
+        body,
+        vk.key,
+        vk.tenant,
+    )
+    .await
 }
 
 async fn images_generations(
@@ -877,7 +923,15 @@ async fn images_generations(
     headers: axum::http::HeaderMap,
     body: bytes::Bytes,
 ) -> Response {
-    proxy::handle_relay(state, Endpoint::ImagesGenerations, headers, body, vk.0).await
+    proxy::handle_relay(
+        state,
+        Endpoint::ImagesGenerations,
+        headers,
+        body,
+        vk.key,
+        vk.tenant,
+    )
+    .await
 }
 
 async fn audio_transcriptions(
@@ -892,7 +946,8 @@ async fn audio_transcriptions(
         "audio_transcriptions",
         headers,
         body,
-        vk.0,
+        vk.key,
+        vk.tenant,
         true,
     )
     .await
@@ -910,7 +965,8 @@ async fn audio_translations(
         "audio_translations",
         headers,
         body,
-        vk.0,
+        vk.key,
+        vk.tenant,
         true,
     )
     .await
@@ -922,7 +978,17 @@ async fn files_upload(
     headers: axum::http::HeaderMap,
     body: Body,
 ) -> Response {
-    proxy::handle_stream_relay(state, "/files", "files_upload", headers, body, vk.0, false).await
+    proxy::handle_stream_relay(
+        state,
+        "/files",
+        "files_upload",
+        headers,
+        body,
+        vk.key,
+        vk.tenant,
+        false,
+    )
+    .await
 }
 
 async fn files_list(
@@ -930,7 +996,7 @@ async fn files_list(
     axum::Extension(vk): axum::Extension<VkCtx>,
     headers: axum::http::HeaderMap,
 ) -> Response {
-    proxy::handle_provider_relay(state, "/files", "files_list", headers, vk.0).await
+    proxy::handle_provider_relay(state, "/files", "files_list", headers, vk.key, vk.tenant).await
 }
 
 async fn files_retrieve(
@@ -944,7 +1010,8 @@ async fn files_retrieve(
         &format!("/files/{id}"),
         "files_retrieve",
         headers,
-        vk.0,
+        vk.key,
+        vk.tenant,
     )
     .await
 }
@@ -960,7 +1027,8 @@ async fn files_content(
         &format!("/files/{id}/content"),
         "files_content",
         headers,
-        vk.0,
+        vk.key,
+        vk.tenant,
     )
     .await
 }
@@ -1021,17 +1089,30 @@ async fn gateway_auth(
 
     let gate_active = !config.server.auth_keys.is_empty() || config.server.require_auth;
     let mut ctx = VkCtx::default();
-    let static_match = presented
-        .as_deref()
-        .is_some_and(|token| config.server.auth_keys.iter().any(|key| key.verify(token)));
+    let static_key = presented.as_deref().and_then(|token| {
+        config
+            .server
+            .auth_keys
+            .iter()
+            .find(|key| key.secret.verify(token))
+    });
+    let static_match = static_key.is_some();
 
     match presented.as_deref() {
-        Some(_) if static_match => {}
+        // Traffic on a static key belongs to whichever service that key
+        // names, if any. The caller sends nothing extra and knows nothing
+        // about this.
+        Some(_) if static_match => {
+            ctx.tenant = static_key.and_then(|key| key.tenant.clone());
+        }
         // A `ck-` token always means virtual-key semantics — enforced
         // when it is not also an explicitly configured static key.
         Some(token) if token.starts_with("ck-") => {
             match state.vkeys.load().verify(token, vkey::unix_now_ms()) {
-                Ok(rt) => ctx.0 = Some(rt),
+                Ok(rt) => {
+                    ctx.tenant = rt.def.tenant.clone();
+                    ctx.key = Some(rt);
+                }
                 Err(reason) => {
                     metrics::counter!("rapid_vkey_rejects_total", "reason" => format!("{reason:?}"))
                         .increment(1);

@@ -32,13 +32,56 @@ pub struct RawConfig {
     pub pricing: BTreeMap<String, RawPrice>,
 }
 
+/// A static gateway key, optionally naming the service its traffic belongs to.
+///
+/// Untagged, so both forms are valid and the first keeps its old meaning:
+///
+/// ```toml
+/// auth_keys = ["store.master"]                           # names no service
+/// auth_keys = [{ key = "store.master", tenant = "agi" }]  # attributed
+/// ```
+///
+/// The second exists because a shared key cannot identify its caller — it is
+/// a password, not an identity, and everyone presenting it sends the same
+/// bytes. Callers nobody can reconfigure would therefore be refused the
+/// moment a pool is divided. Naming a service here says "traffic on this key
+/// belongs to that service" and asks nothing of the caller.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RawAuthKey {
+    /// `"secret"` — a key that names no service.
+    Bare(String),
+    /// `{ key = "secret", tenant = "agi" }`.
+    Named {
+        key: String,
+        #[serde(default)]
+        tenant: Option<String>,
+    },
+}
+
+impl RawAuthKey {
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Bare(value) => value,
+            Self::Named { key, .. } => key,
+        }
+    }
+
+    pub fn tenant(&self) -> Option<&str> {
+        match self {
+            Self::Bare(_) => None,
+            Self::Named { tenant, .. } => tenant.as_deref(),
+        }
+    }
+}
+
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct RawServer {
     pub host: String,
     pub port: u16,
     pub max_body_size_mb: u64,
-    pub auth_keys: Vec<String>,
+    pub auth_keys: Vec<RawAuthKey>,
     /// Refuse anonymous data-plane requests even when `auth_keys` is
     /// empty (the multi-tenant posture together with virtual keys).
     pub require_auth: bool,
