@@ -2645,18 +2645,19 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
     </Show>
 
     <Show when={managingServices()}>
-      <Drawer
-        open
-        title="Services"
-        subtitle="A service owns accounts; keys name one in order to spend them"
-        onClose={() => { setManagingServices(false); setError(""); }}
-      >
-        <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
-        <div class="drawer-section">
+      {/* A dialog, not a drawer: this is a short list and a one-field form,
+          the same shape as Create key, and a full-height panel for it was
+          mostly empty space. */}
+      <div class="dialog-backdrop" role="presentation"
+           onMouseDown={(e) => { if (e.target === e.currentTarget) { setManagingServices(false); setError(""); } }}>
+        <div class="dialog" role="dialog" aria-modal="true" aria-labelledby="services-title">
+          <h2 id="services-title">Services</h2>
+          <p class="muted">A service owns accounts; keys name one in order to spend them</p>
+          <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
           <Show when={tenants().length} fallback={
-            <Empty title="No services yet" action="Add one, then assign accounts and keys to it." />
+            <p class="muted">No services yet. Add one, then assign accounts and keys to it.</p>
           }>
-            <ul class="account-list">
+            <ul class="account-list service-list">
               <For each={tenants()}>{(name) => {
                 const held = () => serviceHolds(name);
                 const inUse = () => held().accounts > 0 || held().keys > 0;
@@ -2665,10 +2666,8 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
                   <span class="muted">
                     {held().accounts} account{held().accounts === 1 ? "" : "s"} · {held().keys} key{held().keys === 1 ? "" : "s"}
                   </span>
-                  <span />
-                  {/* The reason sits on the row, not in a tooltip. A greyed-out
-                      button with no visible cause reads as broken rather than
-                      as the rule doing its job. */}
+                  {/* The reason sits on the row, not in a tooltip: a disabled
+                      button with no visible cause reads as broken. */}
                   <Show when={inUse()} fallback={
                     <button
                       class="button outline small"
@@ -2682,20 +2681,19 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
               }}</For>
             </ul>
           </Show>
-        </div>
-        <div class="drawer-section">
-          <SectionTitle title="Add a service" subtitle="Letters, digits, dashes and underscores" />
-          <div class="field-row">
-            <label>Name
-              <input
-                type="text"
-                value={newService()}
-                placeholder="e.g. billing"
-                aria-label="Add a service"
-                onInput={(e) => setNewService(e.currentTarget.value)}
-                onKeyDown={(e) => { if (e.key === "Enter") void addService(); }}
-              />
-            </label>
+          <label>Add a service
+            <input
+              type="text"
+              value={newService()}
+              placeholder="e.g. billing"
+              aria-label="Add a service"
+              onInput={(e) => setNewService(e.currentTarget.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") void addService(); }}
+            />
+            <small class="muted">Letters, digits, dashes and underscores</small>
+          </label>
+          <div class="dialog-actions">
+            <button class="button ghost" onClick={() => { setManagingServices(false); setError(""); }}>Close</button>
             <button
               class="button primary"
               disabled={!newService().trim() || Boolean(serviceBusy())}
@@ -2703,8 +2701,9 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
             >Add service</button>
           </div>
         </div>
-      </Drawer>
+      </div>
     </Show>
+
     <Show when={managing()} keyed>{(service) => (
       <KeyAccounts
         service={service}
@@ -2800,7 +2799,6 @@ function KeyAccounts(props: {
 
   return <Drawer
     open
-    wide
     title={`Accounts for ${props.service}`}
     subtitle="Accounts belong to the service, so every key of this service shares them"
     onClose={props.onClose}
@@ -2892,7 +2890,7 @@ function accountsFor(providers: Provider[], service: string): number {
 }
 
 function KeyRow(props: { key: VirtualKey; tenants: string[]; accounts: number | null; onManage: () => void; reload: () => Promise<void>; reveal: (value: string) => void }) {
-  return <tr><td><strong>{props.key.name}</strong><small class="mono">{props.key.id}</small></td><td>{props.key.models.length ? props.key.models.join(", ") : "All models"}</td><td><ServicePicker value={props.key.tenant ?? null} tenants={props.tenants} label={`Service for ${props.key.name}`} onChange={async (tenant) => { await api.updateKey(props.key.id, { tenant }); await props.reload(); }} /></td><td>{props.key.tenant ? <button class="button outline small" onClick={props.onManage}>{`${props.accounts ?? 0} account${props.accounts === 1 ? "" : "s"}`}</button> : <span class="muted">—</span>}</td><td>{props.key.rate?.rpm ? `${props.key.rate.rpm} RPM` : "Unlimited"}</td><td>{props.key.budget ? `${formatUsd(props.key.budget.usd)} / ${props.key.budget.period}` : "None"}</td><td><Status text={props.key.enabled ? "Active" : "Revoked"} tone={props.key.enabled ? "success" : "muted"} /></td><td class="actions"><button class="icon-button" title={`Rotate ${props.key.name}`} aria-label={`Rotate ${props.key.name}`} onClick={async () => { const result = await api.rotateKey(props.key.id); props.reveal(result.key); await props.reload(); }}><RefreshCw size={16} /></button><button class="icon-button danger" title={`Delete ${props.key.name}`} aria-label={`Delete ${props.key.name}`} onClick={async () => { if (confirm(`Delete ${props.key.name}?`)) { await api.deleteKey(props.key.id); await props.reload(); } }}><Trash2 size={16} /></button></td></tr>;
+  return <tr><td><strong>{props.key.name}</strong><small class="mono">{props.key.id}</small></td><td>{props.key.models.length ? props.key.models.join(", ") : "All models"}</td><td><ServicePicker value={props.key.tenant ?? null} tenants={props.tenants} label={`Service for ${props.key.name}`} onChange={async (tenant) => { await api.updateKey(props.key.id, { tenant }); await props.reload(); }} /></td><td class="accounts-cell">{props.key.tenant ? <button class="button outline small" onClick={props.onManage}>{`${props.accounts ?? 0} account${props.accounts === 1 ? "" : "s"}`}</button> : <span class="muted">—</span>}</td><td>{props.key.rate?.rpm ? `${props.key.rate.rpm} RPM` : "Unlimited"}</td><td>{props.key.budget ? `${formatUsd(props.key.budget.usd)} / ${props.key.budget.period}` : "None"}</td><td><Status text={props.key.enabled ? "Active" : "Revoked"} tone={props.key.enabled ? "success" : "muted"} /></td><td class="actions"><button class="icon-button" title={`Rotate ${props.key.name}`} aria-label={`Rotate ${props.key.name}`} onClick={async () => { const result = await api.rotateKey(props.key.id); props.reveal(result.key); await props.reload(); }}><RefreshCw size={16} /></button><button class="icon-button danger" title={`Delete ${props.key.name}`} aria-label={`Delete ${props.key.name}`} onClick={async () => { if (confirm(`Delete ${props.key.name}?`)) { await api.deleteKey(props.key.id); await props.reload(); } }}><Trash2 size={16} /></button></td></tr>;
 }
 
 type TrendPoint = [number, number];

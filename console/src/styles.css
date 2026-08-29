@@ -1887,7 +1887,7 @@ label > small { display: block; }
 }
 /* A hundred accounts is a scroll, not a page — and a taller one now that
    nothing is hidden behind a "narrow the search" line. */
-.account-list { max-height: 46vh; overflow-y: auto; }
+.account-list { max-height: 46vh; overflow-y: auto; max-width: 44rem; }
 .account-list li:last-child { border-bottom: 0; }
 .account-name { font-weight: 500; overflow-wrap: anywhere; }
 
@@ -1909,3 +1909,11 @@ label > small { display: block; }
 /* A service row: name, what it holds, and either a way out or the reason
    there isn't one. */
 .service-row { grid-template-columns: 1fr auto auto; }
+
+/* One column of buttons that all read the same width, so "12 accounts" and
+   "107 accounts" line up instead of stepping in and out. */
+.accounts-cell .button { min-width: 7.5rem; justify-content: center; }
+
+/* The service list in the dialog has no health dot, so it is one column
+   narrower than the account list it shares a class with. */
+.service-list li { grid-template-columns: minmax(0, 1fr) auto auto; }
