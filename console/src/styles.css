@@ -1839,8 +1839,7 @@ table.dense small.danger { color: var(--danger); }
 .jz { color: var(--muted); }
 .jp { color: var(--muted); }
 
-/* Assigning an account or a key to a service, inline in a table row:
-   compact enough not to widen the column, and obviously interactive. */
+/* Assigning a service, on the key form and in the service drawer. */
 .service-picker {
   min-height: 26px;
   padding: 2px 6px;
@@ -1856,3 +1855,48 @@ table.dense small.danger { color: var(--danger); }
 /* Helper text under a field. `small` is inline, so it has to be told to
    take its own line before .muted's margin means anything. */
 label > small { display: block; }
+
+/* What a service holds, above the list: a count is not enough on its own,
+   because ten accounts with eight benched cannot serve. */
+.account-summary {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+  padding: 10px 12px;
+  margin-bottom: 14px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--surface-2, transparent);
+}
+.account-summary strong { font-size: 18px; }
+
+/* A list, not a table. Four columns of mostly-empty cells read as a form to
+   fill in; these are rows to scan. */
+.account-list { list-style: none; margin: 0; padding: 0; }
+.account-list li {
+  display: grid;
+  grid-template-columns: 1fr auto 10px auto;
+  align-items: center;
+  gap: 10px;
+  padding: 7px 2px;
+  border-bottom: 1px solid var(--border);
+}
+.account-list li:last-child { border-bottom: 0; }
+.account-name { font-weight: 500; overflow-wrap: anywhere; }
+.account-list.candidates { max-height: 320px; overflow-y: auto; }
+
+/* Health as a dot: the word "ready" repeated down a column is noise, but its
+   absence needs to be visible at a glance. */
+.account-list .dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--warning, #d08770);
+}
+.account-list .dot.ok { background: var(--success, #63b57a); }
+
+.account-search {
+  width: 100%;
+  margin-bottom: 10px;
+}
