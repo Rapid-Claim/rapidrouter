@@ -2753,7 +2753,9 @@ function KeyAccounts(props: {
       ? mine().filter((a) => label(a).toLowerCase().includes(q) || a.provider.toLowerCase().includes(q))
       : mine();
   });
-  const shownMine = createMemo(() => matchingMine().slice(0, 12));
+  // No cap: the list scrolls, so slicing it only hid rows behind a
+  // sentence telling you to type. Scrolling is the cheaper gesture.
+  const shownMine = matchingMine;
 
   // Candidates are ranked by what taking one costs: unassigned accounts are
   // free, and one held by another service is a transfer out of that service.
@@ -2849,9 +2851,7 @@ function KeyAccounts(props: {
             >Release</button>
           </li>}</For>
         </ul>
-        <Show when={matchingMine().length > shownMine().length}>
-          <p class="muted">{matchingMine().length - shownMine().length} more — narrow the search to see them.</p>
-        </Show>
+
       </Show>
     </div>
 
@@ -2864,7 +2864,7 @@ function KeyAccounts(props: {
           <select> of 117 accounts is a scroll rather than a choice. */}
       <Show when={candidates().length} fallback={<p class="muted">No account matches.</p>}>
         <ul class="account-list candidates">
-          <For each={candidates().slice(0, 12)}>{(a) => <li>
+          <For each={candidates()}>{(a) => <li>
             <span class="account-name">{label(a)}</span>
             <span class="muted">{a.provider}</span>
             <Show when={a.key.tenant} fallback={<span class="pill">unassigned</span>}>
@@ -2877,9 +2877,7 @@ function KeyAccounts(props: {
             >Add</button>
           </li>}</For>
         </ul>
-        <Show when={candidates().length > 12}>
-          <p class="muted">{candidates().length - 12} more — narrow the search to see them.</p>
-        </Show>
+
       </Show>
     </div>
   </Drawer>;

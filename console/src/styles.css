@@ -1885,11 +1885,11 @@ label > small { display: block; }
   padding: 6px 2px;
   border-bottom: 1px solid var(--border);
 }
-/* A hundred accounts is a scroll, not a page. */
-.account-list { max-height: 340px; overflow-y: auto; }
+/* A hundred accounts is a scroll, not a page — and a taller one now that
+   nothing is hidden behind a "narrow the search" line. */
+.account-list { max-height: 46vh; overflow-y: auto; }
 .account-list li:last-child { border-bottom: 0; }
 .account-name { font-weight: 500; overflow-wrap: anywhere; }
-.account-list.candidates { max-height: 320px; overflow-y: auto; }
 
 /* Health as a dot: the word "ready" repeated down a column is noise, but its
    absence needs to be visible at a glance. */
