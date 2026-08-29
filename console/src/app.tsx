@@ -2579,7 +2579,7 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
             type="text"
             value={newService()}
             placeholder="New service…"
-            aria-label="New service name"
+            aria-label="Add a service"
             onInput={(e) => setNewService(e.currentTarget.value)}
             onKeyDown={(e) => { if (e.key === "Enter") void addService(); }}
           />
