@@ -2478,6 +2478,7 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
   const [tpm, setTpm] = createSignal("");
   const [advanced, setAdvanced] = createSignal(false);
   const [error, setError] = createSignal("");
+  const [managingServices, setManagingServices] = createSignal(false);
   const [newService, setNewService] = createSignal("");
   const [serviceBusy, setServiceBusy] = createSignal("");
 
@@ -2502,7 +2503,6 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
       setError(`\u201c${name}\u201d still has ${held.accounts} account(s) and ${held.keys} key(s). Move them first.`);
       return;
     }
-    if (!confirm(`Remove the service \u201c${name}\u201d?`)) return;
     setServiceBusy(name); setError("");
     try { await api.deleteTenant(name); await refetchProviders(); }
     catch (err) { setError(err instanceof Error ? err.message : "Could not remove the service"); }
@@ -2543,51 +2543,12 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
       onSearch={setSearch}
       searchPlaceholder="Search keys (press /)"
       filters={[]}
-      extra={<button class="button primary" onClick={() => setCreating(true)}><Plus size={15} />Create key</button>}
+      extra={<>
+        {/* Rare enough that it does not get permanent space on a page visited to look at keys. */}
+        <button class="button outline" onClick={() => setManagingServices(true)}>Services</button>
+        <button class="button primary" onClick={() => setCreating(true)}><Plus size={15} />Create key</button>
+      </>}
     />
-    {/* The roster has to be editable somewhere, and this is where its words
-        are used. Until it was, every service control on this page offered
-        nothing but "Unassigned" and the only way to add one was to hand-edit
-        the gateway's config. */}
-    <section class="panel">
-      <SectionTitle
-        title="Services"
-        subtitle="Accounts and keys are assigned to a service; a name has to exist here first"
-      />
-      <div class="service-roster">
-        <For each={tenants()} fallback={<p class="muted">No services yet. Add one to start assigning accounts.</p>}>
-          {(name) => {
-            const held = serviceHolds(name);
-            const inUse = held.accounts > 0 || held.keys > 0;
-            return <span class="service-chip">
-              <strong>{name}</strong>
-              <span class="muted">{held.accounts} acct · {held.keys} key{held.keys === 1 ? "" : "s"}</span>
-              <button
-                class="icon-button"
-                disabled={Boolean(serviceBusy()) || inUse}
-                title={inUse
-                  ? `In use by ${held.accounts} account(s) and ${held.keys} key(s) — move them first`
-                  : `Remove ${name}`}
-                aria-label={`Remove the service ${name}`}
-                onClick={() => void removeService(name)}
-              ><Trash2 size={13} /></button>
-            </span>;
-          }}
-        </For>
-        <div class="service-add">
-          <input
-            type="text"
-            value={newService()}
-            placeholder="New service…"
-            aria-label="Add a service"
-            onInput={(e) => setNewService(e.currentTarget.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") void addService(); }}
-          />
-          <button class="button outline small" disabled={!newService().trim() || Boolean(serviceBusy())} onClick={() => void addService()}>Add</button>
-        </div>
-      </div>
-    </section>
-
     <section class="panel">
       <SectionTitle title="Virtual keys" subtitle="Scoped credentials with limits, budgets, and immediate revocation" />
       <Loading when={keys.loading && !keys()} skeleton="table"><Show when={shown().length} fallback={<Empty title="No virtual keys" action="Create a key for an application or team." />}>
@@ -2683,6 +2644,67 @@ function Keys(props: { refresh: () => number; bump: () => void }) {
       </div>
     </Show>
 
+    <Show when={managingServices()}>
+      <Drawer
+        open
+        title="Services"
+        subtitle="A service owns accounts; keys name one in order to spend them"
+        onClose={() => { setManagingServices(false); setError(""); }}
+      >
+        <Show when={error()}><p class="form-error" role="alert">{error()}</p></Show>
+        <div class="drawer-section">
+          <Show when={tenants().length} fallback={
+            <Empty title="No services yet" action="Add one, then assign accounts and keys to it." />
+          }>
+            <ul class="account-list">
+              <For each={tenants()}>{(name) => {
+                const held = () => serviceHolds(name);
+                const inUse = () => held().accounts > 0 || held().keys > 0;
+                return <li>
+                  <span class="account-name">{name}</span>
+                  <span class="muted">
+                    {held().accounts} account{held().accounts === 1 ? "" : "s"} · {held().keys} key{held().keys === 1 ? "" : "s"}
+                  </span>
+                  <span />
+                  {/* The reason sits on the row, not in a tooltip. A greyed-out
+                      button with no visible cause reads as broken rather than
+                      as the rule doing its job. */}
+                  <Show when={inUse()} fallback={
+                    <button
+                      class="button outline small"
+                      disabled={Boolean(serviceBusy())}
+                      onClick={() => void removeService(name)}
+                    >Remove</button>
+                  }>
+                    <span class="muted">in use</span>
+                  </Show>
+                </li>;
+              }}</For>
+            </ul>
+          </Show>
+        </div>
+        <div class="drawer-section">
+          <SectionTitle title="Add a service" subtitle="Letters, digits, dashes and underscores" />
+          <div class="field-row">
+            <label>Name
+              <input
+                type="text"
+                value={newService()}
+                placeholder="e.g. billing"
+                aria-label="Add a service"
+                onInput={(e) => setNewService(e.currentTarget.value)}
+                onKeyDown={(e) => { if (e.key === "Enter") void addService(); }}
+              />
+            </label>
+            <button
+              class="button primary"
+              disabled={!newService().trim() || Boolean(serviceBusy())}
+              onClick={() => void addService()}
+            >Add service</button>
+          </div>
+        </div>
+      </Drawer>
+    </Show>
     <Show when={managing()} keyed>{(service) => (
       <KeyAccounts
         service={service}
@@ -2725,6 +2747,13 @@ function KeyAccounts(props: {
   const mine = createMemo(() =>
     all().filter((a) => a.key.tenant === props.service).sort((x, y) => label(x).localeCompare(label(y))),
   );
+  const matchingMine = createMemo(() => {
+    const q = filter().trim().toLowerCase();
+    return q
+      ? mine().filter((a) => label(a).toLowerCase().includes(q) || a.provider.toLowerCase().includes(q))
+      : mine();
+  });
+  const shownMine = createMemo(() => matchingMine().slice(0, 12));
 
   // Candidates are ranked by what taking one costs: unassigned accounts are
   // free, and one held by another service is a transfer out of that service.
@@ -2793,8 +2822,19 @@ function KeyAccounts(props: {
       <Show when={mine().length} fallback={
         <Empty title="No accounts yet" action="Until this service is given one, every request it makes is refused." />
       }>
+        {/* One search over both lists. With 107 accounts on a service,
+            listing them all is a scroll nobody reads — you come here knowing
+            which account you want. */}
+        <input
+          class="account-search"
+          type="search"
+          placeholder={`Search ${mine().length} account${mine().length === 1 ? "" : "s"}…`}
+          value={filter()}
+          onInput={(e) => setFilter(e.currentTarget.value)}
+          aria-label="Search this service's accounts"
+        />
         <ul class="account-list">
-          <For each={mine()}>{(a) => <li>
+          <For each={shownMine()}>{(a) => <li>
             <span class="account-name">{label(a)}</span>
             <span class="muted">{a.provider}</span>
             <span classList={{ dot: true, ok: (a.key.health ?? "") === "healthy" }}
@@ -2809,6 +2849,9 @@ function KeyAccounts(props: {
             >Release</button>
           </li>}</For>
         </ul>
+        <Show when={matchingMine().length > shownMine().length}>
+          <p class="muted">{matchingMine().length - shownMine().length} more — narrow the search to see them.</p>
+        </Show>
       </Show>
     </div>
 
@@ -2817,16 +2860,8 @@ function KeyAccounts(props: {
         title="Add an account"
         subtitle="Taking one from another service moves it — nothing is copied"
       />
-      {/* A search box and a short list, because a <select> of 117 accounts is
-          a scroll, not a choice. */}
-      <input
-        class="account-search"
-        type="search"
-        placeholder="Search accounts…"
-        value={filter()}
-        onInput={(e) => setFilter(e.currentTarget.value)}
-        aria-label="Search accounts to add"
-      />
+      {/* No second search box: the one above filters both lists, and a
+          <select> of 117 accounts is a scroll rather than a choice. */}
       <Show when={candidates().length} fallback={<p class="muted">No account matches.</p>}>
         <ul class="account-list candidates">
           <For each={candidates().slice(0, 12)}>{(a) => <li>
