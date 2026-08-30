@@ -306,3 +306,160 @@ Claude pool is divided, for the same reason master-key traffic would have.
 3. **Delivery.** I cannot reach the Go caret repo from anywhere — see Part 5.
    That has to be resolved before any code change can ship, whatever we decide
    about accounts.
+
+---
+
+## Part 9 — Both blockers, closed
+
+Written 2026-08-30, after building and testing both. This supersedes the
+"what I cannot solve" framing in Parts 5 and 7 for the two specific
+blockers named there. Everything is proved against real binaries; where
+something is still unproven it says so.
+
+### 9a · Codex on Kris
+
+**Was:** Kris is Claude-only. It declares no Codex provider, and Part 5's
+investigation found the abandoned 29 July attempt plus four reasons it
+could not have worked.
+
+**Now:** Kris can run Codex through the gateway.
+
+The mechanism is the one the optimizer proved, arrived at differently.
+`OPENAI_BASE_URL` is read by nothing in codex-cli 0.146.0 — it is ignored
+silently while the CLI carries on to `api.openai.com`. What redirects it
+is a `model_provider` block. The optimizer writes one into each run's
+`CODEX_HOME/config.toml`; caret passes the same settings as `-c`
+overrides, because:
+
+- caret already drives the CLI that way for its MCP server,
+- there is no per-run directory to create, write or clean up, and
+- **an override beats the config file**, so whatever sits in the host's
+  own `~/.codex/config.toml` cannot quietly redirect a routed run.
+
+`wire_api = "responses"` is not optional. Without it the CLI opens a
+transport the gateway does not serve.
+
+**Proved, not asserted.** Two tests drive the real codex-cli against a
+recording stand-in, with decoy `OPENAI_API_KEY` and `CODEX_API_KEY`
+planted in the environment:
+
+```
+real codex-cli reached [/v1/models /v1/models /v1/responses]
+  with the virtual key, no contact with OpenAI
+caret's Runner reached [/v1/models /v1/models /v1/responses]
+  with the virtual key
+```
+
+The second matters as much as the first: the override list being right is
+worth nothing if caret's Runner does not pass it on.
+
+Two things the stand-in had to get right, learned by watching the real CLI
+fail against a first version that got them wrong:
+
+- **It probes the model list before sending anything**, and retries when
+  the answer is not a model list. A stand-in that streams at every path
+  never gets as far as a completion.
+- **The completed event needs an item lifecycle around the text**, or the
+  client has nothing to attach the deltas to.
+
+### 9b · Claude accounts, poolable like Codex ones
+
+**Was:** Part 7 said the blocker was inventory — 117 Codex accounts versus
+effectively one general-purpose Claude account — and that the mechanism
+was fine. That was half right, and the wrong half was load-bearing.
+
+The mechanism *for ownership* was fine: `owned_by()` never looks at the
+provider, and `claude_subscription` accounts take a `tenant` like any
+other. But there was a second gap underneath, in `refresh.rs`:
+
+```rust
+// Codex is the only transport whose refresh flow is implemented.
+if kind != ProviderKind::CodexSubscription { return false; }
+```
+
+**Nothing renewed a Claude seat's token.** A Claude access token lives
+hours, not Codex's ten days. So a Claude subscription seat added to the
+pool would work until it expired that afternoon and then die, needing a
+human with a browser. That is why the gateway carries **119 Codex seats
+and zero Claude ones**, and why the two Claude accounts there are API
+keys rather than seats.
+
+> **A correction, and a small finding.** An earlier draft of this said
+> "139 credential files", counting files on disk rather than accounts.
+> There are 139 files but only **119 distinct accounts**: 15 accounts
+> were uploaded twice under two naming schemes (`codex_aisha-kapoor.json`
+> and `codex_aisha-kapoor-opencac-com.json` are one account), leaving 20
+> orphans.
+>
+> They are not wired into the config — for all 15 pairs exactly one file
+> is a live key, and the orphans' mtimes are frozen at their 17 August
+> upload while every live file has rotated since. So routing is
+> unaffected. But they hold real OAuth refresh tokens that nothing
+> renews, so they are dead credentials sitting on disk, and a future bulk
+> re-import could pick them up. Two entries for one account is a known
+> hazard: each seat carries its own breaker, so traffic keeps hitting an
+> account whose twin was just benched for being out of quota. Worth
+> deleting the 20.
+
+Inventory was a symptom. You cannot accumulate seats you cannot keep alive.
+
+**Now:** Claude seats renew themselves, so a Claude subscription login is
+poolable exactly like a Codex one. Any machine with a Claude subscription
+can sign in and hand over its `~/.claude/.credentials.json`.
+
+The values were read out of the Claude Code CLI's own bundle (v2.1.238),
+**not guessed** — the distinction matters more here than anywhere else in
+the gateway, because a refresh token rotates the instant the endpoint
+answers, so a wrong URL or client id does not merely fail, it spends the
+credential it was trying to preserve.
+
+| | Codex | Claude |
+|---|---|---|
+| Token URL | `auth.openai.com/oauth/token` | `platform.claude.com/v1/oauth/token` |
+| Client id | `app_EMoamEEZ73f0CkXaXp7hrann` | `9d1c250a-e61b-44d9-88ed-5944d1962f5e` |
+| Body | form-urlencoded | **JSON** |
+| Expiry | the token's own JWT `exp` | `now + expires_in × 1000` |
+| Document | `tokens.*`, snake_case | `claudeAiOauth.*`, camelCase |
+
+The expiry difference is the one that bites: the response says "3600
+seconds from now" and the document wants an absolute instant in
+milliseconds. Write the response through unchanged and the seat is treated
+as expired on every subsequent request — no error, just a pool that never
+serves.
+
+Scopes are sent back from the seat's own document rather than a default
+list, so a renewal cannot silently widen or narrow the grant.
+
+**Proved end to end.** The e2e harness now carries an expired Claude seat
+backed by a credential file, and the gateway's refresh is pointed at the
+stand-in (`RAPID_CLAUDE_OAUTH_URL` — a real refresh can never be tested
+against the vendor, because the first attempt would be the only one that
+seat ever gets). It asserts the renewal happened, in the right encoding,
+with the right client id, presenting the stale token and the seat's own
+scopes; that the vendor then saw the *renewed* token; and that the rotated
+refresh token and an absolute `expiresAt` were persisted to disk — because
+if the rotated token is not recorded, the seat can never renew again.
+
+The console now accepts Claude credential files the same way it accepts
+Codex ones, in bulk. One honest limitation: **Claude's document carries no
+email**, so those seats are named after their files. Name the files after
+the accounts before uploading forty of them.
+
+### 9c · What this does and does not change
+
+**Does:** Claude seats can now be accumulated, labelled and divided
+between services on exactly the same terms as Codex seats. The 117-vs-1
+asymmetry is now a matter of going and collecting logins, not a gap in the
+gateway.
+
+**Does not:** it adds no accounts by itself. Today's Claude pool is still
+two API keys, one of them carrying a model allowlist. Part 7's
+recommendation stands unchanged for right now — give Kris a `tenant = kris`
+key and label nothing on Claude, so its spend becomes visible without
+dividing a pool that cannot yet be divided. Division becomes worth doing
+once there are seats to divide.
+
+**Still open:** the Go caret has no reachable git remote (Part 5). Both
+commits live on my machine and, once deployed, on the host — the same
+position as the 29 July work. That is tolerable for a week and bad for a
+quarter.

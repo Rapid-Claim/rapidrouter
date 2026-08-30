@@ -67,6 +67,37 @@ class Handler(BaseHTTPRequestHandler):
             body = json.loads(raw)
         except Exception:
             body = {}
+        # The OAuth token endpoint. A seat's refresh token rotates the
+        # instant the real endpoint answers, so a refresh can only ever be
+        # exercised against a stand-in — the gateway is pointed here with
+        # RAPID_CLAUDE_OAUTH_URL. Recorded like everything else, because
+        # "did it actually refresh, and with what" is the whole question.
+        if self.path.endswith("/oauth/token"):
+            try:
+                sent = json.loads(raw)
+            except Exception:
+                sent = {p.split("=", 1)[0]: p.split("=", 1)[1]
+                        for p in raw.decode().split("&") if "=" in p}
+            record({
+                "path": self.path,
+                "oauth": True,
+                "content_type": self.headers.get("content-type"),
+                "grant_type": sent.get("grant_type"),
+                "client_id": sent.get("client_id"),
+                "scope": sent.get("scope"),
+                # Recorded so a test can prove the *stale* token was the one
+                # sent for renewal, and that the rotated one came back.
+                "sent_refresh_token": sent.get("refresh_token"),
+            })
+            return self._json(200, {
+                "access_token": "sk-ant-oat01-REFRESHED",
+                "refresh_token": "sk-ant-ort01-ROTATED",
+                "expires_in": 3600,
+                "refresh_token_expires_in": 7776000,
+                "scope": "user:profile user:inference",
+                "token_type": "Bearer",
+            })
+
         auth = self.headers.get("authorization", "")
         record({
             "path": self.path,

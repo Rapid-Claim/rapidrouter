@@ -107,6 +107,60 @@ pub const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 /// Where a Codex credential is renewed.
 pub const CODEX_OAUTH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 
+// -- Claude Code subscription --------------------------------------------
+//
+// Taken from the Claude Code CLI's own OAuth configuration (v2.1.238),
+// not guessed. That distinction matters more here than anywhere else in
+// this file: a refresh token rotates the moment the endpoint answers, so
+// a wrong URL or client id does not merely fail — it spends the one
+// credential we were trying to preserve, and the seat then needs a human
+// with a browser to log in again.
+//
+// Three differences from Codex, each load-bearing:
+//
+//   - The body is **JSON**, not form-encoded.
+//   - Expiry is not in the token. `sk-ant-oat01-...` is opaque rather
+//     than a JWT, so the response's `expires_in` is the only source and
+//     has to be turned into an absolute instant the way the CLI does.
+//   - The scope list is sent back on every refresh. The grant is narrowed
+//     to what is asked for, so omitting it would silently downgrade a
+//     seat's scopes on its first renewal.
+
+/// The public OAuth client id the Claude Code CLI uses to refresh.
+pub const CLAUDE_OAUTH_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+
+/// Where a Claude Code credential is renewed.
+pub const CLAUDE_OAUTH_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+
+/// The scopes the CLI asks for when a credential carries none of its own.
+///
+/// Only a fallback: a real credential records the scopes it was issued
+/// with, and those are preferred so a renewal cannot widen or narrow the
+/// grant behind the operator's back.
+pub const CLAUDE_OAUTH_SCOPES: &[&str] = &[
+    "user:profile",
+    "user:inference",
+    "user:sessions:claude_code",
+    "user:mcp_servers",
+    "user:file_upload",
+];
+
+/// The JSON body that renews a Claude Code credential.
+pub fn claude_refresh_body(refresh_token: &str, scopes: &[String]) -> String {
+    let scope = if scopes.is_empty() {
+        CLAUDE_OAUTH_SCOPES.join(" ")
+    } else {
+        scopes.join(" ")
+    };
+    serde_json::json!({
+        "grant_type": "refresh_token",
+        "refresh_token": refresh_token,
+        "client_id": CLAUDE_OAUTH_CLIENT_ID,
+        "scope": scope,
+    })
+    .to_string()
+}
+
 // -- Device-code login ---------------------------------------------------
 //
 // The browser flow the Codex CLI runs by default is unusable here: it
@@ -1581,4 +1635,76 @@ pub fn codex_relay_body(value: &Value, model: &str) -> Value {
         }
     }
     body
+}
+
+/// Tests for the Claude refresh request.
+///
+/// These assert the wire shape rather than behaviour, deliberately: the
+/// endpoint rotates the refresh token on use, so the first time this code
+/// is exercised against the real service is the only chance it gets. The
+/// shape below is the Claude Code CLI's, read out of its own bundle.
+#[cfg(test)]
+mod claude_refresh_request {
+    use super::*;
+    use serde_json::Value;
+
+    #[test]
+    fn the_body_is_json_not_a_form() {
+        let body = claude_refresh_body("sk-ant-ort01-x", &[]);
+        let parsed: Value =
+            serde_json::from_str(&body).expect("Anthropic takes JSON here, unlike OpenAI");
+        assert_eq!(parsed["grant_type"], "refresh_token");
+        assert_eq!(parsed["refresh_token"], "sk-ant-ort01-x");
+        assert_eq!(parsed["client_id"], CLAUDE_OAUTH_CLIENT_ID);
+    }
+
+    /// A credential records the scopes it was issued with, and those win.
+    /// Sending the defaults instead would silently re-grant the seat a
+    /// different set on its first renewal.
+    #[test]
+    fn a_seats_own_scopes_are_preferred_over_the_defaults() {
+        let scopes = vec!["user:inference".to_owned(), "user:profile".to_owned()];
+        let body = claude_refresh_body("r", &scopes);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["scope"], "user:inference user:profile");
+    }
+
+    #[test]
+    fn a_credential_with_no_scopes_falls_back_to_the_cli_defaults() {
+        let body = claude_refresh_body("r", &[]);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["scope"], CLAUDE_OAUTH_SCOPES.join(" "));
+        assert!(
+            parsed["scope"].as_str().unwrap().contains("user:inference"),
+            "inference is the scope that actually serves requests"
+        );
+    }
+
+    /// The endpoint and client id are the two values that cannot be
+    /// guessed: a wrong one spends a refresh token that rotates on use.
+    #[test]
+    fn the_endpoint_and_client_are_the_cli_s_own() {
+        assert_eq!(
+            CLAUDE_OAUTH_TOKEN_URL,
+            "https://platform.claude.com/v1/oauth/token"
+        );
+        assert_eq!(
+            CLAUDE_OAUTH_CLIENT_ID,
+            "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+        );
+        assert_ne!(
+            CLAUDE_OAUTH_TOKEN_URL, CODEX_OAUTH_TOKEN_URL,
+            "the two vendors are not one endpoint with a variable host"
+        );
+    }
+
+    /// A token with form-hostile characters must survive JSON encoding.
+    /// The Codex path form-encodes for the same reason; this is the
+    /// equivalent check for a body that is serialised, not escaped by hand.
+    #[test]
+    fn an_awkward_token_survives_encoding() {
+        let body = claude_refresh_body("rt+a/b=c&d\"e", &[]);
+        let parsed: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["refresh_token"], "rt+a/b=c&d\"e");
+    }
 }

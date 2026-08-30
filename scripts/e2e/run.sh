@@ -71,6 +71,24 @@ for name in ("opt", "kris", "spare"):
                    "refresh_token": "rt-" + name,
                    "id_token": jwt({"https://api.openai.com/auth": {"chatgpt_account_id": acct}}),
                    "account_id": acct}}))
+
+# A Claude seat as an operator actually has one: the document Claude Code
+# writes, already expired, carrying a refresh token. Inline `sk-ant-...`
+# strings cannot renew and so cannot exercise any of this — a seat backed
+# by a file is the only kind that can, which is exactly why the Claude pool
+# had none until now.
+(d / "claude-kris.json").write_text(json.dumps({
+    "claudeAiOauth": {
+        "accessToken": "sk-ant-oat01-STALE",
+        "refreshToken": "sk-ant-ort01-STALE",
+        "expiresAt": 1000,            # 1970. Due for renewal on first use.
+        "refreshTokenExpiresAt": 4000000000000,
+        "scopes": ["user:profile", "user:inference"],
+        "subscriptionType": "max",
+        "rateLimitTier": "default_claude_max_20x",
+    },
+    "organizationUuid": "org-e2e",
+}, indent=2))
 PY
 
 OPT_SECRET=optimizersecret0123; KRIS_SECRET=krissecret0123456789; NONE_SECRET=plainsecret012345678
@@ -115,8 +133,19 @@ keys = [
   {{ name = "claude-kris", value = "sk-ant-oat01-kris-seat", tenant = "kris" }},
 ]
 
+# One provider, one seat, backed by a credential file. Kept apart from
+# claude-max above so the renewal assertions cannot be satisfied by some
+# other account happening to serve.
+[providers.claude-seat]
+type = "claude_subscription"
+base_url = "__UPSTREAM__"
+keys = [
+  {{ name = "seat-claude-kris", value = "file:{d}/claude-kris.json", tenant = "kris" }},
+]
+
 [aliases]
 "gpt-5.6-sol" = "codex/gpt-5.6-sol"
+"claude-renewing" = "claude-seat/claude-sonnet-5"
 # What the CLIs actually ask for, so a run does not 404 on a name the
 # gateway has never been told about.
 "sonnet" = "claude-max/claude-sonnet-5"
@@ -151,6 +180,9 @@ curl -sf -m 10 --retry 20 --retry-all-errors --retry-delay 1 -o /dev/null \
 
 sed -e "s|__UPSTREAM__|http://127.0.0.1:$UP_PORT|" -e "s|__PORT__|$PORT|" -e "s|__HOST__|$HOST|" \
     "$WORK/gateway.toml" > "$WORK/gateway.live.toml"
+# A refresh token rotates the moment the real endpoint answers, so this can
+# only ever run against the stand-in. Unset in production; see token_url.
+RAPID_CLAUDE_OAUTH_URL="http://127.0.0.1:$UP_PORT/oauth/token" \
 "$ROUTER_BIN" --config "$WORK/gateway.live.toml" > "$WORK/gateway.log" 2>&1 &
 GW_PID=$!
 GW="http://127.0.0.1:$PORT"
@@ -265,6 +297,75 @@ curl -s -m 10 -o /dev/null -X POST "http://127.0.0.1:$UP_PORT/_control" -d '{"co
 say "$KRIS" > /dev/null
 check "a vendor 429 never falls back to another service's account" "$(seats_used)" "acct-kris"
 curl -s -m 10 -o /dev/null -X POST "http://127.0.0.1:$UP_PORT/_control" -d '{"code":200}'
+
+echo
+echo "a Claude seat renews itself"
+# Claude accounts were never poolable the way Codex ones are, and the reason
+# was never the ownership rule — it was that nothing renewed their tokens, so
+# a seat died within hours of being added. This is that gap, closed and
+# proved end to end: an expired credential, a real renewal round trip, and a
+# request served with the token that came back.
+: > "$UP_LOG"
+CLAUDE_CODE=$(curl -s -m 20 -o "$WORK/claude.out" -w '%{http_code}' -X POST "$GW/v1/chat/completions" \
+  -H "Authorization: Bearer $KRIS" -H 'Content-Type: application/json' \
+  -d '{"model":"claude-renewing","messages":[{"role":"user","content":"ping"}]}')
+check "an expired seat still serves the request" "$CLAUDE_CODE" 200
+
+oauth_field() {  # read one field off the recorded refresh
+  python3 - "$UP_LOG" "$1" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    if r.get("oauth"):
+        print(r.get(sys.argv[2]) or "")
+        break
+else:
+    print("NO-REFRESH")
+PY
+}
+check "it renewed the credential first"          "$(oauth_field grant_type)" "refresh_token"
+check "  as JSON, which is Anthropic's encoding" "$(oauth_field content_type)" "application/json"
+check "  against the Claude Code client id"      "$(oauth_field client_id)" "9d1c250a-e61b-44d9-88ed-5944d1962f5e"
+check "  presenting the stale refresh token"     "$(oauth_field sent_refresh_token)" "sk-ant-ort01-STALE"
+# Scopes come off the document, so a renewal cannot quietly re-grant the
+# seat a different set than the one it was issued with.
+check "  and the scopes the seat already held"   "$(oauth_field scope)" "user:profile user:inference"
+
+vendor_token() {
+  python3 - "$UP_LOG" <<'PY'
+import json, sys
+for line in open(sys.argv[1]):
+    r = json.loads(line)
+    if not r.get("oauth"):
+        print(r.get("bearer") or "")
+        break
+else:
+    print("NO-REQUEST")
+PY
+}
+check "the vendor saw the renewed token, not the stale one" "$(vendor_token)" "sk-ant-oat01-REFRESHED"
+
+# Persistence is the half that strands a seat when it is wrong: the refresh
+# token rotated upstream, so if the new one is not on disk the seat can
+# never renew again and needs a human with a browser.
+disk() {  # one field out of the credential file the gateway rewrote
+  python3 - "$WORK/claude-kris.json" "$1" <<'PY'
+import json, sys
+doc = json.load(open(sys.argv[1]))
+print(doc.get("claudeAiOauth", doc).get(sys.argv[2], "MISSING"))
+PY
+}
+check "the rotated refresh token was persisted" "$(disk refreshToken)" "sk-ant-ort01-ROTATED"
+check "  and the new access token with it"      "$(disk accessToken)"  "sk-ant-oat01-REFRESHED"
+# expires_in is relative seconds; the document wants an absolute instant in
+# milliseconds. Getting this wrong benches the seat on every later request.
+NOW_MS=$(python3 -c 'import time;print(int(time.time()*1000))')
+EXP=$(disk expiresAt)
+python3 -c "import sys;n=int(sys.argv[1]);e=int(sys.argv[2]);sys.exit(0 if n < e <= n+3700000 else 1)" "$NOW_MS" "$EXP" \
+  && ok "expiry was rewritten as an absolute instant about an hour out" \
+  || bad "expiry was rewritten as an absolute instant about an hour out" "now=$NOW_MS expiresAt=$EXP"
+# The file belongs to the Claude Code CLI; a renewal must leave it usable.
+check "members the gateway does not model survived" "$(disk subscriptionType)" "max"
 
 echo
 printf '%d passed, %d failed\n' "$PASS" "$FAIL"

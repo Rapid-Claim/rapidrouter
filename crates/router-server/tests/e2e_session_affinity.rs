@@ -158,3 +158,85 @@ async fn the_cache_key_still_reaches_upstream() {
         "the caller's cache key is forwarded, not swallowed"
     );
 }
+
+/// Load: many conversations at once, all in flight together.
+///
+/// The distribution question this answers is the one an operator actually
+/// asks — *can a hundred conversations share ten accounts* — and the
+/// concurrency is the point as much as the count: selection mutates a
+/// per-key atomic and a local candidate list on every request, so hammering
+/// it from many tasks at once is what would expose a race in either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn a_hundred_conversations_share_the_pool_without_losing_their_seats() {
+    let gw = gateway().await;
+    const CONVERSATIONS: usize = 100;
+    const TURNS: usize = 4;
+
+    let mut tasks = tokio::task::JoinSet::new();
+    for c in 0..CONVERSATIONS {
+        let url = gw.url.clone();
+        tasks.spawn(async move {
+            let client = reqwest::Client::new();
+            let session = format!("conversation-{c}");
+            let mut codes = Vec::new();
+            for _ in 0..TURNS {
+                let r = client
+                    .post(format!("{url}/v1/responses"))
+                    .bearer_auth("ck-aaaaaa-s3cret")
+                    .json(&json!({
+                        "model": "pool/gpt-4o",
+                        "input": "hello",
+                        "prompt_cache_key": session,
+                    }))
+                    .send()
+                    .await
+                    .unwrap();
+                codes.push(r.status().as_u16());
+            }
+            codes
+        });
+    }
+
+    let mut served = 0usize;
+    while let Some(res) = tasks.join_next().await {
+        for code in res.unwrap() {
+            assert_eq!(code, 200, "every turn is served under load");
+            served += 1;
+        }
+    }
+    assert_eq!(served, CONVERSATIONS * TURNS);
+
+    // Group the upstream's record by the cache key it saw, and check each
+    // conversation stayed on one credential.
+    let mut seats_per_conversation: std::collections::BTreeMap<String, BTreeSet<String>> =
+        Default::default();
+    for r in gw.mock.requests() {
+        let (Some(key), Some(auth)) = (
+            r.body["prompt_cache_key"].as_str().map(str::to_owned),
+            r.authorization.clone(),
+        ) else {
+            continue;
+        };
+        seats_per_conversation
+            .entry(key)
+            .or_default()
+            .insert(auth.trim_start_matches("Bearer ").to_owned());
+    }
+    assert_eq!(
+        seats_per_conversation.len(),
+        CONVERSATIONS,
+        "every conversation reached upstream"
+    );
+    let split: Vec<_> = seats_per_conversation
+        .iter()
+        .filter(|(_, seats)| seats.len() > 1)
+        .collect();
+    assert!(
+        split.is_empty(),
+        "under load, each conversation must still keep one account: {split:?}"
+    );
+
+    // …and the pool as a whole is still shared out.
+    let used: BTreeSet<&String> = seats_per_conversation.values().flatten().collect();
+    assert_eq!(used.len(), 4, "all four accounts carry conversations");
+}

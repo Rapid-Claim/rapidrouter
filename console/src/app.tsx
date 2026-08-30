@@ -1166,13 +1166,17 @@ function seatNameFrom(email: string | null, fallback: string): string {
 
 export type Seat = { name: string; email: string | null; content: string; file: string };
 
-/// Turn a set of uploaded auth.json documents into named seats.
+/// Turn a set of uploaded credential documents into named seats.
 ///
 /// Seats are named after the account email, which is what an operator
 /// recognises in a list of eighty. Two files for the same account are a
 /// real thing in an exported pool (the same login authorised twice), so
 /// duplicates are numbered rather than silently collapsed — the operator
 /// can see them and drop the extras.
+///
+/// Claude Code's document carries no email at all, so those seats fall
+/// back to the file name. That is worth knowing before uploading forty of
+/// them: name the files after the accounts, or the list is unreadable.
 export async function seatsFromFiles(
   files: File[],
   taken: Iterable<string> = [],
@@ -1194,7 +1198,15 @@ export async function seatsFromFiles(
       rejected.push(`${file.name}: not valid JSON`);
       continue;
     }
-    if (!parsed?.tokens?.refresh_token) {
+    // Either vendor's document. A seat is a credential that can renew
+    // itself, and the only thing that makes one renewable is a refresh
+    // token — Codex keeps it under `tokens`, Claude Code under
+    // `claudeAiOauth`. Anything without one is a token that will die in
+    // hours with no way to bring it back, so it is refused here rather
+    // than accepted and left to fail quietly later.
+    const oauth = parsed?.claudeAiOauth ?? parsed;
+    const renewable = parsed?.tokens?.refresh_token ?? oauth?.refreshToken ?? oauth?.refresh_token;
+    if (!renewable) {
       rejected.push(`${file.name}: no refresh token in it`);
       continue;
     }
@@ -1230,7 +1242,50 @@ function CredentialField(props: {
   const [email, setEmail] = createSignal<string | null>(null);
   return <Switch>
     <Match when={props.kind === "claude"}>
-      <label>Setup token
+      <label>Credential file {props.onSeats ? <span class="optional">One or many</span> : ""}
+        <input
+          type="file"
+          accept=".json,application/json"
+          multiple={Boolean(props.onSeats)}
+          onChange={async (e) => {
+            const picked = [...(e.currentTarget.files ?? [])];
+            if (!picked.length) return;
+            if (props.onSeats) {
+              const result = await seatsFromFiles(picked, props.taken ?? []);
+              setSeats(result.seats);
+              setRejected(result.rejected);
+              setFileName(picked.length === 1 ? picked[0].name : `${picked.length} files`);
+              props.onSeats(result.seats, result.rejected);
+              return;
+            }
+            const content = await picked[0].text();
+            setFileName(picked[0].name);
+            props.onFile(content, null);
+          }}
+        />
+      </label>
+      <Show when={seats().length > 1}>
+        <div class="seat-preview">
+          <p class="muted"><strong>{seats().length} seats</strong> ready — named after each file.</p>
+          <div class="seat-chips">
+            <For each={seats().slice(0, 12)}>{(seat) => <span class="chip">{seat.name}</span>}</For>
+            <Show when={seats().length > 12}><span class="chip muted">+{seats().length - 12} more</span></Show>
+          </div>
+        </div>
+      </Show>
+      <Show when={rejected().length}>
+        <p class="form-error" role="alert">{rejected().length} file{rejected().length > 1 ? "s" : ""} skipped: {rejected().slice(0, 3).join("; ")}{rejected().length > 3 ? "…" : ""}</p>
+      </Show>
+      <Show when={seats().length <= 1}>
+        <p class="muted">
+          {fileName()
+            ? <>{fileName()} loaded — Claude's document carries no email, so the seat is named after the file.</>
+            : <>Upload the <code class="mono">~/.claude/.credentials.json</code> files Claude Code wrote
+              after sign-in — select as many as you like. The gateway keeps its own copies and renews
+              the tokens itself, which a pasted setup token cannot do.</>}
+        </p>
+      </Show>
+      <label>Setup token <span class="optional">Instead of a file</span>
         <input
           type="password"
           placeholder="sk-ant-oat01-…"
@@ -1352,7 +1407,7 @@ function AddProviderDialog(props: {
         // A pool of Codex seats is uploaded in one shot: every document
         // is persisted in a single request, then the provider is created
         // with all of its keys in a single config commit.
-        if (p?.name === "codex_subscription" && seats().length > 1) {
+        if (p?.subscription && seats().length > 1) {
           const written = await api.putCredentialFiles(seats().map((seat) => ({
             name: `${name()}_${seat.name}`.replace(/[^a-zA-Z0-9_-]/g, "_"),
             content: seat.content,
@@ -1371,12 +1426,16 @@ function AddProviderDialog(props: {
           return;
         }
         let credential = value();
-        if (p?.name === "claude_subscription" && value()) {
-          const sealed = await api.putSecret(`${name()}_${keyName()}`.replace(/[^a-zA-Z0-9_-]/g, "_"), value());
-          credential = sealed.reference;
-        } else if (p?.name === "codex_subscription" && fileContent()) {
+        // An uploaded document is checked first, for both vendors. It has
+        // to be: value() is set to the sentinel "uploaded" when a file is
+        // chosen, so testing the pasted token first would seal that word
+        // as the credential and the seat would fail on its first request.
+        if (fileContent()) {
           const saved = await api.putCredentialFile(`${name()}_${keyName()}`.replace(/[^a-zA-Z0-9_-]/g, "_"), fileContent());
           credential = saved.reference;
+        } else if (p?.name === "claude_subscription" && value()) {
+          const sealed = await api.putSecret(`${name()}_${keyName()}`.replace(/[^a-zA-Z0-9_-]/g, "_"), value());
+          credential = sealed.reference;
         }
         // No model seeding: model line-ups change weekly, so models are
         // added explicitly on the Models page.
