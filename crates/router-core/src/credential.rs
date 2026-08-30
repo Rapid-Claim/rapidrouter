@@ -342,6 +342,115 @@ pub fn merge_refresh(
     Ok(serde_json::to_string_pretty(&doc).expect("value serializes"))
 }
 
+/// The scopes a Claude credential was issued with.
+///
+/// Sent back on refresh so a renewal cannot silently widen or narrow the
+/// grant. Empty when the document records none, which is the caller's cue
+/// to fall back to the CLI's default set.
+pub fn claude_scopes(document: &str) -> Vec<String> {
+    let Ok(doc) = serde_json::from_str::<Value>(document) else {
+        return Vec::new();
+    };
+    let oauth = doc.get("claudeAiOauth").unwrap_or(&doc);
+    oauth
+        .get("scopes")
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .filter(|s| !s.is_empty())
+                .map(str::to_owned)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Merge a Claude OAuth refresh response into the credential document.
+///
+/// Separate from [`merge_refresh`] because the two formats agree on
+/// almost nothing: Claude nests under `claudeAiOauth`, names its fields in
+/// camelCase, and — the part that actually bites — records an **absolute**
+/// `expiresAt` in milliseconds while the response carries only a relative
+/// `expires_in` in seconds. Writing the response through unchanged would
+/// leave a document whose expiry field means the wrong thing, and the seat
+/// would then be treated as expired on every single request.
+///
+/// Unknown members (`subscriptionType`, `rateLimitTier`, the outer
+/// `organizationUuid`) are preserved, because this file belongs to the
+/// Claude Code CLI and must stay usable by it.
+///
+/// Refuses a response with no access token, leaving the caller's existing
+/// credential untouched.
+pub fn merge_claude_refresh(
+    document: &str,
+    response: &Value,
+    now_ms: u64,
+) -> Result<String, CredentialError> {
+    let access_token = response
+        .get("access_token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or(CredentialError::NoAccessToken)?
+        .to_owned();
+
+    let mut doc: Value = if document.trim().is_empty() {
+        serde_json::json!({ "claudeAiOauth": {} })
+    } else {
+        serde_json::from_str(document).map_err(|_| CredentialError::NotJson)?
+    };
+    if !doc.is_object() {
+        return Err(CredentialError::NotJson);
+    }
+    // Write back into whichever shape we were given. An operator who
+    // lifted the inner object into their secret manager gets the inner
+    // object back, not a surprise wrapper.
+    let nested = doc.get("claudeAiOauth").is_some_and(Value::is_object);
+    let oauth = if nested {
+        doc.get_mut("claudeAiOauth")
+            .and_then(Value::as_object_mut)
+            .expect("checked above")
+    } else {
+        doc.as_object_mut().expect("checked above")
+    };
+
+    oauth.insert("accessToken".into(), Value::String(access_token));
+    // A response that omits the refresh token means "keep using the one
+    // you have" — the CLI does the same. Clearing it would strand a seat
+    // that is otherwise perfectly renewable.
+    if let Some(refresh) = response
+        .get("refresh_token")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+    {
+        oauth.insert("refreshToken".into(), Value::String(refresh.to_owned()));
+    }
+    // Relative to absolute, saturating: a hostile or corrupt `expires_in`
+    // must not wrap into a date in the past, which would bench the seat.
+    if let Some(expires_in) = response.get("expires_in").and_then(Value::as_u64) {
+        let at = now_ms.saturating_add(expires_in.saturating_mul(1000));
+        oauth.insert("expiresAt".into(), Value::from(at));
+    }
+    if let Some(refresh_in) = response
+        .get("refresh_token_expires_in")
+        .and_then(Value::as_u64)
+    {
+        let at = now_ms.saturating_add(refresh_in.saturating_mul(1000));
+        oauth.insert("refreshTokenExpiresAt".into(), Value::from(at));
+    }
+    if let Some(scope) = response.get("scope").and_then(Value::as_str) {
+        let scopes: Vec<Value> = scope
+            .split_whitespace()
+            .map(|s| Value::String(s.to_owned()))
+            .collect();
+        if !scopes.is_empty() {
+            oauth.insert("scopes".into(), Value::Array(scopes));
+        }
+    }
+
+    Ok(serde_json::to_string_pretty(&doc).expect("value serializes"))
+}
+
 /// The `exp` claim of a JWT, as epoch milliseconds.
 ///
 /// Every failure mode returns `None` — "expiry unknown" — because this is
@@ -696,5 +805,153 @@ mod tests {
             "2026-08-16T03:56:15.000Z"
         );
         assert_eq!(rfc3339_utc_millis(0), "1970-01-01T00:00:00.000Z");
+    }
+}
+
+/// Tests for the Claude seat format.
+///
+/// Kept apart from the Codex tests above because the failure modes are
+/// different: Codex can be checked against a JWT it carries, while every
+/// fact about a Claude seat's lifetime comes from arithmetic we do here.
+#[cfg(test)]
+mod claude_refresh {
+    use super::*;
+    use serde_json::json;
+
+    /// A real document's shape, taken from what Claude Code writes.
+    fn claude_document() -> String {
+        json!({
+            "claudeAiOauth": {
+                "accessToken": "sk-ant-oat01-old",
+                "refreshToken": "sk-ant-ort01-old",
+                "expiresAt": 1_000_000_u64,
+                "refreshTokenExpiresAt": 9_000_000_u64,
+                "scopes": ["user:profile", "user:inference"],
+                "subscriptionType": "max",
+                "rateLimitTier": "default_claude_max_20x"
+            },
+            "organizationUuid": "org-abc"
+        })
+        .to_string()
+    }
+
+    fn response() -> Value {
+        json!({
+            "access_token": "sk-ant-oat01-new",
+            "refresh_token": "sk-ant-ort01-new",
+            "expires_in": 3600,
+            "refresh_token_expires_in": 7776000,
+            "scope": "user:profile user:inference user:file_upload"
+        })
+    }
+
+    /// The one that matters most. The response says "3600 seconds from
+    /// now"; the document must record an absolute instant in
+    /// milliseconds. Getting this wrong does not fail loudly — it makes
+    /// every subsequent request treat the seat as already expired.
+    #[test]
+    fn relative_expiry_becomes_an_absolute_instant_in_millis() {
+        let now = 1_700_000_000_000_u64;
+        let merged = merge_claude_refresh(&claude_document(), &response(), now).unwrap();
+        let seat = parse_claude_oauth_json(&merged).unwrap();
+
+        assert_eq!(seat.expires_at_ms, Some(now + 3_600_000));
+        assert!(!seat.is_expired(now), "a seat renewed for an hour is live");
+        assert!(!seat.wants_refresh(now, 120_000));
+        assert!(
+            seat.wants_refresh(now + 3_600_000 - 60_000, 120_000),
+            "and it comes due again inside the skew"
+        );
+    }
+
+    #[test]
+    fn the_renewed_tokens_are_what_come_back_out() {
+        let merged = merge_claude_refresh(&claude_document(), &response(), 1_000).unwrap();
+        let seat = parse_claude_oauth_json(&merged).unwrap();
+        assert_eq!(seat.access_token.expose(), "sk-ant-oat01-new");
+        assert_eq!(
+            seat.refresh_token.as_ref().map(|t| t.expose().to_owned()),
+            Some("sk-ant-ort01-new".to_owned())
+        );
+    }
+
+    /// The document belongs to the Claude Code CLI. Dropping members we do
+    /// not model would leave the operator's own tool with a file it can no
+    /// longer make sense of.
+    #[test]
+    fn members_we_do_not_model_survive_the_round_trip() {
+        let merged = merge_claude_refresh(&claude_document(), &response(), 1_000).unwrap();
+        let doc: Value = serde_json::from_str(&merged).unwrap();
+        let oauth = &doc["claudeAiOauth"];
+        assert_eq!(oauth["subscriptionType"], "max");
+        assert_eq!(oauth["rateLimitTier"], "default_claude_max_20x");
+        assert_eq!(doc["organizationUuid"], "org-abc");
+    }
+
+    /// A response that omits the refresh token means "keep the one you
+    /// have". Clearing it would strand a renewable seat permanently.
+    #[test]
+    fn an_omitted_refresh_token_leaves_the_existing_one_in_place() {
+        let partial = json!({ "access_token": "sk-ant-oat01-new", "expires_in": 3600 });
+        let merged = merge_claude_refresh(&claude_document(), &partial, 1_000).unwrap();
+        let seat = parse_claude_oauth_json(&merged).unwrap();
+        assert_eq!(
+            seat.refresh_token.as_ref().map(|t| t.expose().to_owned()),
+            Some("sk-ant-ort01-old".to_owned()),
+            "the old refresh token must survive"
+        );
+    }
+
+    /// An operator may lift the inner object into a secret manager. Give
+    /// back the shape we were handed rather than imposing a wrapper.
+    #[test]
+    fn a_bare_inner_object_stays_bare() {
+        let bare = json!({ "accessToken": "old", "refreshToken": "r" }).to_string();
+        let merged = merge_claude_refresh(&bare, &response(), 1_000).unwrap();
+        let doc: Value = serde_json::from_str(&merged).unwrap();
+        assert!(doc.get("claudeAiOauth").is_none(), "no wrapper invented");
+        assert_eq!(doc["accessToken"], "sk-ant-oat01-new");
+    }
+
+    #[test]
+    fn a_response_without_an_access_token_is_refused() {
+        let empty = json!({ "expires_in": 3600 });
+        assert!(matches!(
+            merge_claude_refresh(&claude_document(), &empty, 1_000).unwrap_err(),
+            CredentialError::NoAccessToken
+        ));
+        let blank = json!({ "access_token": "" });
+        assert!(merge_claude_refresh(&claude_document(), &blank, 1_000).is_err());
+    }
+
+    /// A corrupt or hostile `expires_in` must not wrap into the past,
+    /// which would bench the seat on the very request that renewed it.
+    #[test]
+    fn an_absurd_expiry_saturates_rather_than_wrapping() {
+        let hostile = json!({ "access_token": "t", "expires_in": u64::MAX });
+        let merged = merge_claude_refresh(&claude_document(), &hostile, 1_000).unwrap();
+        let seat = parse_claude_oauth_json(&merged).unwrap();
+        assert_eq!(seat.expires_at_ms, Some(u64::MAX));
+        assert!(!seat.is_expired(1_000));
+    }
+
+    #[test]
+    fn scopes_are_read_back_for_the_next_refresh() {
+        assert_eq!(
+            claude_scopes(&claude_document()),
+            vec!["user:profile".to_owned(), "user:inference".to_owned()]
+        );
+        // A document recording none is the caller's cue to use defaults.
+        assert!(claude_scopes(&json!({ "accessToken": "t" }).to_string()).is_empty());
+        assert!(claude_scopes("not json").is_empty());
+        // And the refresh widens them to whatever the response granted.
+        let merged = merge_claude_refresh(&claude_document(), &response(), 1_000).unwrap();
+        assert_eq!(claude_scopes(&merged).len(), 3);
+    }
+
+    #[test]
+    fn a_document_that_is_not_an_object_is_refused() {
+        assert!(merge_claude_refresh("[1,2,3]", &response(), 1).is_err());
+        assert!(merge_claude_refresh("not json", &response(), 1).is_err());
     }
 }

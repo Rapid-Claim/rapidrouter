@@ -127,10 +127,10 @@ pub async fn refresh_now(
         tracing::debug!("seat credential has no durable home; not refreshing");
         return false;
     };
-    // Codex is the only transport whose refresh flow is implemented. A
-    // Claude subscription token is renewed by its own CLI, and guessing at
-    // that endpoint would burn the credential we are trying to save.
-    if kind != ProviderKind::CodexSubscription {
+    // Only a subscription seat has anything to renew; a metered key is a
+    // constant. Both seat transports are implemented, and each has its own
+    // endpoint, encoding and document shape — see `post_refresh`.
+    if !kind.is_subscription() {
         return false;
     }
 
@@ -148,7 +148,14 @@ pub async fn refresh_now(
         return false;
     };
 
-    let response = match post_refresh(client, refresh_token.expose()).await {
+    let response = match post_refresh(
+        client,
+        kind,
+        refresh_token.expose(),
+        state.document.expose(),
+    )
+    .await
+    {
         Ok(response) => response,
         Err(err) => {
             tracing::warn!(error = %err, "seat credential refresh failed; keeping the current one");
@@ -156,7 +163,7 @@ pub async fn refresh_now(
         }
     };
 
-    let merged = match credential::merge_refresh(state.document.expose(), &response, now_ms) {
+    let merged = match merge_for(kind, state.document.expose(), &response, now_ms) {
         Ok(merged) => merged,
         Err(err) => {
             tracing::warn!(error = %err, "refresh response was unusable; credential left untouched");
@@ -165,7 +172,7 @@ pub async fn refresh_now(
     };
     // Validate before persisting: a document that will not parse back into
     // a usable credential must never replace one that does.
-    let renewed = match credential::parse_codex_auth_json(&merged) {
+    let renewed = match reparse(kind, &merged) {
         Ok(renewed) => renewed,
         Err(err) => {
             tracing::warn!(error = %err, "refreshed credential did not re-parse; not persisting");
@@ -184,16 +191,88 @@ pub async fn refresh_now(
     true
 }
 
+/// Merge a refresh response into the seat's document, in that seat's own
+/// format. Dispatched rather than unified because the two documents share
+/// no field names and disagree about what expiry even means.
+fn merge_for(
+    kind: ProviderKind,
+    document: &str,
+    response: &serde_json::Value,
+    now_ms: u64,
+) -> Result<String, credential::CredentialError> {
+    match kind {
+        ProviderKind::ClaudeSubscription => {
+            credential::merge_claude_refresh(document, response, now_ms)
+        }
+        _ => credential::merge_refresh(document, response, now_ms),
+    }
+}
+
+/// Read a merged document back as a seat.
+///
+/// The round trip is the validation: a document that will not parse into a
+/// usable credential must never replace one that does.
+fn reparse(
+    kind: ProviderKind,
+    merged: &str,
+) -> Result<credential::SeatState, credential::CredentialError> {
+    match kind {
+        ProviderKind::ClaudeSubscription => credential::parse_claude_oauth_json(merged),
+        _ => credential::parse_codex_auth_json(merged),
+    }
+}
+
+/// Where a seat's credential is renewed.
+///
+/// Overridable in the same way `RAPID_PRICE_CATALOG_URL` is, and for a
+/// sharper reason: a refresh token rotates the instant the endpoint answers,
+/// so an end-to-end test can never be pointed at the real vendor — the first
+/// attempt would be the only one that seat ever gets. Unset, which is the
+/// normal case, means the vendor's own endpoint.
+fn token_url(kind: ProviderKind) -> String {
+    let (var, default) = match kind {
+        ProviderKind::ClaudeSubscription => (
+            "RAPID_CLAUDE_OAUTH_URL",
+            subscription::CLAUDE_OAUTH_TOKEN_URL,
+        ),
+        _ => ("RAPID_CODEX_OAUTH_URL", subscription::CODEX_OAUTH_TOKEN_URL),
+    };
+    std::env::var(var)
+        .ok()
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| default.to_owned())
+}
+
+/// Post the refresh to the right vendor, in the encoding that vendor wants.
+///
+/// The two flows are genuinely different — OpenAI takes a form body and
+/// puts expiry in the token; Anthropic takes JSON and returns a relative
+/// `expires_in` — so this branches rather than pretending they are one
+/// endpoint with a variable host.
 async fn post_refresh(
     client: &UpstreamClient,
+    kind: ProviderKind,
     refresh_token: &str,
+    document: &str,
 ) -> Result<serde_json::Value, GatewayError> {
-    let request = http::Request::post(subscription::CODEX_OAUTH_TOKEN_URL)
-        .header(
-            http::header::CONTENT_TYPE,
+    let (label, content_type, body) = match kind {
+        ProviderKind::ClaudeSubscription => (
+            "claude-oauth",
+            "application/json",
+            subscription::claude_refresh_body(refresh_token, &credential::claude_scopes(document)),
+        ),
+        _ => (
+            "codex-oauth",
             "application/x-www-form-urlencoded",
-        )
-        .body(Body::from(subscription::codex_refresh_form(refresh_token)))
+            subscription::codex_refresh_form(refresh_token),
+        ),
+    };
+    let url = token_url(kind);
+
+    let request = http::Request::post(url)
+        .header(http::header::CONTENT_TYPE, content_type)
+        .body(Body::from(body))
         .map_err(|e| {
             GatewayError::new(
                 ErrorClass::UpstreamError,
@@ -202,7 +281,7 @@ async fn post_refresh(
         })?;
 
     let response = client
-        .send("codex-oauth", request, std::time::Duration::from_secs(30))
+        .send(label, request, std::time::Duration::from_secs(30))
         .await?;
     let status = response.status();
     let body = response
