@@ -596,13 +596,15 @@ impl ProviderRuntime {
     ///
     /// `None` means nothing is admitted right now: every eligible key is
     /// open and in cooldown (or no key serves this model at all).
+    /// `affinity` is a caller-supplied session id — see [`admit_for`].
     pub fn admit_key(
         &self,
         model: &str,
         tenant: Option<&str>,
+        affinity: Option<&str>,
         now_ms: u64,
     ) -> Option<KeyChoice<'_>> {
-        self.admit_for(Some(model), tenant, now_ms)
+        self.admit_for(Some(model), tenant, affinity, now_ms)
     }
 
     /// Admit a credential for a request that names no model: the relay
@@ -610,14 +612,42 @@ impl ProviderRuntime {
     /// for. It spends a real account, so it goes through the same
     /// selection — health, weights, rate ceilings, account rules — as
     /// every routed request.
-    pub fn admit_any(&self, tenant: Option<&str>, now_ms: u64) -> Option<KeyChoice<'_>> {
-        self.admit_for(None, tenant, now_ms)
+    pub fn admit_any(
+        &self,
+        tenant: Option<&str>,
+        affinity: Option<&str>,
+        now_ms: u64,
+    ) -> Option<KeyChoice<'_>> {
+        self.admit_for(None, tenant, affinity, now_ms)
     }
 
+    /// Admit one attempt.
+    ///
+    /// `affinity`, when present, is a **caller-supplied** session id — the
+    /// `prompt_cache_key` a CLI sends on every turn of one conversation. It
+    /// pins that conversation to one seat, because prompt caching is
+    /// per-account: a conversation that is spread across the pool finds
+    /// nothing cached and re-pays for the prefix it already sent. Measured
+    /// on a real routed agent run before this existed: 5% cache against a
+    /// ~90% ceiling, roughly five times the seat quota needed. See
+    /// `PROMPT-CACHE-COLLAPSE.md`.
+    ///
+    /// It is a *hint*, never a constraint. It picks within the candidate
+    /// set the rules already produced, so ownership, model scope, health
+    /// and rate ceilings all still decide who is eligible — affinity only
+    /// chooses among those who already are. A pinned seat that is benched
+    /// or over its ceiling is stepped over exactly as any other.
+    ///
+    /// Only a supplied key may pin. A key this gateway *derived* names a
+    /// workload, not a conversation — every request sharing a system
+    /// prompt would hash together and land on one seat, which for the
+    /// largest caller here would be about half its traffic on a single
+    /// account. Callers pass `None` unless the client sent its own.
     fn admit_for(
         &self,
         model: Option<&str>,
         tenant: Option<&str>,
+        affinity: Option<&str>,
         now_ms: u64,
     ) -> Option<KeyChoice<'_>> {
         if self.keys.is_empty() {
@@ -651,6 +681,24 @@ impl ProviderRuntime {
         // its breaker is closed and it will serve again shortly — so it is
         // stepped over rather than recorded as a failure.
         let mut candidates = healthy;
+        // A conversation goes back to the seat it was on, so the prefix it
+        // re-sends every turn is still cached there. Tried first and only
+        // once: if that seat is over its own ceiling this turn, fall
+        // through to the levelled pick rather than fail, and the next turn
+        // returns to it — the score is deterministic, so recovery needs no
+        // state.
+        if let Some(session) = affinity
+            && let Some(pinned) = pinned_seat(&candidates, session)
+        {
+            if pinned.try_admit_request(now_ms) {
+                pinned.take_lease();
+                return Some(KeyChoice {
+                    key: Some(pinned),
+                    admission: Admission::Yes,
+                });
+            }
+            candidates.retain(|k| !std::ptr::eq(*k, pinned));
+        }
         while !candidates.is_empty() {
             let picked = balanced_pick(&candidates);
             if picked.try_admit_request(now_ms) {
@@ -792,6 +840,37 @@ fn weighted_pick_target(pool: &[WeightedTarget]) -> TargetModel {
 /// many requests, which is exactly the split the weights ask for.
 fn share(key: &KeyRuntime) -> f64 {
     key.leases() as f64 / key.weight
+}
+
+/// The seat a session belongs on: highest random weight over the
+/// candidates, keyed by the session and the seat's name.
+///
+/// Rendezvous rather than `hash % len`, because the candidate list is not
+/// stable — seats leave it when they bench and rejoin when they recover.
+/// Modulo re-maps *every* session whenever the length changes, so one seat
+/// going down would cost the cache on all of them. Here, a seat leaving
+/// moves only the sessions that were on it, and everyone else keeps both
+/// their seat and their cache.
+///
+/// The seat's *name* is the second input, not its index, so the mapping
+/// also survives reordering the pool in the config.
+fn pinned_seat<'a>(keys: &[&'a KeyRuntime], session: &str) -> Option<&'a KeyRuntime> {
+    keys.iter()
+        .copied()
+        .max_by_key(|key| rendezvous_score(session, &key.name))
+}
+
+/// Score one (session, seat) pair. Deterministic across processes and
+/// restarts: two gateway nodes serving the same conversation agree on its
+/// seat without sharing anything.
+fn rendezvous_score(session: &str, seat: &str) -> u64 {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(session.as_bytes());
+    // Separated, so ("ab", "c") and ("a", "bc") are different pairs.
+    hasher.update(b"\0");
+    hasher.update(seat.as_bytes());
+    let digest = hasher.finalize();
+    u64::from_le_bytes(digest.as_bytes()[..8].try_into().expect("32-byte digest"))
 }
 
 /// Pick the candidate furthest behind its share.
@@ -944,7 +1023,7 @@ keys = [
         // Selection still serves, because the other key is unlimited.
         for _ in 0..20 {
             let choice = p
-                .admit_key("gpt-4o", None, 1_000)
+                .admit_key("gpt-4o", None, None, 1_000)
                 .expect("a key is admitted");
             assert_eq!(choice.key.unwrap().name, "spare");
         }
@@ -1136,7 +1215,7 @@ keys = [{ name = "main", value = "sk-m" }]
     fn served_by(provider: &Arc<ProviderRuntime>, tenant: Option<&str>) -> BTreeSet<String> {
         let mut seen = BTreeSet::new();
         for now in 0..40 {
-            if let Some(choice) = provider.admit_key("gpt-5.6", tenant, now) {
+            if let Some(choice) = provider.admit_key("gpt-5.6", tenant, None, now) {
                 seen.insert(choice.key.unwrap().name.clone());
             }
         }
@@ -1178,7 +1257,7 @@ keys = [{ name = "main", value = "sk-m" }]
     fn a_caller_with_no_service_gets_nothing_from_a_labelled_pool() {
         let t = table(POOL);
         let r = t.resolve("codex/gpt-5.6").unwrap();
-        assert!(r.provider.admit_key("gpt-5.6", None, 0).is_none());
+        assert!(r.provider.admit_key("gpt-5.6", None, None, 0).is_none());
         assert_eq!(r.provider.holding("gpt-5.6", None, 0).owned, 0);
     }
 
@@ -1189,7 +1268,141 @@ keys = [{ name = "main", value = "sk-m" }]
         let r = t.resolve("openai/gpt-4o").unwrap();
         assert!(!r.provider.managed);
         for who in [Some("optimizer"), None] {
-            assert!(r.provider.admit_key("gpt-4o", who, 0).is_some());
+            assert!(r.provider.admit_key("gpt-4o", who, None, 0).is_some());
+        }
+    }
+
+    /// One service, six seats — the shape a routed agent run actually
+    /// meets, and the one where spreading a conversation costs the cache.
+    const SESSION_POOL: &str = r#"
+tenants = ["optimizer"]
+
+[providers.codex]
+type = "openai_compat"
+base_url = "http://127.0.0.1:1"
+keys = [
+  { name = "seat-1", value = "sk-1", tenant = "optimizer" },
+  { name = "seat-2", value = "sk-2", tenant = "optimizer" },
+  { name = "seat-3", value = "sk-3", tenant = "optimizer" },
+  { name = "seat-4", value = "sk-4", tenant = "optimizer" },
+  { name = "seat-5", value = "sk-5", tenant = "optimizer" },
+  { name = "seat-6", value = "sk-6", tenant = "optimizer" },
+]
+"#;
+
+    fn seat_for(provider: &Arc<ProviderRuntime>, session: Option<&str>, now: u64) -> String {
+        provider
+            .admit_key("gpt-5.6", Some("optimizer"), session, now)
+            .expect("a seat")
+            .key
+            .expect("a named seat")
+            .name
+            .clone()
+    }
+
+    /// The whole point: every turn of one conversation goes to the seat
+    /// that already holds its cached prefix.
+    #[test]
+    fn a_conversation_stays_on_one_seat() {
+        let t = table(SESSION_POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        let seats: BTreeSet<String> = (0..30)
+            .map(|now| seat_for(&r.provider, Some("conversation-42"), now))
+            .collect();
+        assert_eq!(seats.len(), 1, "one conversation, one seat: {seats:?}");
+    }
+
+    /// …without turning that seat into the pool's hot spot. Affinity has
+    /// to spread *conversations* while pinning each one.
+    #[test]
+    fn different_conversations_still_use_the_whole_pool() {
+        let t = table(SESSION_POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        let seats: BTreeSet<String> = (0..60)
+            .map(|n| seat_for(&r.provider, Some(&format!("conversation-{n}")), n))
+            .collect();
+        assert!(
+            seats.len() >= 5,
+            "60 conversations should reach most of 6 seats, saw {seats:?}"
+        );
+    }
+
+    /// A caller that names no conversation is levelled across the pool
+    /// exactly as before. This is the guard on the derived-key trap: the
+    /// proxy passes `None` unless the *client* supplied a key, and this is
+    /// what `None` has to keep doing.
+    #[test]
+    fn traffic_with_no_session_still_spreads() {
+        let t = table(SESSION_POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        let seats: BTreeSet<String> = (0..60).map(|n| seat_for(&r.provider, None, n)).collect();
+        assert_eq!(
+            seats.len(),
+            6,
+            "unpinned traffic uses every seat: {seats:?}"
+        );
+    }
+
+    /// A pin is a hint, not a constraint: a benched seat does not strand
+    /// the conversations that live on it, and they come back on their own
+    /// once it recovers — the score is deterministic, so nothing has to
+    /// remember where they were.
+    #[test]
+    fn a_benched_seat_does_not_strand_its_conversations() {
+        let t = table(SESSION_POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        let home = seat_for(&r.provider, Some("conversation-42"), 0);
+
+        let seat = r.provider.keys.iter().find(|k| k.name == home).unwrap();
+        seat.breaker.bench_until(1_000);
+
+        let away = seat_for(&r.provider, Some("conversation-42"), 10);
+        assert_ne!(away, home, "falls through rather than failing the turn");
+
+        let back = seat_for(&r.provider, Some("conversation-42"), 2_000);
+        assert_eq!(back, home, "and returns once the bench elapses");
+    }
+
+    /// Two gateway processes agree on a conversation's seat without
+    /// sharing anything, which is what makes the pin survive a restart.
+    #[test]
+    fn a_conversation_maps_to_the_same_seat_in_a_fresh_process() {
+        let one = table(SESSION_POOL);
+        let two = table(SESSION_POOL);
+        for n in 0..12 {
+            let session = format!("conversation-{n}");
+            assert_eq!(
+                seat_for(
+                    &one.resolve("codex/gpt-5.6").unwrap().provider,
+                    Some(&session),
+                    n
+                ),
+                seat_for(
+                    &two.resolve("codex/gpt-5.6").unwrap().provider,
+                    Some(&session),
+                    n
+                ),
+            );
+        }
+    }
+
+    /// Affinity picks *within* what ownership already allowed. A pinned
+    /// conversation must never reach another service's account.
+    #[test]
+    fn a_pin_cannot_cross_a_service_boundary() {
+        let t = table(POOL);
+        let r = t.resolve("codex/gpt-5.6").unwrap();
+        for n in 0..40 {
+            let session = format!("conversation-{n}");
+            let choice = r
+                .provider
+                .admit_key("gpt-5.6", Some("kris"), Some(&session), n)
+                .expect("kris has a seat");
+            assert_eq!(
+                choice.key.unwrap().name,
+                "seat-1",
+                "kris owns seat-1 and nothing else, pinned or not"
+            );
         }
     }
 
@@ -1206,7 +1419,8 @@ keys = [{ name = "main", value = "sk-m" }]
             }
         }
         assert!(
-            p.admit_key("gpt-5.6", Some("optimizer"), 5_000).is_none(),
+            p.admit_key("gpt-5.6", Some("optimizer"), None, 5_000)
+                .is_none(),
             "the optimizer's only account is out of quota"
         );
         assert!(
@@ -1214,7 +1428,7 @@ keys = [{ name = "main", value = "sk-m" }]
             "and it is out of quota, not out of capacity"
         );
         assert!(
-            p.admit_key("gpt-5.6", Some("kris"), 5_000).is_some(),
+            p.admit_key("gpt-5.6", Some("kris"), None, 5_000).is_some(),
             "kris is unaffected"
         );
     }
@@ -1298,11 +1512,11 @@ keys = [{ name = "only", value = "sk-a" }]
         );
         let r = t.resolve("openai/gpt-4o").unwrap();
         r.provider.keys[0].breaker.bench_until(10_000);
-        assert!(r.provider.admit_key("gpt-4o", None, 9_999).is_none());
+        assert!(r.provider.admit_key("gpt-4o", None, None, 9_999).is_none());
 
         let choice = r
             .provider
-            .admit_key("gpt-4o", None, 10_000)
+            .admit_key("gpt-4o", None, None, 10_000)
             .expect("the window rolled; the seat serves again");
         assert_eq!(choice.key.unwrap().name, "only");
         assert_eq!(choice.admission, Admission::Yes);
@@ -1354,7 +1568,7 @@ cooldown_secs = 1
 
         // While `a` is open, admission must always land on `b`.
         for _ in 0..50 {
-            let choice = r.provider.admit_key("m", None, 10).unwrap();
+            let choice = r.provider.admit_key("m", None, None, 10).unwrap();
             assert_eq!(choice.key.unwrap().name, "b");
             assert_eq!(choice.admission, Admission::Yes);
         }
@@ -1363,15 +1577,15 @@ cooldown_secs = 1
         let b = r.provider.keys.iter().find(|k| k.name == "b").unwrap();
         b.breaker.record_failure(2);
         b.breaker.record_failure(3);
-        assert!(r.provider.admit_key("m", None, 10).is_none());
+        assert!(r.provider.admit_key("m", None, None, 10).is_none());
 
         // Past cooldown: one probe per open key, then nothing.
-        let first = r.provider.admit_key("m", None, 1500).unwrap();
+        let first = r.provider.admit_key("m", None, None, 1500).unwrap();
         assert_eq!(first.admission, Admission::Probe);
-        let second = r.provider.admit_key("m", None, 1500).unwrap();
+        let second = r.provider.admit_key("m", None, None, 1500).unwrap();
         assert_eq!(second.admission, Admission::Probe);
         assert_ne!(first.key.unwrap().name, second.key.unwrap().name);
-        assert!(r.provider.admit_key("m", None, 1500).is_none());
+        assert!(r.provider.admit_key("m", None, None, 1500).is_none());
     }
 
     /// A pool of `n` equal seats, `toml` for a provider named `pool`.
@@ -1388,7 +1602,7 @@ cooldown_secs = 1
         let r = t.resolve("openai/m").unwrap();
 
         for _ in 0..2_000 {
-            r.provider.admit_key("m", None, 0).unwrap();
+            r.provider.admit_key("m", None, None, 0).unwrap();
         }
 
         // Exactly level, not merely close: an independent weighted draw
@@ -1413,7 +1627,7 @@ keys = [
         );
         let r = t.resolve("openai/m").unwrap();
         for _ in 0..400 {
-            r.provider.admit_key("m", None, 0).unwrap();
+            r.provider.admit_key("m", None, None, 0).unwrap();
         }
         let leases = |name: &str| {
             r.provider
@@ -1440,7 +1654,7 @@ keys = [
         out.breaker.record_failure(0);
         out.breaker.record_failure(0);
         for _ in 0..300 {
-            let choice = r.provider.admit_key("m", None, 10).unwrap();
+            let choice = r.provider.admit_key("m", None, None, 10).unwrap();
             assert_ne!(choice.key.unwrap().name, "k0");
         }
         assert_eq!(out.leases(), 0);
@@ -1452,7 +1666,7 @@ keys = [
         for _ in 0..100 {
             assert_eq!(
                 r.provider
-                    .admit_key("m", None, 400)
+                    .admit_key("m", None, None, 400)
                     .unwrap()
                     .key
                     .unwrap()
@@ -1463,7 +1677,7 @@ keys = [
         // Level again — and it stops taking every request.
         assert!(
             (0..40)
-                .filter_map(|_| r.provider.admit_key("m", None, 400))
+                .filter_map(|_| r.provider.admit_key("m", None, None, 400))
                 .any(|c| c.key.unwrap().name != "k0"),
             "a caught-up seat rejoins the rotation"
         );
@@ -1475,7 +1689,7 @@ keys = [
         let table = RoutingTable::from_config(&before);
         let r = table.resolve("openai/m").unwrap();
         for _ in 0..300 {
-            r.provider.admit_key("m", None, 0).unwrap();
+            r.provider.admit_key("m", None, None, 0).unwrap();
         }
         drop(r);
 
@@ -1497,12 +1711,12 @@ keys = [
     fn keyless_provider_uses_provider_breaker() {
         let t = table("[providers.ollama]\nauth = \"none\"\n");
         let r = t.resolve("ollama/llama3").unwrap();
-        let choice = r.provider.admit_key("llama3", None, 0).unwrap();
+        let choice = r.provider.admit_key("llama3", None, None, 0).unwrap();
         assert!(choice.key.is_none());
         r.provider.provider_breaker.record_failure(0);
         for _ in 0..4 {
             r.provider.provider_breaker.record_failure(0);
         }
-        assert!(r.provider.admit_key("llama3", None, 1).is_none());
+        assert!(r.provider.admit_key("llama3", None, None, 1).is_none());
     }
 }
