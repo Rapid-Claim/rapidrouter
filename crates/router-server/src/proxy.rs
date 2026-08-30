@@ -710,7 +710,10 @@ async fn run_chat(
         for a_idx in 0..budget {
             let is_last_candidate = t_idx + 1 == n_targets && a_idx + 1 == budget;
             let now = clock::now_ms();
-            let Some(choice) = route.provider.admit_key(&route.upstream_model, tenant, now) else {
+            let Some(choice) = route
+                .provider
+                .admit_key(&route.upstream_model, tenant, None, now)
+            else {
                 // Three different problems, three different answers: this
                 // caller owns nothing here, its own accounts are spent, or
                 // the provider itself has nothing healthy.
@@ -1785,7 +1788,10 @@ async fn run_relay(
         for a_idx in 0..budget {
             let is_last = t_idx + 1 == n_targets && a_idx + 1 == budget;
             let now = clock::now_ms();
-            let Some(choice) = route.provider.admit_key(&route.upstream_model, tenant, now) else {
+            let Some(choice) = route
+                .provider
+                .admit_key(&route.upstream_model, tenant, None, now)
+            else {
                 let holding = route.provider.holding(&route.upstream_model, tenant, now);
                 last_error = Some(if holding.owned == 0 {
                     no_accounts(route, tenant)
@@ -2091,7 +2097,7 @@ async fn run_stream_relay(
         (provider, String::new())
     };
     let choice = provider
-        .admit_key(&upstream_model, tenant, clock::now_ms())
+        .admit_key(&upstream_model, tenant, None, clock::now_ms())
         .ok_or_else(|| {
             GatewayError::new(
                 ErrorClass::NoCapacity,
@@ -2532,6 +2538,15 @@ async fn run_responses(
     let stream = value["stream"] == Value::Bool(true);
     let wants_state =
         value["store"] == Value::Bool(true) || !value["previous_response_id"].is_null();
+    // Which conversation this turn belongs to, if the client named one.
+    // Codex CLI sends `prompt_cache_key` on every turn of a session, and
+    // this is the endpoint it speaks, so this is where a routed agent run
+    // gets pinned to one seat and keeps its cache. Only what the *client*
+    // sent counts: a key this gateway derives later names a workload
+    // rather than a conversation, and pinning on that would put half of
+    // one caller's traffic on a single account. Absent means no pin, which
+    // is the behaviour every other endpoint keeps.
+    let affinity = value["prompt_cache_key"].as_str().map(str::to_owned);
 
     let table = state.table.load();
     let plan = table.plan(&model)?;
@@ -2655,7 +2670,11 @@ async fn run_responses(
             let is_last_candidate =
                 t_idx + 1 == n_targets && a_idx + 1 == plan.max_attempts_per_target;
             let now = clock::now_ms();
-            let Some(choice) = route.provider.admit_key(&route.upstream_model, tenant, now) else {
+            let Some(choice) =
+                route
+                    .provider
+                    .admit_key(&route.upstream_model, tenant, affinity.as_deref(), now)
+            else {
                 let holding = route.provider.holding(&route.upstream_model, tenant, now);
                 last_error = Some(if holding.owned == 0 {
                     no_accounts(route, tenant)
@@ -2908,7 +2927,7 @@ async fn run_passthrough(
     // account. Taking `keys.first()` here ignored health, load balancing
     // and the service that owns the account alike, which made this
     // endpoint a way around all three.
-    let choice = provider.admit_any(tenant, clock::now_ms());
+    let choice = provider.admit_any(tenant, None, clock::now_ms());
     if provider.auth == AuthMode::Key && choice.is_none() {
         return Err(GatewayError::new(
             ErrorClass::NoCapacity,

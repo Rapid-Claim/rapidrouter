@@ -231,6 +231,44 @@ anything the gateway says about itself:
 
 ---
 
+## Implemented — 2026-08-30, branch `session-affinity`
+
+| Change | Where |
+|---|---|
+| `admit_for` / `admit_key` / `admit_any` take an `affinity: Option<&str>` | `router-core/src/router.rs` |
+| `pinned_seat` + `rendezvous_score` — highest random weight over the candidate set, keyed by session and seat *name* | `router-core/src/router.rs` |
+| The pin is tried once, then falls through to `balanced_pick` if that seat is over its ceiling | `router-core/src/router.rs` |
+| `run_responses` reads the caller's `prompt_cache_key` and passes it | `router-server/src/proxy.rs` |
+| Every other call site passes `None` — chat, relay, stream relay, passthrough | `router-server/src/proxy.rs` |
+
+Six unit tests and four end-to-end tests, the latter asserting on the
+credential the mock upstream received, because the gateway's own records
+cannot say which account served — see the last section.
+
+```
+a_conversation_stays_on_one_seat                     one conversation, one seat
+different_conversations_still_use_the_whole_pool     no hot seat
+traffic_with_no_session_still_spreads                the derived-key guard
+a_benched_seat_does_not_strand_its_conversations     falls through, then returns
+a_conversation_maps_to_the_same_seat_in_a_fresh_process   survives a restart
+a_pin_cannot_cross_a_service_boundary                ownership still wins
+
+e2e: a_conversation_keeps_one_account
+     turns_with_no_conversation_still_spread
+     separate_conversations_use_separate_accounts
+     the_cache_key_still_reaches_upstream
+```
+
+Gate: **500 passed, 0 failed**; `cargo fmt --all --check` and
+`cargo clippy --workspace --all-targets -- -D warnings` both clean.
+
+**Not yet measured in production.** The unit and e2e tests prove the seat
+selection; what they cannot prove is the cache rate a real run gets, because
+that depends on the upstream honouring the prefix. Re-run the measurement at
+the top of this document after deploying, and compare. The G2 fix (account
+and tenant on the usage record) would make that a query rather than an
+exercise.
+
 ## What this deliberately does not do
 
 It does not reintroduce lending, pin a credential to a client, or change what a

@@ -78,7 +78,7 @@ fast = "openai/gpt-4o"
         b.iter(|| {
             route
                 .provider
-                .admit_key(black_box("gpt-4o"), None, 1000)
+                .admit_key(black_box("gpt-4o"), None, None, 1000)
                 .unwrap()
         })
     });
