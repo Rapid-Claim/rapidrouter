@@ -1601,29 +1601,43 @@ async fn probe_provider(
     let semaphore = Arc::new(tokio::sync::Semaphore::new(6));
     let mut tasks = tokio::task::JoinSet::new();
     for key_name in targets {
-        let model = match input
-            .model
-            .clone()
-            .or_else(|| probe_model(&provider, &key_name))
-        {
-            Some(model) => model,
-            None => {
-                tasks.spawn(async move {
-                    json!({
-                        "key": key_name,
-                        "status": "unknown",
-                        "detail": "no model declared for this credential — add one on the Models page",
-                    })
-                });
-                continue;
-            }
+        // Every model this credential could be asked for, in declared
+        // order. A model the backend no longer serves to this plan is
+        // refused with a 400 that says nothing about the credential, so
+        // the check moves on to the next one rather than failing the
+        // seat over it — which is how every seat read "400 Bad Request"
+        // for a day after `gpt-5.4-mini` was withdrawn from ChatGPT
+        // accounts while still first in every seat's list.
+        let candidates: Vec<String> = match input.model.clone() {
+            Some(model) => vec![model],
+            None => probe_models(&provider, &key_name),
         };
+        if candidates.is_empty() {
+            tasks.spawn(async move {
+                json!({
+                    "key": key_name,
+                    "status": "unknown",
+                    "detail": "no model declared for this credential — add one on the Models page",
+                })
+            });
+            continue;
+        }
         let state = state.clone();
         let provider = provider.clone();
         let semaphore = semaphore.clone();
         tasks.spawn(async move {
             let _permit = semaphore.acquire_owned().await.ok();
-            let outcome = crate::proxy::probe_key(&state, provider, &key_name, &model).await;
+            let mut last = None;
+            for model in candidates {
+                let outcome =
+                    crate::proxy::probe_key(&state, provider.clone(), &key_name, &model).await;
+                let rejected_model = outcome.status == "rejected";
+                last = Some((model, outcome));
+                if !rejected_model {
+                    break;
+                }
+            }
+            let (model, outcome) = last.expect("at least one candidate");
             json!({
                 "key": key_name,
                 "model": model,
@@ -1709,27 +1723,36 @@ pub(crate) fn probe_model(
     provider: &router_core::router::ProviderRuntime,
     key_name: &str,
 ) -> Option<String> {
-    provider
+    probe_models(provider, key_name).into_iter().next()
+}
+
+/// Every model a probe may try for this credential, in order: the
+/// credential's own list, else the provider's, else — for a subscription
+/// seat — what the plan is known to serve. See [`probe_model`].
+pub(crate) fn probe_models(
+    provider: &router_core::router::ProviderRuntime,
+    key_name: &str,
+) -> Vec<String> {
+    let declared = provider
         .keys
         .iter()
         .find(|k| k.name == key_name)
-        .and_then(|k| k.models.as_ref().and_then(|m| m.first().cloned()))
-        .or_else(|| {
-            provider
-                .keys
-                .iter()
-                .find_map(|k| k.models.as_ref().and_then(|m| m.first().cloned()))
-        })
-        .or_else(|| {
-            let preset = match provider.kind {
-                router_core::config::ProviderKind::ClaudeSubscription => "claude_subscription",
-                router_core::config::ProviderKind::CodexSubscription => "codex_subscription",
-                _ => return None,
-            };
-            router_core::config::presets::catalog(preset)
-                .first()
-                .map(|m| m.id.to_owned())
-        })
+        .and_then(|k| k.models.as_ref())
+        .or_else(|| provider.keys.iter().find_map(|k| k.models.as_ref()))
+        .map(|models| models.iter().cloned().collect::<Vec<_>>())
+        .unwrap_or_default();
+    if !declared.is_empty() {
+        return declared;
+    }
+    let preset = match provider.kind {
+        router_core::config::ProviderKind::ClaudeSubscription => "claude_subscription",
+        router_core::config::ProviderKind::CodexSubscription => "codex_subscription",
+        _ => return Vec::new(),
+    };
+    router_core::config::presets::catalog(preset)
+        .iter()
+        .map(|m| m.id.to_owned())
+        .collect()
 }
 
 /// Fetch the public price catalog and swap it in.

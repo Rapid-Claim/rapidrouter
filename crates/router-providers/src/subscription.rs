@@ -192,32 +192,182 @@ pub fn codex_device_exchange_form(code: &str, code_verifier: &str) -> String {
 /// Configurable per provider precisely because it moves when OpenAI ships
 /// a model family, and an operator must be able to follow that without
 /// waiting for a rapid-router release.
-pub const DEFAULT_CODEX_VERSION: &str = "0.146.0";
+pub const DEFAULT_CODEX_VERSION: &str = "0.154.0";
 
-/// The header set the Codex CLI sends, reproduced exactly.
+/// What the Codex CLI calls itself: the `originator` header, and the
+/// first word of its user agent.
+pub const CODEX_ORIGINATOR: &str = "codex_cli_rs";
+
+/// The identifiers one CLI turn carries, on the headers and in the body.
+///
+/// The CLI names each request four ways — a session, a thread, a turn and
+/// an installation — and puts the same values in `session-id`,
+/// `thread-id`, `x-client-request-id`, `x-codex-turn-metadata` and the
+/// body's `client_metadata`, so the backend can tie them together. A
+/// gateway request is one turn of a one-turn thread: session and thread
+/// are the same id, minted fresh, and reused across the attempts of one
+/// request the way the CLI reuses them across its own retries.
+///
+/// Captured from codex-cli 0.154.0 on 2026-09-17, driving a recording
+/// endpoint; see `docs/components/agent-subscriptions.md`.
+#[derive(Clone, Debug)]
+pub struct CodexTurn {
+    /// One per gateway process, the way the CLI's is one per install.
+    pub installation_id: String,
+    /// Session and thread id, and the client request id.
+    pub session_id: String,
+    pub turn_id: String,
+    pub started_unix_ms: u64,
+}
+
+impl CodexTurn {
+    pub fn mint() -> Self {
+        Self {
+            installation_id: installation_id().to_owned(),
+            session_id: uuid::Uuid::now_v7().to_string(),
+            turn_id: uuid::Uuid::now_v7().to_string(),
+            started_unix_ms: std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis() as u64)
+                .unwrap_or_default(),
+        }
+    }
+
+    /// The CLI's window id: its thread, window zero.
+    pub fn window_id(&self) -> String {
+        format!("{}:0", self.session_id)
+    }
+
+    /// The `x-codex-turn-metadata` value, which the CLI also repeats
+    /// verbatim under `client_metadata`.
+    pub fn metadata_json(&self) -> String {
+        json!({
+            "installation_id": self.installation_id,
+            "session_id": self.session_id,
+            "thread_id": self.session_id,
+            "turn_id": self.turn_id,
+            "root_turn_id": self.turn_id,
+            "window_id": self.window_id(),
+            "window_number": 0,
+            "request_kind": "turn",
+            "thread_source": "user",
+            "turn_started_at_unix_ms": self.started_unix_ms,
+        })
+        .to_string()
+    }
+
+    /// The body's `client_metadata`: the same identifiers, as the CLI
+    /// lays them out.
+    pub fn client_metadata(&self) -> Value {
+        json!({
+            "x-codex-installation-id": self.installation_id,
+            "session_id": self.session_id,
+            "thread_id": self.session_id,
+            "x-codex-window-id": self.window_id(),
+            "turn_id": self.turn_id,
+            "root_turn_id": self.turn_id,
+            "x-codex-turn-metadata": self.metadata_json(),
+        })
+    }
+}
+
+/// The installation id this process presents, minted once.
+fn installation_id() -> &'static str {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(|| uuid::Uuid::now_v7().to_string())
+}
+
+/// The user agent the CLI presents, in its shape:
+/// `codex_cli_rs/<version> (<OS> <os version>; <arch>) <terminal>`.
+///
+/// The CLI fills the platform from `os_info` and the terminal from what
+/// it is running in, which for a headless process is `unknown`. The
+/// platform here is the host's, read once: it is descriptive, not a gate
+/// — the gate is `version`, which the operator configures.
+pub fn codex_user_agent(version: &str) -> String {
+    let (os, os_version, arch) = host_platform();
+    format!("{CODEX_ORIGINATOR}/{version} ({os} {os_version}; {arch}) unknown")
+}
+
+/// `(os type, os version, architecture)` as `os_info` would name them,
+/// read once per process.
+fn host_platform() -> &'static (String, String, String) {
+    static PLATFORM: std::sync::OnceLock<(String, String, String)> = std::sync::OnceLock::new();
+    PLATFORM.get_or_init(|| {
+        let os = match std::env::consts::OS {
+            "macos" => "Mac OS",
+            "linux" => "Linux",
+            "windows" => "Windows",
+            other => other,
+        };
+        let os_version = match std::env::consts::OS {
+            "linux" => std::fs::read_to_string("/proc/sys/kernel/osrelease")
+                .ok()
+                .map(|v| v.trim().to_owned()),
+            "macos" => std::fs::read_to_string("/System/Library/CoreServices/SystemVersion.plist")
+                .ok()
+                .and_then(|plist| {
+                    let key = "<key>ProductVersion</key>";
+                    let rest = &plist[plist.find(key)? + key.len()..];
+                    let start = rest.find("<string>")? + "<string>".len();
+                    let end = rest[start..].find("</string>")? + start;
+                    Some(rest[start..end].to_owned())
+                }),
+            _ => None,
+        }
+        .filter(|v| !v.is_empty())
+        .unwrap_or_else(|| "0".to_owned());
+        let arch = match std::env::consts::ARCH {
+            "aarch64" => "arm64",
+            other => other,
+        };
+        (os.to_owned(), os_version, arch.to_owned())
+    })
+}
+
+/// The header set codex-cli 0.154.0 sends on a Responses request,
+/// reproduced from a capture of the real client.
 ///
 /// The backend is not a public API and is content to refuse anything that
 /// does not look like its own client, so this is a fixed list rather than
-/// a minimal one. `session_id` is fresh per request, matching the CLI.
+/// a minimal one. What changed since 0.146: `session_id` became
+/// `session-id` and gained `thread-id` and `x-client-request-id` (all the
+/// same value); `openai-beta: responses=experimental` is gone from HTTP
+/// (the CLI now sends it only on its WebSocket transport); the user agent
+/// carries the platform; and the turn's identity travels in
+/// `x-codex-window-id`, `x-codex-turn-metadata` and a routing hint naming
+/// the model. `version` is still the model gate.
+///
+/// Not sent, on purpose: `x-codex-beta-features` (advertises remote
+/// compaction, which we do not consume), `x-codex-turn-state` (the
+/// backend's sticky-routing token for a *multi-request* turn; a gateway
+/// request is one request), and the responses-lite header (a different
+/// body shape the CLI uses for its own prompt).
 pub fn codex_headers<'a>(
     access_token: &'a str,
     account_id: &'a str,
     version: &'a str,
-    session_id: &'a str,
+    model: &'a str,
+    turn: &CodexTurn,
 ) -> Vec<(&'static str, String)> {
     vec![
         ("content-type", "application/json".into()),
         ("accept", "text/event-stream".into()),
-        // The CLI disables compression; the backend's SSE framing is
-        // sensitive to it in ways not worth discovering in production.
+        // Compression stays off: the backend's SSE framing is sensitive to
+        // it in ways not worth discovering in production, and we do not
+        // decode gzip on the way through.
         ("accept-encoding", "identity".into()),
         ("authorization", format!("Bearer {access_token}")),
         ("chatgpt-account-id", account_id.to_owned()),
         ("version", version.to_owned()),
-        ("openai-beta", "responses=experimental".into()),
-        ("session_id", session_id.to_owned()),
-        ("originator", "codex_cli_rs".into()),
-        ("user-agent", format!("codex_cli_rs/{version}")),
+        ("originator", CODEX_ORIGINATOR.into()),
+        ("user-agent", codex_user_agent(version)),
+        ("session-id", turn.session_id.clone()),
+        ("thread-id", turn.session_id.clone()),
+        ("x-client-request-id", turn.session_id.clone()),
+        ("x-codex-window-id", turn.window_id()),
+        ("x-codex-routing-hint", format!("model={model}")),
+        ("x-codex-turn-metadata", turn.metadata_json()),
     ]
 }
 
@@ -230,6 +380,9 @@ pub use router_core::config::CodexSettings;
 pub struct CodexRequest {
     pub body: Value,
     pub dropped_params: Vec<String>,
+    /// The identity the body's `client_metadata` carries; the headers
+    /// must carry the same one, so it travels with the body.
+    pub turn: CodexTurn,
 }
 
 /// Build the Responses body for the ChatGPT Codex backend.
@@ -276,6 +429,7 @@ pub fn codex_request(
     }
 
     let instructions = instructions.unwrap_or_else(|| "You are Codex.".to_owned());
+    let turn = CodexTurn::mint();
 
     let mut body = Map::new();
     body.insert("model".into(), json!(model));
@@ -287,6 +441,12 @@ pub fn codex_request(
     );
     body.insert("instructions".into(), json!(instructions));
     body.insert("input".into(), Value::Array(input));
+    // The turn's identity, as the CLI repeats it in the body. Deliberately
+    // not `include: ["reasoning.encrypted_content"]`, which the CLI also
+    // sends: it asks the backend to ship encrypted reasoning items back
+    // for the client to replay next turn, and a gateway replays nothing —
+    // it would be bytes on every response that nobody reads.
+    body.insert("client_metadata".into(), turn.client_metadata());
 
     // `format` and `verbosity` share one `text` object; assigning it twice
     // would drop the schema and quietly turn a structured-output request
@@ -354,6 +514,7 @@ pub fn codex_request(
     Ok(CodexRequest {
         body: Value::Object(body),
         dropped_params: dropped,
+        turn,
     })
 }
 
@@ -743,7 +904,8 @@ mod tests {
 
     #[test]
     fn codex_headers_are_the_cli_set() {
-        let headers = codex_headers("tok", "acct", "0.146.0", "sess");
+        let turn = CodexTurn::mint();
+        let headers = codex_headers("tok", "acct", "0.154.0", "gpt-5.6-luna", &turn);
         let get = |name: &str| {
             headers
                 .iter()
@@ -752,11 +914,54 @@ mod tests {
         };
         assert_eq!(get("authorization"), Some("Bearer tok"));
         assert_eq!(get("chatgpt-account-id"), Some("acct"));
-        assert_eq!(get("version"), Some("0.146.0"));
-        assert_eq!(get("user-agent"), Some("codex_cli_rs/0.146.0"));
+        assert_eq!(get("version"), Some("0.154.0"));
         assert_eq!(get("originator"), Some("codex_cli_rs"));
-        assert_eq!(get("openai-beta"), Some("responses=experimental"));
-        assert_eq!(get("session_id"), Some("sess"));
+        // `codex_cli_rs/0.154.0 (Mac OS 27.0.0; arm64) unknown`, as
+        // captured from the real client — the platform part is the host's.
+        let ua = get("user-agent").unwrap();
+        assert!(ua.starts_with("codex_cli_rs/0.154.0 ("), "{ua}");
+        assert!(ua.ends_with(") unknown"), "{ua}");
+        assert!(ua.contains("; "), "os and arch are separated: {ua}");
+        // One identity, three headers.
+        assert_eq!(get("session-id"), Some(turn.session_id.as_str()));
+        assert_eq!(get("thread-id"), Some(turn.session_id.as_str()));
+        assert_eq!(get("x-client-request-id"), Some(turn.session_id.as_str()));
+        assert_eq!(
+            get("x-codex-window-id").unwrap(),
+            format!("{}:0", turn.session_id)
+        );
+        assert_eq!(get("x-codex-routing-hint"), Some("model=gpt-5.6-luna"));
+        let metadata: Value = serde_json::from_str(get("x-codex-turn-metadata").unwrap()).unwrap();
+        assert_eq!(metadata["turn_id"], turn.turn_id);
+        assert_eq!(metadata["request_kind"], "turn");
+        // Gone since 0.146: the CLI no longer sends these over HTTP.
+        assert_eq!(get("openai-beta"), None);
+        assert_eq!(get("session_id"), None);
+    }
+
+    #[test]
+    fn two_turns_never_share_an_id_but_share_the_installation() {
+        let a = CodexTurn::mint();
+        let b = CodexTurn::mint();
+        assert_ne!(a.session_id, b.session_id);
+        assert_ne!(a.turn_id, b.turn_id);
+        assert_eq!(a.installation_id, b.installation_id);
+    }
+
+    #[test]
+    fn codex_body_carries_the_turn_identity_the_headers_do() {
+        let req = request(vec![message("user", "hello")]);
+        let built = codex_request(&req, "gpt-5.5", &CodexSettings::default()).unwrap();
+        let meta = &built.body["client_metadata"];
+        assert_eq!(meta["session_id"], built.turn.session_id);
+        assert_eq!(meta["thread_id"], built.turn.session_id);
+        assert_eq!(meta["turn_id"], built.turn.turn_id);
+        assert_eq!(meta["x-codex-installation-id"], built.turn.installation_id);
+        assert_eq!(meta["x-codex-turn-metadata"], built.turn.metadata_json());
+        assert!(
+            built.body.get("include").is_none(),
+            "encrypted reasoning is not requested: nothing here replays it"
+        );
     }
 
     #[test]

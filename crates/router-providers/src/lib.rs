@@ -86,6 +86,9 @@ pub struct OutboundRequest {
     /// Recorded per request because the floor is invisible from the
     /// caller's body, and "why was this slow" is answered by it.
     pub reasoning_effort: Option<String>,
+    /// For a Codex target, the turn identity the body carries; the
+    /// request headers must name the same one.
+    pub codex_turn: Option<subscription::CodexTurn>,
 }
 
 /// Build the chat request body for a foreign-dialect target.
@@ -109,6 +112,7 @@ pub fn build_outbound(
                 dropped_params: Vec::new(),
                 json_schema_emulated: false,
                 reasoning_effort: None,
+                codex_turn: None,
             })
         }
         Dialect::Anthropic => {
@@ -126,6 +130,7 @@ pub fn build_outbound(
                 dropped_params: built.dropped_params,
                 json_schema_emulated: built.json_schema_emulated,
                 reasoning_effort: None,
+                codex_turn: None,
             })
         }
         Dialect::Gemini => {
@@ -143,6 +148,7 @@ pub fn build_outbound(
                 dropped_params: built.dropped_params,
                 json_schema_emulated: false,
                 reasoning_effort: None,
+                codex_turn: None,
             })
         }
         Dialect::Bedrock => {
@@ -160,6 +166,7 @@ pub fn build_outbound(
                 dropped_params: built.dropped_params,
                 json_schema_emulated: false,
                 reasoning_effort: None,
+                codex_turn: None,
             })
         }
         Dialect::CodexResponses => {
@@ -182,6 +189,7 @@ pub fn build_outbound(
                 dropped_params: built.dropped_params,
                 json_schema_emulated: false,
                 reasoning_effort,
+                codex_turn: Some(built.turn),
             })
         }
     }

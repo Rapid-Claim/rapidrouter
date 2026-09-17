@@ -298,16 +298,40 @@ async fn codex_seat_presents_the_cli_header_set() {
         Some("0.199.0"),
         "the configured version must reach the backend — it is a model gate",
     );
-    assert_eq!(request.header("user-agent"), Some("codex_cli_rs/0.199.0"));
+    let ua = request.header("user-agent").unwrap();
+    assert!(
+        ua.starts_with("codex_cli_rs/0.199.0 (") && ua.ends_with(") unknown"),
+        "the 0.154 user agent carries the platform: {ua}"
+    );
     assert_eq!(request.header("originator"), Some("codex_cli_rs"));
+    // The turn's identity, as codex-cli 0.154.0 sends it: one id on
+    // three headers, and the same id inside the body.
+    let session = request.header("session-id").expect("session-id");
+    assert!(!session.is_empty());
+    assert_eq!(request.header("thread-id"), Some(session));
+    assert_eq!(request.header("x-client-request-id"), Some(session));
+    assert_eq!(
+        request.header("x-codex-window-id").unwrap(),
+        format!("{session}:0")
+    );
+    assert_eq!(
+        request.header("x-codex-routing-hint"),
+        Some("model=gpt-5.5")
+    );
+    let metadata: Value =
+        serde_json::from_str(request.header("x-codex-turn-metadata").unwrap()).unwrap();
+    assert_eq!(metadata["session_id"], session);
+    assert_eq!(metadata["request_kind"], "turn");
+    assert_eq!(
+        request.body["client_metadata"]["session_id"], session,
+        "the body names the same session the headers do"
+    );
     assert_eq!(
         request.header("openai-beta"),
-        Some("responses=experimental")
+        None,
+        "0.154 sends this only on its websocket transport"
     );
-    assert!(
-        request.header("session_id").is_some_and(|s| !s.is_empty()),
-        "the CLI sends a fresh session id per request",
-    );
+    assert_eq!(request.header("session_id"), None, "renamed to session-id");
     assert!(
         request
             .authorization
@@ -645,6 +669,102 @@ async fn a_callers_own_effort_is_the_one_recorded() {
     assert_eq!(mock.last_request().body["reasoning"]["effort"], "high");
     let record = first_logged_request(&url).await;
     assert_eq!(record["reasoning_effort"], "high", "{record}");
+}
+
+// ---------------------------------------------------------------------------
+// What a check can see
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_check_sees_through_a_refusal_inside_a_200() {
+    let (url, mock, _dir) = codex_pool_with(
+        &["acct-a"],
+        "\n[console]\nadmin_keys = [\"probe-test-key\"]\n",
+    )
+    .await;
+    let result = probe(&url, "codex", "refuse-all").await;
+    let seat = &result;
+    assert_eq!(seat["http_status"], 200, "{result}");
+    assert_eq!(
+        seat["status"], "provider_error",
+        "a 200 that refuses inside the stream is not a pass: {seat}"
+    );
+    assert!(
+        seat["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("server_is_overloaded"),
+        "and the console is told what the backend said: {seat}"
+    );
+
+    // The check leaves the router knowing what it learned: the seat is
+    // held out, so the next request does not go upstream.
+    let hits = mock.request_count();
+    let (status, _) = chat(
+        &url,
+        json!({"model": "codex/gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_ne!(status, 200);
+    assert_eq!(mock.request_count(), hits);
+}
+
+#[tokio::test]
+async fn a_check_steps_past_a_model_the_plan_no_longer_serves() {
+    let mock = MockProvider::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth_path = dir.path().join("acct-a.json");
+    std::fs::write(&auth_path, codex_auth_json_for(4_000_000_000, "acct-a")).unwrap();
+    let config = Config::from_str_with_env(
+        &format!(
+            r#"
+[providers.codex]
+type = "codex_subscription"
+base_url = "{base}"
+keys = [{{ name = "seat-a", value = "file:{auth}", models = ["unsupported-model", "gpt-5.5"] }}]
+
+[console]
+admin_keys = ["probe-test-key"]
+"#,
+            base = mock.base_url(),
+            auth = auth_path.display(),
+        ),
+        Format::Toml,
+        &NoEnv,
+    )
+    .unwrap();
+    let state = AppState::new(config);
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        router_server::serve(listener, state, app, std::future::pending())
+            .await
+            .unwrap()
+    });
+
+    // First in the list is a model the backend refuses for this plan;
+    // the check must not fail the seat over it.
+    let result = probe(&url, "codex", "").await;
+    let seat = &result;
+    assert_eq!(seat["status"], "ok", "{result}");
+    assert_eq!(
+        seat["model"], "gpt-5.5",
+        "the model that actually answered: {seat}"
+    );
+
+    // Asked for that model explicitly, the check reports the backend's
+    // own words rather than a bare status line.
+    let result = probe(&url, "codex", "unsupported-model").await;
+    let seat = &result;
+    assert_eq!(seat["status"], "rejected", "{seat}");
+    assert!(
+        seat["detail"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("not supported when using Codex with a ChatGPT account"),
+        "{seat}"
+    );
 }
 
 // ---------------------------------------------------------------------------

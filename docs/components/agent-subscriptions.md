@@ -45,20 +45,47 @@ CLI as a subprocess with `CLAUDE_CODE_OAUTH_TOKEN` in its environment (from
 ### Codex — plain HTTP, no CLI
 
 The Codex path never runs a subprocess. It POSTs the OpenAI **Responses API**
-body to `https://chatgpt.com/backend-api/codex/responses` with the exact
-header set the Codex CLI sends:
+body to `https://chatgpt.com/backend-api/codex/responses` with the header
+set the Codex CLI sends. Captured 2026-09-17 from codex-cli 0.154.0 driving
+a recording endpoint (`chatgpt_base_url` plus a `requires_openai_auth`
+provider), and cross-checked against `codex-rs/core/src/client.rs` at
+`rust-v0.154.0`:
 
 ```
 Authorization: Bearer <access_token from auth.json>
 ChatGPT-Account-Id: <account_id | chatgpt_account_id from the id_token>
-Version: 0.146.0
-User-Agent: codex_cli_rs/0.146.0
+Version: 0.154.0
+User-Agent: codex_cli_rs/0.154.0 (Linux 6.8.0; x86_64) unknown
 Originator: codex_cli_rs
-Openai-Beta: responses=experimental
-Session_id: <fresh uuid per request>
+Session-Id: <uuid v7, one per request>
+Thread-Id: <the same uuid>
+X-Client-Request-Id: <the same uuid>
+X-Codex-Window-Id: <the same uuid>:0
+X-Codex-Routing-Hint: model=<model>
+X-Codex-Turn-Metadata: {"installation_id":…,"session_id":…,"turn_id":…,"request_kind":"turn",…}
 Accept: text/event-stream
 Accept-Encoding: identity
 ```
+
+What changed since 0.146, and why it matters: `Session_id` became
+`Session-Id` and gained `Thread-Id` and `X-Client-Request-Id` carrying the
+same value; `Openai-Beta: responses=experimental` is no longer sent over
+HTTP (0.154 sends it only on its WebSocket transport, as
+`responses_websockets=2026-02-06`); the user agent carries the platform;
+and the body repeats the turn identity under `client_metadata`. `Version`
+is still the model gate. The CLI's default transport against
+`chatgpt.com` is now Responses-over-WebSocket with HTTP as its fallback;
+the gateway speaks the HTTP path, which the backend serves unchanged.
+
+Sent by the CLI and deliberately *not* by the gateway: `include:
+["reasoning.encrypted_content"]` (asks for encrypted reasoning items to
+replay next turn; a gateway replays nothing, so it would be bytes on every
+response nobody reads), `x-codex-beta-features: remote_compaction_v2`
+(advertises a compaction flow we do not consume), `x-codex-turn-state`
+(the backend's sticky-routing token for a multi-request turn; a gateway
+request is one request), and `x-openai-internal-codex-responses-lite`
+with its `additional_tools` body shape (the CLI's own prompt layout;
+`instructions` + `input` is still accepted, verified live).
 
 Hard-won details, all measured against the live backend:
 
@@ -323,7 +350,7 @@ type = "codex_subscription"
 # Raise them if you want the thinking; a caller can also raise either
 # per request. Leaving them to the backend's own per-model defaults is
 # what costs 14.5 s where 2.1 s would do.
-codex = { version = "0.146.0", reasoning_effort = "low", verbosity = "low" }
+codex = { version = "0.154.0", reasoning_effort = "low", verbosity = "low" }
 keys = [
   { name = "seat-1", value = "file:/etc/rapid/codex/seat-1/auth.json" },
   { name = "seat-2", value = "file:/etc/rapid/codex/seat-2/auth.json" },

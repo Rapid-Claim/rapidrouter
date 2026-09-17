@@ -230,6 +230,17 @@ async fn scripted_failure(shared: &Shared, model: &str) -> Option<Response> {
             tokio::time::sleep(Duration::from_secs(2)).await;
             None
         }
+        // The Codex backend's refusal of a model the plan does not serve,
+        // worded and shaped as it sends it: a `detail`, not an `error`.
+        "unsupported-model" => Some(
+            (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({"detail": format!(
+                    "The '{model}' model is not supported when using Codex with a ChatGPT account."
+                )})),
+            )
+                .into_response(),
+        ),
         _ => None,
     }
 }
