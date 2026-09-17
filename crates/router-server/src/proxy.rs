@@ -751,39 +751,41 @@ async fn run_chat(
         // chains may cross dialects). Capability errors (n>1, logprobs,
         // audio parts…) are the caller's to fix; surface immediately
         // rather than burning fallbacks.
-        let (out_body, path, dropped, emulated, reasoning_effort) = if out_dialect == in_dialect {
-            let body = inbound.passthrough_body(&route.upstream_model);
-            let path =
-                router_providers::passthrough_path(out_dialect, &route.upstream_model, stream);
-            (body, path, Vec::new(), false, None)
-        } else {
-            let req = match &internal {
-                Some(r) => r,
-                None => internal.insert(inbound.to_internal()?),
-            };
-            let req = if router_providers::needs_rasterized_documents(out_dialect)
-                && router_media::has_documents(req)
-            {
-                documents_as_images(req, &mut rasterized, route).await?
+        let (out_body, path, dropped, emulated, reasoning_effort, codex_turn) =
+            if out_dialect == in_dialect {
+                let body = inbound.passthrough_body(&route.upstream_model);
+                let path =
+                    router_providers::passthrough_path(out_dialect, &route.upstream_model, stream);
+                (body, path, Vec::new(), false, None, None)
             } else {
-                req
+                let req = match &internal {
+                    Some(r) => r,
+                    None => internal.insert(inbound.to_internal()?),
+                };
+                let req = if router_providers::needs_rasterized_documents(out_dialect)
+                    && router_media::has_documents(req)
+                {
+                    documents_as_images(req, &mut rasterized, route).await?
+                } else {
+                    req
+                };
+                let built = router_providers::build_outbound(
+                    out_dialect,
+                    req,
+                    &route.upstream_model,
+                    stream,
+                    route.provider.codex.as_ref(),
+                    route.provider.kind == ProviderKind::ClaudeSubscription,
+                )?;
+                (
+                    built.body,
+                    built.path,
+                    built.dropped_params,
+                    built.json_schema_emulated,
+                    built.reasoning_effort,
+                    built.codex_turn,
+                )
             };
-            let built = router_providers::build_outbound(
-                out_dialect,
-                req,
-                &route.upstream_model,
-                stream,
-                route.provider.codex.as_ref(),
-                route.provider.kind == ProviderKind::ClaudeSubscription,
-            )?;
-            (
-                built.body,
-                built.path,
-                built.dropped_params,
-                built.json_schema_emulated,
-                built.reasoning_effort,
-            )
-        };
         for param in &dropped {
             metrics::counter!("rapid_dropped_params_total", "param" => param.clone(), "provider" => route.provider.name.clone()).increment(1);
             tracing::debug!(provider = %route.provider.name, param, "dropped unsupported parameter");
@@ -849,6 +851,7 @@ async fn run_chat(
                 headers,
                 choice.key,
                 out_body.clone(),
+                codex_turn.as_ref(),
             )?;
 
             match attempt(
@@ -1496,7 +1499,16 @@ async fn collect_capped(body: hyper::body::Incoming, cap: usize) -> Result<Bytes
 
 fn extract_upstream_error(body: &[u8]) -> Option<String> {
     let v: Value = serde_json::from_slice(body).ok()?;
-    for path in [&v["error"]["message"], &v["message"], &v["error"]] {
+    // `detail` is how the Codex backend words a refusal (`{"detail": "The
+    // 'gpt-5.4-mini' model is not supported when using Codex with a
+    // ChatGPT account."}`); without it the console showed a bare `400
+    // Bad Request` for every seat and the reason was anyone's guess.
+    for path in [
+        &v["error"]["message"],
+        &v["message"],
+        &v["detail"],
+        &v["error"],
+    ] {
         if let Some(s) = path.as_str() {
             return Some(s.to_owned());
         }
@@ -1553,6 +1565,7 @@ pub(crate) fn build_upstream_request(
     inbound: &HeaderMap,
     key: Option<&KeyRuntime>,
     body: Bytes,
+    codex_turn: Option<&router_providers::subscription::CodexTurn>,
 ) -> Result<http::Request<Body>, GatewayError> {
     let base = route.provider.base_url.as_deref().ok_or_else(|| {
         GatewayError::new(
@@ -1651,12 +1664,23 @@ pub(crate) fn build_upstream_request(
                 .and_then(|s| s.account_id.as_deref())
                 .unwrap_or_default();
             let settings = route.provider.codex.clone().unwrap_or_default();
-            let session_id = uuid::Uuid::now_v7().simple().to_string();
+            // The identity the body already carries when the body was
+            // built for this backend; a relayed or probing request has
+            // none in its body and gets a fresh one.
+            let minted;
+            let turn = match codex_turn {
+                Some(turn) => turn,
+                None => {
+                    minted = router_providers::subscription::CodexTurn::mint();
+                    &minted
+                }
+            };
             for (name, value) in router_providers::subscription::codex_headers(
                 token.expose(),
                 account_id,
                 &settings.version,
-                &session_id,
+                &route.upstream_model,
+                turn,
             ) {
                 // Content-type is already set above; the rest are the CLI's.
                 if name == "content-type" {
@@ -1803,17 +1827,24 @@ pub(crate) async fn probe_key(
     };
 
     let empty = HeaderMap::new();
-    let request =
-        match build_upstream_request(&route, dialect, &built.path, &empty, key, built.body) {
-            Ok(request) => request,
-            Err(err) => {
-                return ProbeOutcome {
-                    status: "unreachable".into(),
-                    detail: err.to_string(),
-                    http_status: None,
-                };
-            }
-        };
+    let request = match build_upstream_request(
+        &route,
+        dialect,
+        &built.path,
+        &empty,
+        key,
+        built.body,
+        built.codex_turn.as_ref(),
+    ) {
+        Ok(request) => request,
+        Err(err) => {
+            return ProbeOutcome {
+                status: "unreachable".into(),
+                detail: err.to_string(),
+                http_status: None,
+            };
+        }
+    };
 
     let result = state
         .upstream
@@ -1866,14 +1897,35 @@ pub(crate) async fn probe_key(
                 breaker.record_success(clock::now_ms());
             }
 
-            let status = check_status(http_status);
-            let detail = if http_status.is_success() {
-                String::new()
-            } else {
+            let (status, detail) = if !http_status.is_success() {
                 let body = axum::body::to_bytes(Body::new(response.into_body()), 8192)
                     .await
                     .unwrap_or_default();
-                extract_upstream_error(&body).unwrap_or_else(|| http_status.to_string())
+                (
+                    check_status(http_status),
+                    extract_upstream_error(&body).unwrap_or_else(|| http_status.to_string()),
+                )
+            } else if provider.kind == ProviderKind::CodexSubscription {
+                // A Codex `200` is not yet a pass: the backend refuses
+                // inside the stream. Read the whole answer and judge it
+                // the way the request path does — a check that reported
+                // 63 seats "ok" while 56 of them refused every request was
+                // worse than no check at all.
+                let body = axum::body::to_bytes(Body::new(response.into_body()), 1024 * 1024)
+                    .await
+                    .unwrap_or_default();
+                match router_providers::subscription::aggregate_sse(&body, model) {
+                    Ok(_) => ("ok", String::new()),
+                    Err(failure) => {
+                        hold_out_refused_seat(&provider, breaker, key, &failure);
+                        (
+                            "provider_error",
+                            format!("{}: {}", failure.code, failure.message),
+                        )
+                    }
+                }
+            } else {
+                ("ok", String::new())
             };
             // Kept on the key, not just returned to the caller: the
             // console needs to show the state of a seat when a drawer is
@@ -2045,6 +2097,7 @@ async fn run_relay(
                 headers,
                 choice.key,
                 upstream_body,
+                None,
             )?;
             let ctx = TranslationCtx {
                 passthrough: true,
@@ -2818,7 +2871,7 @@ async fn run_responses(
             && !wants_state
             && !responses_body_has_documents(&value);
         let relay = out_dialect == Dialect::OpenAi || codex_relay;
-        let (out_body, path, emulated, reasoning_effort) = if relay {
+        let (out_body, path, emulated, reasoning_effort, codex_turn) = if relay {
             // Relayed verbatim, so the effort is whatever the caller set,
             // and nothing when they set none: no floor is applied here.
             let relayed_effort = value["reasoning"]["effort"].as_str().map(str::to_owned);
@@ -2847,7 +2900,7 @@ async fn run_responses(
             } else {
                 "/responses".to_owned()
             };
-            (rewritten, path, false, relayed_effort)
+            (rewritten, path, false, relayed_effort, None)
         } else {
             if wants_state {
                 return Err(GatewayError::new(
@@ -2891,6 +2944,7 @@ async fn run_responses(
                 built.path,
                 built.json_schema_emulated,
                 built.reasoning_effort,
+                built.codex_turn,
             )
         };
 
@@ -2944,6 +2998,7 @@ async fn run_responses(
                 headers,
                 choice.key,
                 out_body.clone(),
+                codex_turn.as_ref(),
             )?;
             let ctx = TranslationCtx {
                 passthrough: relay,
