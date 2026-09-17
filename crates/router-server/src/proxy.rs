@@ -126,6 +126,75 @@ fn out_of_quota(route: &ResolvedRoute, tenant: Option<&str>, holding: Holding) -
     .with_provider(&route.provider.name)
 }
 
+/// The answer when every account the caller owns is healthy but at one of
+/// its own ceilings this instant — every in-flight slot taken, or no
+/// request left in the minute. The one pool-empty answer that clears in
+/// seconds, so it is a `503` with `retry-after`, and says so.
+fn at_ceiling(route: &ResolvedRoute, tenant: Option<&str>, holding: Holding) -> GatewayError {
+    GatewayError::new(
+        ErrorClass::NoCapacity,
+        format!(
+            "{} has no account free on provider `{}`: all {} of its accounts are at \
+             their ceiling for model `{}`; try again shortly",
+            service_of(tenant),
+            route.provider.name,
+            holding.owned,
+            route.upstream_model
+        ),
+    )
+    .with_provider(&route.provider.name)
+}
+
+/// Why selection admitted nobody, told apart so the caller can act on
+/// it. Four different problems, four different answers: this caller owns
+/// nothing here, its own accounts are spent, they are all busy, or the
+/// provider itself has nothing healthy.
+fn pool_empty(route: &ResolvedRoute, tenant: Option<&str>, now: u64) -> GatewayError {
+    let model = &route.upstream_model;
+    let holding = route.provider.holding(model, tenant, now);
+    if holding.owned == 0 {
+        no_accounts(route, tenant)
+    } else if route.provider.all_keys_benched(model, tenant, now) {
+        out_of_quota(route, tenant, holding)
+    } else if route.provider.all_keys_at_ceiling(model, tenant, now) {
+        at_ceiling(route, tenant, holding)
+    } else {
+        GatewayError::new(
+            ErrorClass::NoCapacity,
+            format!(
+                "no healthy key of provider `{}` for model `{model}`",
+                route.provider.name
+            ),
+        )
+        .with_provider(&route.provider.name)
+    }
+}
+
+/// The permits a request holds while it is upstream: the provider's, and
+/// the seat's own in-flight slot when the seat has a ceiling.
+///
+/// One value, so every path that carries a permit carries both and gives
+/// both back at the same moment — when the response has finished
+/// streaming, not when the headers arrived. A seat's slot released any
+/// earlier would let the next request pile onto a seat still busy with
+/// this one, which is the exact load the ceiling exists to prevent.
+pub(crate) struct UpstreamPermit {
+    _provider: tokio::sync::OwnedSemaphorePermit,
+    _seat: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
+impl UpstreamPermit {
+    fn new(
+        provider: tokio::sync::OwnedSemaphorePermit,
+        seat: Option<tokio::sync::OwnedSemaphorePermit>,
+    ) -> Self {
+        Self {
+            _provider: provider,
+            _seat: seat,
+        }
+    }
+}
+
 /// The answer when a caller owns no account here at all — an unassigned
 /// key, or a service nobody has given an account to. A configuration
 /// problem, not a capacity one.
@@ -155,6 +224,20 @@ pub struct SeatUsed {
     pub key: String,
 }
 
+/// The reasoning effort that went upstream, carried to the meter the same
+/// way as [`SeatUsed`]: the floor is the provider's, not the caller's, so
+/// only the gateway can say what was actually asked for.
+#[derive(Clone)]
+pub struct ReasoningUsed(pub String);
+
+fn note_reasoning(response: &mut Response, effort: Option<&str>) {
+    if let Some(effort) = effort {
+        response
+            .extensions_mut()
+            .insert(ReasoningUsed(effort.to_owned()));
+    }
+}
+
 fn meter(response: Response, mut hook: UsageHook, dialect: Dialect, stream: bool) -> Response {
     hook.provider = response
         .headers()
@@ -182,6 +265,10 @@ fn meter(response: Response, mut hook: UsageHook, dialect: Dialect, stream: bool
         .unwrap_or_default();
     hook.stream = stream;
     hook.seat = response.extensions().get::<SeatUsed>().cloned();
+    hook.reasoning_effort = response
+        .extensions()
+        .get::<ReasoningUsed>()
+        .map(|r| r.0.clone());
     usage::meter_response(response, hook, dialect)
 }
 
@@ -262,6 +349,7 @@ fn build_hook(
             .and_then(|v| v.to_str().ok())
             .map(str::to_owned),
         seat: None,
+        reasoning_effort: None,
         input_body: None,
     }
 }
@@ -663,11 +751,11 @@ async fn run_chat(
         // chains may cross dialects). Capability errors (n>1, logprobs,
         // audio parts…) are the caller's to fix; surface immediately
         // rather than burning fallbacks.
-        let (out_body, path, dropped, emulated) = if out_dialect == in_dialect {
+        let (out_body, path, dropped, emulated, reasoning_effort) = if out_dialect == in_dialect {
             let body = inbound.passthrough_body(&route.upstream_model);
             let path =
                 router_providers::passthrough_path(out_dialect, &route.upstream_model, stream);
-            (body, path, Vec::new(), false)
+            (body, path, Vec::new(), false, None)
         } else {
             let req = match &internal {
                 Some(r) => r,
@@ -693,6 +781,7 @@ async fn run_chat(
                 built.path,
                 built.dropped_params,
                 built.json_schema_emulated,
+                built.reasoning_effort,
             )
         };
         for param in &dropped {
@@ -710,31 +799,12 @@ async fn run_chat(
         for a_idx in 0..budget {
             let is_last_candidate = t_idx + 1 == n_targets && a_idx + 1 == budget;
             let now = clock::now_ms();
-            let Some(choice) = route
-                .provider
-                .admit_key(&route.upstream_model, tenant, None, now)
-            else {
-                // Three different problems, three different answers: this
-                // caller owns nothing here, its own accounts are spent, or
-                // the provider itself has nothing healthy.
-                let holding = route.provider.holding(&route.upstream_model, tenant, now);
-                last_error = Some(if holding.owned == 0 {
-                    no_accounts(route, tenant)
-                } else if route
+            let Some(mut choice) =
+                route
                     .provider
-                    .all_keys_benched(&route.upstream_model, tenant, now)
-                {
-                    out_of_quota(route, tenant, holding)
-                } else {
-                    GatewayError::new(
-                        ErrorClass::NoCapacity,
-                        format!(
-                            "no healthy key of provider `{}` for model `{}`",
-                            route.provider.name, route.upstream_model
-                        ),
-                    )
-                    .with_provider(&route.provider.name)
-                });
+                    .admit_key(&route.upstream_model, tenant, None, now)
+            else {
+                last_error = Some(pool_empty(route, tenant, now));
                 break;
             };
             let Ok(permit) = route.provider.semaphore.clone().try_acquire_owned() else {
@@ -747,6 +817,7 @@ async fn run_chat(
                 );
                 break;
             };
+            let permit = UpstreamPermit::new(permit, choice.permit.take());
 
             attempts += 1;
             let breaker = route.provider.breaker_for(choice.key);
@@ -801,6 +872,7 @@ async fn run_chat(
             {
                 AttemptOutcome::Serve(mut response) => {
                     finalize(&mut response, route, choice.key, attempts, started);
+                    note_reasoning(&mut response, reasoning_effort.as_deref());
                     if emulated {
                         response
                             .headers_mut()
@@ -839,7 +911,7 @@ async fn attempt(
     request: http::Request<Body>,
     breaker: &Breaker,
     key: Option<&router_core::router::KeyRuntime>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: UpstreamPermit,
     plan: &RoutePlan,
     is_last_candidate: bool,
     ctx: TranslationCtx,
@@ -1163,7 +1235,7 @@ fn bench_exhausted_seat(
 async fn translated_response(
     route: &ResolvedRoute,
     response: http::Response<hyper::body::Incoming>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: UpstreamPermit,
     ctx: TranslationCtx,
     upstream_started: Instant,
     seat: SeatOnTrial<'_>,
@@ -1341,7 +1413,7 @@ impl StreamHold {
 
 fn translated_stream_body(
     upstream: hyper::body::Incoming,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: UpstreamPermit,
     parser: WireParser,
     translator: UpstreamStream,
     formatter: InboundStream,
@@ -1354,7 +1426,7 @@ fn translated_stream_body(
         formatter: InboundStream,
         hold: StreamHold,
         done: bool,
-        _permit: tokio::sync::OwnedSemaphorePermit,
+        _permit: UpstreamPermit,
     }
 
     let state = StreamState {
@@ -1944,22 +2016,12 @@ async fn run_relay(
         for a_idx in 0..budget {
             let is_last = t_idx + 1 == n_targets && a_idx + 1 == budget;
             let now = clock::now_ms();
-            let Some(choice) = route
-                .provider
-                .admit_key(&route.upstream_model, tenant, None, now)
-            else {
-                let holding = route.provider.holding(&route.upstream_model, tenant, now);
-                last_error = Some(if holding.owned == 0 {
-                    no_accounts(route, tenant)
-                } else if route
+            let Some(mut choice) =
+                route
                     .provider
-                    .all_keys_benched(&route.upstream_model, tenant, now)
-                {
-                    out_of_quota(route, tenant, holding)
-                } else {
-                    GatewayError::new(ErrorClass::NoCapacity, "no healthy key")
-                        .with_provider(&route.provider.name)
-                });
+                    .admit_key(&route.upstream_model, tenant, None, now)
+            else {
+                last_error = Some(pool_empty(route, tenant, now));
                 break;
             };
             let Ok(permit) = route.provider.semaphore.clone().try_acquire_owned() else {
@@ -1969,6 +2031,7 @@ async fn run_relay(
                 );
                 break;
             };
+            let permit = UpstreamPermit::new(permit, choice.permit.take());
             attempts += 1;
             let breaker = route.provider.breaker_for(choice.key);
             let upstream_body = match span {
@@ -2252,7 +2315,7 @@ async fn run_stream_relay(
         }
         (provider, String::new())
     };
-    let choice = provider
+    let mut choice = provider
         .admit_key(&upstream_model, tenant, None, clock::now_ms())
         .ok_or_else(|| {
             GatewayError::new(
@@ -2270,6 +2333,7 @@ async fn run_stream_relay(
         .clone()
         .try_acquire_owned()
         .map_err(|_| GatewayError::new(ErrorClass::NoCapacity, "provider at max concurrency"))?;
+    let permit = UpstreamPermit::new(permit, choice.permit.take());
     let base = provider
         .base_url
         .as_deref()
@@ -2350,7 +2414,7 @@ const HOP_BY_HOP: &[HeaderName] = &[
 
 fn forward_response(
     upstream: http::Response<hyper::body::Incoming>,
-    permit: tokio::sync::OwnedSemaphorePermit,
+    permit: UpstreamPermit,
 ) -> Response {
     let (parts, body) = upstream.into_parts();
     let body = PermitBody {
@@ -2369,7 +2433,7 @@ fn forward_response(
 
 struct PermitBody {
     inner: hyper::body::Incoming,
-    _permit: tokio::sync::OwnedSemaphorePermit,
+    _permit: UpstreamPermit,
 }
 
 impl http_body::Body for PermitBody {
@@ -2754,7 +2818,10 @@ async fn run_responses(
             && !wants_state
             && !responses_body_has_documents(&value);
         let relay = out_dialect == Dialect::OpenAi || codex_relay;
-        let (out_body, path, emulated) = if relay {
+        let (out_body, path, emulated, reasoning_effort) = if relay {
+            // Relayed verbatim, so the effort is whatever the caller set,
+            // and nothing when they set none: no floor is applied here.
+            let relayed_effort = value["reasoning"]["effort"].as_str().map(str::to_owned);
             let rewritten = if codex_relay {
                 Bytes::from(
                     serde_json::to_vec(&router_providers::subscription::codex_relay_body(
@@ -2780,7 +2847,7 @@ async fn run_responses(
             } else {
                 "/responses".to_owned()
             };
-            (rewritten, path, false)
+            (rewritten, path, false, relayed_effort)
         } else {
             if wants_state {
                 return Err(GatewayError::new(
@@ -2819,30 +2886,24 @@ async fn run_responses(
                 route.provider.codex.as_ref(),
                 route.provider.kind == ProviderKind::ClaudeSubscription,
             )?;
-            (built.body, built.path, built.json_schema_emulated)
+            (
+                built.body,
+                built.path,
+                built.json_schema_emulated,
+                built.reasoning_effort,
+            )
         };
 
         for a_idx in 0..plan.max_attempts_per_target {
             let is_last_candidate =
                 t_idx + 1 == n_targets && a_idx + 1 == plan.max_attempts_per_target;
             let now = clock::now_ms();
-            let Some(choice) =
+            let Some(mut choice) =
                 route
                     .provider
                     .admit_key(&route.upstream_model, tenant, affinity.as_deref(), now)
             else {
-                let holding = route.provider.holding(&route.upstream_model, tenant, now);
-                last_error = Some(if holding.owned == 0 {
-                    no_accounts(route, tenant)
-                } else if route
-                    .provider
-                    .all_keys_benched(&route.upstream_model, tenant, now)
-                {
-                    out_of_quota(route, tenant, holding)
-                } else {
-                    GatewayError::new(ErrorClass::NoCapacity, "no healthy key")
-                        .with_provider(&route.provider.name)
-                });
+                last_error = Some(pool_empty(route, tenant, now));
                 break;
             };
             let Ok(permit) = route.provider.semaphore.clone().try_acquire_owned() else {
@@ -2852,6 +2913,7 @@ async fn run_responses(
                 );
                 break;
             };
+            let permit = UpstreamPermit::new(permit, choice.permit.take());
             attempts += 1;
             let breaker = route.provider.breaker_for(choice.key);
             // Renew a subscription seat that is about to expire, before
@@ -2905,6 +2967,7 @@ async fn run_responses(
             {
                 AttemptOutcome::Serve(mut response) => {
                     finalize(&mut response, route, choice.key, attempts, started);
+                    note_reasoning(&mut response, reasoning_effort.as_deref());
                     if emulated {
                         response
                             .headers_mut()
@@ -3083,7 +3146,7 @@ async fn run_passthrough(
     // account. Taking `keys.first()` here ignored health, load balancing
     // and the service that owns the account alike, which made this
     // endpoint a way around all three.
-    let choice = provider.admit_any(tenant, None, clock::now_ms());
+    let mut choice = provider.admit_any(tenant, None, clock::now_ms());
     if provider.auth == AuthMode::Key && choice.is_none() {
         return Err(GatewayError::new(
             ErrorClass::NoCapacity,
@@ -3094,6 +3157,7 @@ async fn run_passthrough(
         )
         .with_provider(provider_name));
     }
+    let permit = UpstreamPermit::new(permit, choice.as_mut().and_then(|c| c.permit.take()));
     if provider.auth == AuthMode::Key
         && let Some(key) = choice.as_ref().and_then(|c| c.key)
     {

@@ -81,6 +81,11 @@ pub struct OutboundRequest {
     /// Anthropic json_schema emulation is in force; response translation
     /// must fold the forced tool call back into content.
     pub json_schema_emulated: bool,
+    /// The reasoning effort that actually went upstream, for targets that
+    /// take one — the caller's own, or the provider's configured floor.
+    /// Recorded per request because the floor is invisible from the
+    /// caller's body, and "why was this slow" is answered by it.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Build the chat request body for a foreign-dialect target.
@@ -103,6 +108,7 @@ pub fn build_outbound(
                 body: body.into(),
                 dropped_params: Vec::new(),
                 json_schema_emulated: false,
+                reasoning_effort: None,
             })
         }
         Dialect::Anthropic => {
@@ -119,6 +125,7 @@ pub fn build_outbound(
                     .into(),
                 dropped_params: built.dropped_params,
                 json_schema_emulated: built.json_schema_emulated,
+                reasoning_effort: None,
             })
         }
         Dialect::Gemini => {
@@ -135,6 +142,7 @@ pub fn build_outbound(
                     .into(),
                 dropped_params: built.dropped_params,
                 json_schema_emulated: false,
+                reasoning_effort: None,
             })
         }
         Dialect::Bedrock => {
@@ -151,6 +159,7 @@ pub fn build_outbound(
                     .into(),
                 dropped_params: built.dropped_params,
                 json_schema_emulated: false,
+                reasoning_effort: None,
             })
         }
         Dialect::CodexResponses => {
@@ -162,6 +171,9 @@ pub fn build_outbound(
             let _ = stream;
             let settings = codex.cloned().unwrap_or_default();
             let built = subscription::codex_request(req, model, &settings)?;
+            let reasoning_effort = built.body["reasoning"]["effort"]
+                .as_str()
+                .map(str::to_owned);
             Ok(OutboundRequest {
                 path: "/backend-api/codex/responses".into(),
                 body: serde_json::to_vec(&built.body)
@@ -169,6 +181,7 @@ pub fn build_outbound(
                     .into(),
                 dropped_params: built.dropped_params,
                 json_schema_emulated: false,
+                reasoning_effort,
             })
         }
     }

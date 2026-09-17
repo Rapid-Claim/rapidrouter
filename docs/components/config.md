@@ -20,10 +20,17 @@ drain_timeout_secs = 30
 [providers.openai]
 keys = [
   { name = "primary",   value = "env.OPENAI_API_KEY",   weight = 0.7, models = ["gpt-4o", "gpt-4o-mini"] },
-  { name = "secondary", value = "env.OPENAI_API_KEY_2", weight = 0.3 },
+  { name = "secondary", value = "env.OPENAI_API_KEY_2", weight = 0.3, rpm = 600, max_concurrency = 8 },
 ]
-max_concurrency = 512
+max_concurrency = 512                     # in flight across the whole provider
 timeout_secs = 120
+# Ceilings for each key, stated once; a key's own rpm / tpm /
+# max_concurrency overrides the matching field. A key at its ceiling is
+# stepped over for the next one, and when every key is, the caller gets a
+# 503 with retry-after rather than a key being leaned on harder. The
+# ceiling a subscription pool needs: the provider throttled the seats
+# carrying the most requests at once.
+key_limits = { max_concurrency = 2, rpm = 120 }
 
 [providers.anthropic]
 keys = [{ name = "main", value = "env.ANTHROPIC_API_KEY", weight = 1.0 }]

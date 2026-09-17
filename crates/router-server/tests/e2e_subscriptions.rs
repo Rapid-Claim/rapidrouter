@@ -57,6 +57,15 @@ fn codex_auth_json_for(exp_secs: u64, account: &str) -> String {
 
 /// A Codex pool of several seats, each its own account.
 async fn codex_pool(accounts: &[&str]) -> (String, MockProvider, tempfile::TempDir) {
+    codex_pool_with(accounts, "").await
+}
+
+/// The same, with extra lines in the provider table — a `key_limits`,
+/// say.
+async fn codex_pool_with(
+    accounts: &[&str],
+    provider_extra: &str,
+) -> (String, MockProvider, tempfile::TempDir) {
     let mock = MockProvider::spawn().await;
     let dir = tempfile::tempdir().unwrap();
     let keys: Vec<String> = accounts
@@ -78,6 +87,7 @@ type = "codex_subscription"
 base_url = "{base}"
 codex = {{ version = "0.199.0", reasoning_effort = "medium" }}
 keys = [{keys}]
+{provider_extra}
 "#,
             base = mock.base_url(),
             keys = keys.join(", "),
@@ -531,6 +541,209 @@ async fn a_refused_stream_ends_with_an_error_frame_for_a_streaming_caller() {
         hits,
         "a seat refused mid-stream is benched too"
     );
+}
+
+// ---------------------------------------------------------------------------
+// What the log records about a seat
+// ---------------------------------------------------------------------------
+
+/// A one-seat pool whose usage records land on disk, with an admin key to
+/// read them back through the console API.
+async fn logged_codex_pool() -> (String, MockProvider, tempfile::TempDir) {
+    let mock = MockProvider::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let auth_path = dir.path().join("acct-a.json");
+    std::fs::write(&auth_path, codex_auth_json_for(4_000_000_000, "acct-a")).unwrap();
+    let config = Config::from_str_with_env(
+        &format!(
+            r#"
+[providers.codex]
+type = "codex_subscription"
+base_url = "{base}"
+codex = {{ version = "0.199.0", reasoning_effort = "medium" }}
+keys = [{{ name = "seat-alpha", value = "file:{auth}" }}]
+
+[console]
+admin_keys = ["probe-test-key"]
+"#,
+            base = mock.base_url(),
+            auth = auth_path.display(),
+        ),
+        Format::Toml,
+        &NoEnv,
+    )
+    .unwrap();
+    let state = AppState::with_data_dir(config, dir.path().to_path_buf());
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        router_server::serve(listener, state, app, std::future::pending())
+            .await
+            .unwrap()
+    });
+    (url, mock, dir)
+}
+
+/// The first usage record the console API lists, once the flusher has
+/// written it.
+async fn first_logged_request(url: &str) -> Value {
+    let client = reqwest::Client::new();
+    let mut last = Value::Null;
+    for _ in 0..40 {
+        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+        let listing: Value = client
+            .get(format!("{url}/admin/api/requests?limit=5&since_ms=0"))
+            .bearer_auth("probe-test-key")
+            .send()
+            .await
+            .unwrap()
+            .json()
+            .await
+            .unwrap();
+        if let Some(first) = listing["data"].as_array().and_then(|a| a.first()) {
+            return first.clone();
+        }
+        last = listing;
+    }
+    panic!("the request must appear in the log; listing was: {last}")
+}
+
+#[tokio::test]
+async fn the_log_names_the_seat_and_the_reasoning_effort_that_served() {
+    let (url, _mock, _dir) = logged_codex_pool().await;
+    let (status, body) = chat(
+        &url,
+        json!({"model": "codex/gpt-5.5",
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+
+    let record = first_logged_request(&url).await;
+    assert_eq!(
+        record["account"], "seat-alpha",
+        "the record says which seat spent this request: {record}"
+    );
+    assert_eq!(
+        record["reasoning_effort"], "medium",
+        "the effort recorded is the one that went upstream — the provider's floor, \
+         which the caller's body never mentioned: {record}"
+    );
+}
+
+#[tokio::test]
+async fn a_callers_own_effort_is_the_one_recorded() {
+    let (url, mock, _dir) = logged_codex_pool().await;
+    let (status, body) = chat(
+        &url,
+        json!({"model": "codex/gpt-5.5", "reasoning_effort": "high",
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(mock.last_request().body["reasoning"]["effort"], "high");
+    let record = first_logged_request(&url).await;
+    assert_eq!(record["reasoning_effort"], "high", "{record}");
+}
+
+// ---------------------------------------------------------------------------
+// Per-seat ceilings
+// ---------------------------------------------------------------------------
+//
+// Selection already levels requests across seats exactly. What it did not
+// bound was how many requests one seat carries at once, and the provider
+// throttled the seats leaned on hardest. `key_limits.max_concurrency` is
+// that bound: a request past a seat's ceiling goes to another seat, and
+// when every seat is at its ceiling the caller is told to try again
+// shortly rather than a seat being asked to take one more.
+
+/// Fire `n` requests for `model` at once and collect their statuses.
+async fn concurrent(url: &str, model: &str, n: usize) -> Vec<reqwest::StatusCode> {
+    let calls = (0..n).map(|_| {
+        chat(
+            url,
+            json!({"model": model, "messages": [{"role": "user", "content": "hi"}]}),
+        )
+    });
+    futures_util::future::join_all(calls)
+        .await
+        .into_iter()
+        .map(|(status, _)| status)
+        .collect()
+}
+
+#[tokio::test]
+async fn a_seat_carries_no_more_than_its_ceiling_at_once() {
+    // One seat, one slot. The mock's `slow` script holds each request
+    // for two seconds, so three at once cannot all fit.
+    let (url, mock, _dir) =
+        codex_pool_with(&["acct-a"], "key_limits = { max_concurrency = 1 }").await;
+    let statuses = concurrent(&url, "codex/slow", 3).await;
+    let served = statuses.iter().filter(|s| **s == 200).count();
+    let refused = statuses.iter().filter(|s| **s == 503).count();
+    assert_eq!((served, refused), (1, 2), "{statuses:?}");
+    assert_eq!(
+        mock.request_count(),
+        1,
+        "the seat was asked exactly once; the others were never sent upstream"
+    );
+
+    // The slot came back with the response: the next request is served.
+    let (status, body) = chat(
+        &url,
+        json!({"model": "codex/gpt-5.5", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 200, "{body}");
+}
+
+#[tokio::test]
+async fn requests_past_one_seats_ceiling_go_to_the_next_seat() {
+    let (url, mock, _dir) = codex_pool_with(
+        &["acct-a", "acct-b"],
+        "key_limits = { max_concurrency = 1 }",
+    )
+    .await;
+    let statuses = concurrent(&url, "codex/slow", 2).await;
+    assert!(statuses.iter().all(|s| *s == 200), "{statuses:?}");
+    let mut hit = accounts_hit(&mock);
+    hit.sort();
+    assert_eq!(
+        hit,
+        vec!["acct-a", "acct-b"],
+        "two requests at once means one on each seat, never two on one"
+    );
+}
+
+#[tokio::test]
+async fn a_pool_at_its_ceiling_says_so() {
+    let (url, _mock, _dir) =
+        codex_pool_with(&["acct-a"], "key_limits = { max_concurrency = 1 }").await;
+    let hold = tokio::spawn({
+        let url = url.clone();
+        async move {
+            chat(
+                &url,
+                json!({"model": "codex/slow", "messages": [{"role": "user", "content": "hi"}]}),
+            )
+            .await
+        }
+    });
+    // Let the holder take the slot before the second request arrives.
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let (status, body) = chat(
+        &url,
+        json!({"model": "codex/slow", "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(status, 503, "{body}");
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("at their ceiling") && message.contains("try again shortly"),
+        "busy is neither broken nor out of quota, and the caller is told which: {body}"
+    );
+    assert_eq!(hold.await.unwrap().0, 200);
 }
 
 // ---------------------------------------------------------------------------
