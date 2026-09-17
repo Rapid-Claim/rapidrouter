@@ -89,6 +89,20 @@ Hard-won details, all measured against the live backend:
   `response.completed` — on this backend that final event carries an *empty*
   `output` array. Reading only `response.completed` yields a 200 with no tool
   calls: a silent failure, worse than an error.
+- **A refusal arrives inside a `200`.** When the backend will not serve a
+  turn it still answers `200 OK`, then streams an `error` event
+  (`{"type":"error","error":{"type":"service_unavailable_error","code":
+  "server_is_overloaded"}}` — or `server_error` on some models) and a
+  `response.failed`, then closes. Measured 2026-09-17 on 56 of 65 seats,
+  every time, while the seats beside them served: the throttle is per
+  account, follows the accounts driven hardest, and ignores the `Version`
+  header, the reasoning knobs and the model. Read as a normal terminal
+  event that stream folds to a completion with `"content": ""` and
+  `finish_reason: "stop"`, which is what callers were served 92,000 times
+  in one day with nothing in any log. The gateway now treats it as a `5xx`
+  from that seat: the seat is benched for two minutes, the request moves
+  to the next seat, and only when no seat is left does the caller see it —
+  as a `503` carrying the backend's own message, never as an empty answer.
 - **There is no document part.** The backend's content vocabulary is
   `input_text` and `input_image` and nothing else — the Codex client's own
   `ContentItem` enum has three variants and none of them is a file, so a PDF

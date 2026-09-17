@@ -209,9 +209,12 @@ pub fn response_to_openai(
     json_schema_emulated: bool,
 ) -> Result<Value, GatewayError> {
     // Codex answers only in SSE, even for a caller who wanted a whole
-    // body, so it never has a JSON document to parse here.
+    // body, so it never has a JSON document to parse here. A stream the
+    // backend failed comes back as the error it named, with its own
+    // status (the HTTP status was `200`, and is not the truth).
     if dialect == Dialect::CodexResponses {
-        return Ok(subscription::aggregate_sse(body, model));
+        return subscription::aggregate_sse(body, model)
+            .map_err(|failure| failure.to_gateway_error().with_upstream_status(200));
     }
     let value: Value = serde_json::from_slice(body).map_err(|e| {
         GatewayError::new(
@@ -278,6 +281,16 @@ impl UpstreamStream {
                 .unwrap_or_default(),
             Self::Bedrock(state) => state.on_event(event),
             Self::Codex(state) => state.on_event(event),
+        }
+    }
+
+    /// The backend's stated reason the stream carried no answer, for the
+    /// one upstream that refuses inside a `200`. `None` for every other
+    /// dialect, whose refusals arrive as a status code.
+    pub fn failure(&self) -> Option<&subscription::StreamFailure> {
+        match self {
+            Self::Codex(state) => state.failure(),
+            _ => None,
         }
     }
 }
