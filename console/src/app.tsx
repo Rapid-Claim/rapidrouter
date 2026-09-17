@@ -2009,16 +2009,21 @@ function CredentialRow(props: {
     </td>
     <td>
       <Show when={props.subscription} fallback={
-        <Show when={key().limits.rpm || key().limits.tpm} fallback={<span class="muted">No ceiling set</span>}>
+        <Show when={key().limits.rpm || key().limits.tpm || key().limits.concurrency} fallback={<span class="muted">No ceiling set</span>}>
           <small>
-            {key().limits.rpm ? `${formatNumber(key().limits.rpm!.remaining ?? 0)} req left this minute` : ""}
-            {key().limits.rpm && key().limits.tpm ? " · " : ""}
-            {key().limits.tpm ? `${formatNumber(key().limits.tpm!.remaining ?? 0)} tok left` : ""}
+            {[
+              key().limits.concurrency ? `${key().limits.concurrency!.in_flight} of ${key().limits.concurrency!.limit} in flight` : "",
+              key().limits.rpm ? `${formatNumber(key().limits.rpm!.remaining ?? 0)} req left this minute` : "",
+              key().limits.tpm ? `${formatNumber(key().limits.tpm!.remaining ?? 0)} tok left` : "",
+            ].filter(Boolean).join(" · ")}
           </small>
         </Show>
       }>
         <Show when={planWindows().length} fallback={<span class="muted">Reports after the first request</span>}>
           <For each={planWindows()}>{(win) => windowCell(win)}</For>
+        </Show>
+        <Show when={key().limits.concurrency}>
+          <small class="muted">{key().limits.concurrency!.in_flight} of {key().limits.concurrency!.limit} in flight</small>
         </Show>
       </Show>
     </td>
@@ -3765,6 +3770,8 @@ function RequestDrawer(props: { record: UsageRecord | null; onClose: () => void 
             <div><dt>Requested</dt><dd class="mono">{record.requested}</dd></div>
             <div><dt>Endpoint</dt><dd class="mono">{record.endpoint}</dd></div>
             <div><dt>Virtual key</dt><dd class="mono">{record.vkey ?? "—"}</dd></div>
+            <div><dt>Seat</dt><dd class="mono">{record.account ?? "—"}</dd></div>
+            <div><dt>Reasoning</dt><dd>{record.reasoning_effort ?? "—"}</dd></div>
             <div><dt>Attempts</dt><dd>{record.attempts}{record.attempts > 1 ? " (retried)" : ""}</dd></div>
             <div><dt>Streaming</dt><dd>{record.stream ? "Yes" : "No"}</dd></div>
             <div><dt>Request id</dt><dd class="mono wrap">{record.request_id}</dd></div>

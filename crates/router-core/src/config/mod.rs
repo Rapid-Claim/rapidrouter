@@ -348,9 +348,13 @@ pub struct ApiKey {
     pub models: Option<Vec<String>>,
     /// The service this account belongs to; `None` = unassigned.
     pub tenant: Option<String>,
-    /// This key's own request/token ceilings; see [`raw::RawKey`].
+    /// This key's own request/token ceilings; see [`raw::RawKey`]. Already
+    /// resolved against the provider's `key_limits`, so a reader here never
+    /// has to ask which of the two applies.
     pub rpm: Option<u64>,
     pub tpm: Option<u64>,
+    /// Requests this key may carry at once; `None` = unbounded.
+    pub max_concurrency: Option<u32>,
     /// Where this credential was read from, when it came from a file.
     ///
     /// Retained only for `file:` references — a subscription seat whose

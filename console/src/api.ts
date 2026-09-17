@@ -33,6 +33,8 @@ export type ProviderKey = {
   limits: {
     rpm: { remaining: number | null } | null;
     tpm: { remaining: number | null } | null;
+    /** Requests on this key right now, against how many it may carry. */
+    concurrency: { in_flight: number; limit: number } | null;
   };
   /** Present only once the provider has reported a window for this seat. */
   quota: {
@@ -179,6 +181,12 @@ export type UsageRecord = {
   /** Time inside the gateway itself, as opposed to waiting on a provider. */
   overhead_us: number;
   tag?: string;
+  /** The provider key (for a subscription pool, the seat) that served
+   * this request. Absent when nothing was dispatched, and on records
+   * written before the gateway recorded it. */
+  account?: string;
+  /** The reasoning effort sent upstream, for targets that take one. */
+  reasoning_effort?: string;
   /** First user turn (or the system prompt when there is none), truncated.
    * Extracted by the gateway at record time — absent on records written
    * before that shipped. */

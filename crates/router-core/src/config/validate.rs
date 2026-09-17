@@ -523,6 +523,24 @@ fn validate_provider(
         ));
     }
 
+    // The pool-wide ceilings, checked once; each key then inherits what
+    // it does not override.
+    let defaults = rp.key_limits.as_ref();
+    if let Some(limits) = defaults {
+        for (field, zero) in [
+            ("rpm", limits.rpm == Some(0)),
+            ("tpm", limits.tpm == Some(0)),
+            ("max_concurrency", limits.max_concurrency == Some(0)),
+        ] {
+            if zero {
+                errors.push(ConfigError::new(
+                    format!("{path}.key_limits.{field}"),
+                    "must be > 0 — omit the field to leave keys unlimited",
+                ));
+            }
+        }
+    }
+
     let mut key_names = BTreeSet::new();
     let mut keys = Vec::new();
     for (i, rk) in rp.keys.iter().enumerate() {
@@ -541,8 +559,12 @@ fn validate_provider(
         if !(rk.weight.is_finite() && rk.weight > 0.0) {
             errors.push(ConfigError::new(format!("{kpath}.weight"), "must be > 0"));
         }
-        for (field, limit) in [("rpm", rk.rpm), ("tpm", rk.tpm)] {
-            if limit == Some(0) {
+        for (field, zero) in [
+            ("rpm", rk.rpm == Some(0)),
+            ("tpm", rk.tpm == Some(0)),
+            ("max_concurrency", rk.max_concurrency == Some(0)),
+        ] {
+            if zero {
                 errors.push(ConfigError::new(
                     format!("{kpath}.{field}"),
                     "must be > 0 — omit the field to leave this key unlimited",
@@ -556,8 +578,11 @@ fn validate_provider(
                 weight: rk.weight,
                 models: rk.models.clone(),
                 tenant: rk.tenant.clone(),
-                rpm: rk.rpm,
-                tpm: rk.tpm,
+                rpm: rk.rpm.or(defaults.and_then(|d| d.rpm)),
+                tpm: rk.tpm.or(defaults.and_then(|d| d.tpm)),
+                max_concurrency: rk
+                    .max_concurrency
+                    .or(defaults.and_then(|d| d.max_concurrency)),
                 source_path: rk
                     .value
                     .strip_prefix("file:")

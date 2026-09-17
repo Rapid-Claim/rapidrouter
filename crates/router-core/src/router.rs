@@ -5,7 +5,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use tokio::sync::Semaphore;
+use tokio::sync::{OwnedSemaphorePermit, Semaphore};
 
 use crate::breaker::{Admission, Breaker, BreakerConfig};
 use crate::config::{
@@ -79,6 +79,16 @@ pub struct KeyRuntime {
     /// not per provider: one exhausted key must not stop the pool.
     pub rpm: Option<TokenBucket>,
     pub tpm: Option<TokenBucket>,
+    /// How many requests this key may carry at once, and the slots.
+    ///
+    /// A rate limit bounds how often a seat is asked; this bounds how
+    /// hard it is leaned on at any instant. Held as a semaphore whose
+    /// permit rides with the request, so a slot is returned exactly when
+    /// the response finishes streaming and never before — the same
+    /// discipline the provider-wide `max_concurrency` uses. `None` =
+    /// unbounded.
+    pub max_concurrency: Option<u32>,
+    inflight: Option<Arc<Semaphore>>,
     /// The last quota view this key's provider reported, for the console.
     ///
     /// Observability only — benching is decided at the moment a response
@@ -204,6 +214,65 @@ impl KeyRuntime {
         }
     }
 
+    /// Take one of this key's in-flight slots.
+    ///
+    /// `Some(None)` when the key has no ceiling, `Some(Some(permit))` when
+    /// a slot was free — the permit is the slot, and dropping it returns
+    /// it — and `None` when every slot is taken, in which case selection
+    /// moves to the next key rather than waiting on this one.
+    pub fn try_reserve_slot(&self) -> Option<Option<OwnedSemaphorePermit>> {
+        match &self.inflight {
+            None => Some(None),
+            Some(slots) => slots.clone().try_acquire_owned().ok().map(Some),
+        }
+    }
+
+    /// Admit one request against both of this key's ceilings.
+    ///
+    /// The slot first, because it is free to give back; the request
+    /// against the minute second, because it is not — a slot reserved for
+    /// a request the rate limit then refuses is simply released, whereas
+    /// a minute-request spent on a key with no slot free would be gone.
+    /// `None` = over one ceiling or the other; try the next key.
+    fn admit_now(&self, now_ms: u64) -> Option<Option<OwnedSemaphorePermit>> {
+        let permit = self.try_reserve_slot()?;
+        if !self.try_admit_request(now_ms) {
+            return None;
+        }
+        Some(permit)
+    }
+
+    /// Requests in flight on this key right now, and the ceiling, for the
+    /// console. `None` when the key has no ceiling.
+    pub fn in_flight(&self) -> Option<(u32, u32)> {
+        let limit = self.max_concurrency?;
+        let free = self
+            .inflight
+            .as_ref()
+            .map(|s| s.available_permits() as u32)
+            .unwrap_or(limit);
+        Some((limit.saturating_sub(free), limit))
+    }
+
+    /// Whether this key could take a request this instant, without
+    /// spending anything: a free slot, and a request left in the minute.
+    /// For the pool-state message a caller gets when nobody could.
+    pub fn has_headroom(&self, now_ms: u64) -> bool {
+        let slot_free = self
+            .inflight
+            .as_ref()
+            .is_none_or(|s| s.available_permits() > 0);
+        let rpm_left = self.rpm.as_ref().is_none_or(|rpm| {
+            rpm.try_consume(0, now_ms);
+            rpm.available_tokens() > 0
+        });
+        let tpm_left = self.tpm.as_ref().is_none_or(|tpm| {
+            tpm.try_consume(0, now_ms);
+            tpm.available_tokens() > 0
+        });
+        slot_free && rpm_left && tpm_left
+    }
+
     /// Settle the token limiter against what the request actually used.
     pub fn debit_tokens(&self, tokens: u64, now_ms: u64) {
         if let Some(tpm) = &self.tpm {
@@ -261,6 +330,10 @@ pub struct Holding {
 pub struct KeyChoice<'a> {
     pub key: Option<&'a KeyRuntime>,
     pub admission: Admission,
+    /// The key's in-flight slot, when it has a ceiling. Whoever carries
+    /// the request must carry this too: dropping it is what frees the
+    /// slot, so a caller that lets it fall here has capped nothing.
+    pub permit: Option<OwnedSemaphorePermit>,
 }
 
 impl RoutingTable {
@@ -321,6 +394,12 @@ impl RoutingTable {
                         previous_key(prev, name, &k.name).and_then(|p| p.tpm.as_ref()),
                         k.tpm,
                     ),
+                    max_concurrency: k.max_concurrency,
+                    // Carried across a reload when the ceiling is unchanged:
+                    // the permits of in-flight requests live on the old
+                    // semaphore, and a fresh one would admit a full second
+                    // ceiling on top of them until they drained.
+                    inflight: carry_slots(previous_key(prev, name, &k.name), k.max_concurrency),
                     quota: Mutex::new(
                         previous_key(prev, name, &k.name).and_then(KeyRuntime::quota),
                     ),
@@ -530,6 +609,17 @@ fn previous_key<'a>(
 
 /// Keep the running balance when a limit is unchanged in kind; start
 /// fresh when one is newly added or its shape changed.
+/// The in-flight slots for a key across a reload: the same semaphore when
+/// the ceiling did not change, a new one when it did, none when there is
+/// no ceiling.
+fn carry_slots(prev: Option<&KeyRuntime>, limit: Option<u32>) -> Option<Arc<Semaphore>> {
+    let limit = limit?;
+    match prev {
+        Some(p) if p.max_concurrency == Some(limit) => p.inflight.clone(),
+        _ => Some(Arc::new(Semaphore::new(limit as usize))),
+    }
+}
+
 fn carry_bucket(prev: Option<&TokenBucket>, limit: Option<u64>) -> Option<TokenBucket> {
     match (prev, limit) {
         (Some(bucket), Some(_)) => Some(bucket.clone_state()),
@@ -656,6 +746,7 @@ impl ProviderRuntime {
                 admission => Some(KeyChoice {
                     key: None,
                     admission,
+                    permit: None,
                 }),
             };
         }
@@ -690,22 +781,24 @@ impl ProviderRuntime {
         if let Some(session) = affinity
             && let Some(pinned) = pinned_seat(&candidates, session)
         {
-            if pinned.try_admit_request(now_ms) {
+            if let Some(permit) = pinned.admit_now(now_ms) {
                 pinned.take_lease();
                 return Some(KeyChoice {
                     key: Some(pinned),
                     admission: Admission::Yes,
+                    permit,
                 });
             }
             candidates.retain(|k| !std::ptr::eq(*k, pinned));
         }
         while !candidates.is_empty() {
             let picked = balanced_pick(&candidates);
-            if picked.try_admit_request(now_ms) {
+            if let Some(permit) = picked.admit_now(now_ms) {
                 picked.take_lease();
                 return Some(KeyChoice {
                     key: Some(picked),
                     admission: Admission::Yes,
+                    permit,
                 });
             }
             candidates.retain(|k| !std::ptr::eq(*k, picked));
@@ -724,13 +817,23 @@ impl ProviderRuntime {
             match key.breaker.admit(now_ms) {
                 Admission::No => continue,
                 admission => {
-                    if admission == Admission::Yes && !key.try_admit_request(now_ms) {
+                    // A probe is exempt from the rate ceiling — it is one
+                    // request, and the point is to learn whether the key
+                    // works — but not from the slot ceiling: a key with
+                    // every slot taken is busy, not in need of probing.
+                    let permit = if admission == Admission::Yes {
+                        key.admit_now(now_ms)
+                    } else {
+                        key.try_reserve_slot()
+                    };
+                    let Some(permit) = permit else {
                         continue;
-                    }
+                    };
                     key.take_lease();
                     return Some(KeyChoice {
                         key: Some(key),
                         admission,
+                        permit,
                     });
                 }
             }
@@ -773,6 +876,23 @@ impl ProviderRuntime {
         // quota until Tuesday" off a deadline that passed on Sunday sends
         // the caller away from a pool that is ready to serve.
         eligible.peek().is_some() && eligible.all(|k| k.breaker.is_benched(now_ms))
+    }
+
+    /// Whether every healthy key this caller owns for `model` is at one of
+    /// its own ceilings this instant — every slot taken, or no request
+    /// left in the minute.
+    ///
+    /// The third way a pool has nothing to offer, and the only one that
+    /// resolves itself in seconds rather than minutes or days: the caller
+    /// should be told to try again shortly, not that the pool is broken or
+    /// out of quota.
+    pub fn all_keys_at_ceiling(&self, model: &str, tenant: Option<&str>, now_ms: u64) -> bool {
+        let mut healthy = self
+            .eligible(Some(model))
+            .into_iter()
+            .filter(|k| self.owned_by(k, tenant) && k.breaker.looks_healthy(now_ms))
+            .peekable();
+        healthy.peek().is_some() && healthy.all(|k| !k.has_headroom(now_ms))
     }
 
     /// The breaker an attempt outcome should be recorded against.
@@ -1027,6 +1147,118 @@ keys = [
                 .expect("a key is admitted");
             assert_eq!(choice.key.unwrap().name, "spare");
         }
+    }
+
+    const CAPPED: &str = r#"
+[providers.codex]
+type = "codex_subscription"
+key_limits = { max_concurrency = 2 }
+keys = [
+  { name = "seat-a", value = "tok-a" },
+  { name = "seat-b", value = "tok-b", max_concurrency = 1 },
+]
+"#;
+
+    #[test]
+    fn a_pool_wide_ceiling_reaches_every_key_unless_the_key_sets_its_own() {
+        let t = table(CAPPED);
+        let p = t.providers.get("codex").unwrap();
+        let by_name = |n: &str| p.keys.iter().find(|k| k.name == n).unwrap();
+        assert_eq!(by_name("seat-a").max_concurrency, Some(2));
+        assert_eq!(by_name("seat-b").max_concurrency, Some(1));
+        assert_eq!(by_name("seat-a").in_flight(), Some((0, 2)));
+    }
+
+    #[test]
+    fn a_key_with_every_slot_taken_steps_aside_for_the_next() {
+        let t = table(CAPPED);
+        let p = t.providers.get("codex").unwrap();
+        // Three slots in the whole pool: two on a, one on b. Hold all
+        // three, and the fourth request has nowhere to go.
+        let held: Vec<_> = (0..3)
+            .map(|_| {
+                p.admit_key("gpt-5.6-luna", None, None, 1_000)
+                    .expect("a slot is free")
+            })
+            .collect();
+        let names: Vec<&str> = held.iter().map(|c| c.key.unwrap().name.as_str()).collect();
+        assert_eq!(
+            names.iter().filter(|n| **n == "seat-a").count(),
+            2,
+            "{names:?}"
+        );
+        assert_eq!(
+            names.iter().filter(|n| **n == "seat-b").count(),
+            1,
+            "{names:?}"
+        );
+        assert!(
+            held.iter().all(|c| c.permit.is_some()),
+            "a capped key hands out its slot"
+        );
+        assert!(
+            p.admit_key("gpt-5.6-luna", None, None, 1_000).is_none(),
+            "no key is leaned on past its ceiling, even when the request has nowhere else to go"
+        );
+        assert!(p.all_keys_at_ceiling("gpt-5.6-luna", None, 1_000));
+        assert!(
+            !p.all_keys_benched("gpt-5.6-luna", None, 1_000),
+            "at the ceiling is not benched: nothing failed"
+        );
+
+        // Returning one slot is what admits the next request, and it lands
+        // on the key whose slot came back.
+        drop(held);
+        let again = p
+            .admit_key("gpt-5.6-luna", None, None, 1_000)
+            .expect("slots are back");
+        assert!(again.permit.is_some());
+        assert!(!p.all_keys_at_ceiling("gpt-5.6-luna", None, 1_000));
+    }
+
+    #[test]
+    fn a_slot_refused_by_the_rate_ceiling_is_given_back() {
+        let t = table(
+            r#"
+[providers.openai]
+keys = [{ name = "only", value = "sk", rpm = 60, max_concurrency = 1 }]
+"#,
+        );
+        let p = t.providers.get("openai").unwrap();
+        let only = &p.keys[0];
+        for _ in 0..60 {
+            assert!(only.try_admit_request(1_000));
+        }
+        // Over the minute: refused, and the slot it reserved on the way
+        // in must not stay reserved.
+        assert!(p.admit_key("gpt-4o", None, None, 1_000).is_none());
+        assert_eq!(only.in_flight(), Some((0, 1)));
+        assert!(!only.has_headroom(1_000));
+        // A minute later the request allowance is back and the slot is
+        // free: admitted.
+        let choice = p.admit_key("gpt-4o", None, None, 61_000).expect("admitted");
+        assert_eq!(only.in_flight(), Some((1, 1)));
+        drop(choice);
+        assert_eq!(only.in_flight(), Some((0, 1)));
+    }
+
+    #[test]
+    fn slots_survive_a_reload_that_keeps_the_ceiling() {
+        let t = table(CAPPED);
+        let p = t.providers.get("codex").unwrap();
+        let held = p.admit_key("gpt-5.6-luna", None, None, 1_000).unwrap();
+        let seat = held.key.unwrap().name.clone();
+
+        let reloaded = RoutingTable::from_config_with(&config(CAPPED), Some(&t));
+        let p2 = reloaded.providers.get("codex").unwrap();
+        let k2 = p2.keys.iter().find(|k| k.name == seat).unwrap();
+        assert_eq!(
+            k2.in_flight().map(|(used, _)| used),
+            Some(1),
+            "the in-flight request still occupies its slot after the reload"
+        );
+        drop(held);
+        assert_eq!(k2.in_flight().map(|(used, _)| used), Some(0));
     }
 
     #[test]
