@@ -1072,6 +1072,17 @@ mod tests {
 /// 2. **Usage is nested** under `response.usage` on the terminal event,
 ///    with the discounted sub-counts a further level down
 ///    (`input_tokens_details.cached_tokens`).
+/// 3. **A refusal arrives inside a `200`.** When the backend will not
+///    serve the turn it still answers `200 OK`, then streams an `error`
+///    event and a `response.failed` in place of the output. Measured
+///    2026-09-17: `{"type":"error","error":{"type":
+///    "service_unavailable_error","code":"server_is_overloaded"}}`, sent
+///    per account and consistently for the accounts it had decided to
+///    throttle. Read as an ordinary terminal event, that stream is a
+///    well-formed completion with empty content and `finish_reason:
+///    "stop"` — which is what 92,000 requests were served in one day
+///    before this branch existed. So the failure is kept, exposed on
+///    [`Self::failure`], and never turned into a `stop`.
 #[derive(Default)]
 pub struct CodexStreamToOpenAi {
     id: String,
@@ -1084,6 +1095,90 @@ pub struct CodexStreamToOpenAi {
     next_tool_index: u64,
     saw_tool_call: bool,
     usage: Option<Value>,
+    failure: Option<StreamFailure>,
+}
+
+/// Why an upstream stream ended without an answer, as the backend put it.
+///
+/// `code` is the backend's own identifier (`server_is_overloaded`,
+/// `server_error`, …) and is what the routing decision keys on; `message`
+/// is for the caller and the console.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct StreamFailure {
+    pub code: String,
+    pub message: String,
+}
+
+impl StreamFailure {
+    /// Read the backend's `error` object, in either of the two places it
+    /// appears: the `error` event carries it at `data.error`, and the
+    /// `response.failed` event repeats it at `data.response.error`.
+    fn from_error_object(error: &Value, fallback_code: &str) -> Self {
+        let code = error["code"]
+            .as_str()
+            .or_else(|| error["type"].as_str())
+            .filter(|c| !c.is_empty())
+            .unwrap_or(fallback_code)
+            .to_owned();
+        let message = error["message"]
+            .as_str()
+            .filter(|m| !m.is_empty())
+            .unwrap_or("the provider ended the stream without a response")
+            .to_owned();
+        Self { code, message }
+    }
+
+    /// The gateway's view of this failure.
+    ///
+    /// Overload and rate limiting are capacity problems — the request was
+    /// fine, this account was not the one to serve it — and are classed
+    /// so the dispatch loop rotates to another seat and, failing that, the
+    /// caller sees a `503`/`429` it knows to retry. Anything else is the
+    /// provider's own fault and a `502`.
+    pub fn to_gateway_error(&self) -> GatewayError {
+        let class = match self.code.as_str() {
+            "server_is_overloaded" | "service_unavailable_error" | "overloaded" => {
+                ErrorClass::NoCapacity
+            }
+            "rate_limit_exceeded" | "rate_limit_error" | "usage_limit_reached" => {
+                ErrorClass::RateLimited
+            }
+            _ => ErrorClass::UpstreamError,
+        };
+        GatewayError::new(class, format!("{}: {}", self.code, self.message))
+    }
+
+    /// Whether the account, rather than the request or the provider at
+    /// large, is what the backend refused. These are the codes measured to
+    /// arrive per account (some seats every time, neighbouring seats
+    /// never), so they are the ones worth holding a seat out over.
+    pub fn is_account_throttle(&self) -> bool {
+        matches!(
+            self.code.as_str(),
+            "server_is_overloaded"
+                | "service_unavailable_error"
+                | "overloaded"
+                | "server_error"
+                | "rate_limit_exceeded"
+                | "rate_limit_error"
+                | "usage_limit_reached"
+        )
+    }
+
+    /// The mid-stream error frame an OpenAI-format client expects.
+    ///
+    /// OpenAI's own streams carry an error this way — a `data:` payload
+    /// with an `error` object and no `choices` — and every OpenAI SDK
+    /// raises on it. It is the only honest thing to send once the `200`
+    /// and the headers are already on the wire.
+    pub fn to_openai_chunk(&self) -> Value {
+        let err = self.to_gateway_error();
+        json!({"error": {
+            "message": self.message,
+            "type": err.class.openai_type(),
+            "code": self.code,
+        }})
+    }
 }
 
 impl CodexStreamToOpenAi {
@@ -1193,7 +1288,23 @@ impl CodexStreamToOpenAi {
                 }]})));
                 chunks
             }
-            "response.completed" | "response.incomplete" | "response.failed" => {
+            "error" => {
+                // The refusal itself. It normally precedes a
+                // `response.failed`, but is terminal on its own when the
+                // backend drops the stream right after it.
+                let failure = StreamFailure::from_error_object(&data["error"], "stream_error");
+                self.note_failure(failure)
+            }
+            "response.failed" => {
+                // The same refusal, restated on the terminal event. Only
+                // the first sighting emits a frame; this one fills in a
+                // failure the stream had not already named. What this arm
+                // must never do is what it did before: report `stop`.
+                let failure =
+                    StreamFailure::from_error_object(&data["response"]["error"], "response_failed");
+                self.note_failure(failure)
+            }
+            "response.completed" | "response.incomplete" => {
                 self.usage = codex_usage(&data["response"]["usage"]);
                 let finish = if self.saw_tool_call {
                     "tool_calls"
@@ -1211,6 +1322,25 @@ impl CodexStreamToOpenAi {
             }
             _ => Vec::new(),
         }
+    }
+
+    /// The backend's reason the stream carried no answer, if it said so.
+    ///
+    /// Set by an `error` or `response.failed` event and never cleared: a
+    /// stream that failed is failed, whatever arrives after.
+    pub fn failure(&self) -> Option<&StreamFailure> {
+        self.failure.as_ref()
+    }
+
+    /// Record a failure and, the first time, hand the caller its error
+    /// frame. A later restatement of the same failure adds nothing.
+    fn note_failure(&mut self, failure: StreamFailure) -> Vec<Value> {
+        if self.failure.is_some() {
+            return Vec::new();
+        }
+        let chunk = failure.to_openai_chunk();
+        self.failure = Some(failure);
+        vec![chunk]
     }
 
     /// The first content-bearing event opens the assistant message. Sent
@@ -1455,10 +1585,104 @@ mod stream_tests {
                 .any(|c| c["choices"][0]["delta"]["role"].is_string()),
             "no content means no assistant message was opened"
         );
-        assert_eq!(
-            chunks.last().unwrap()["choices"][0]["finish_reason"],
-            "stop"
+        assert!(
+            !chunks
+                .iter()
+                .any(|c| c["choices"][0]["finish_reason"] == "stop"),
+            "a failed stream is never reported as a clean stop: {chunks:?}"
         );
+        assert_eq!(chunks.last().unwrap()["error"]["code"], "response_failed");
+    }
+
+    /// The exact transcript the backend sent on 2026-09-17 to an account
+    /// it had decided to throttle: `200 OK`, then this, then EOF.
+    fn overloaded_transcript() -> Vec<Value> {
+        vec![
+            json!({"type": "response.created", "response": {"id": "resp_1", "model": "gpt-5.6-luna"}}),
+            json!({"type": "response.in_progress", "response": {"id": "resp_1"}}),
+            json!({"type": "error", "sequence_number": 2, "error": {
+                "type": "service_unavailable_error", "code": "server_is_overloaded",
+                "message": "Our servers are currently overloaded. Please try again later.",
+                "param": null}}),
+            json!({"type": "response.failed", "sequence_number": 3, "response": {
+                "id": "resp_1", "status": "failed", "output": [], "usage": null,
+                "error": {"code": "server_is_overloaded",
+                          "message": "Our servers are currently overloaded. Please try again later."}}}),
+        ]
+    }
+
+    #[test]
+    fn an_in_stream_refusal_is_one_error_frame_and_no_stop() {
+        let mut stream = CodexStreamToOpenAi::new("gpt-5.6-luna");
+        let chunks: Vec<Value> = overloaded_transcript()
+            .into_iter()
+            .flat_map(|payload| stream.on_event(&event(payload)))
+            .collect();
+        assert_eq!(
+            chunks.len(),
+            1,
+            "the error is said once, not once per event: {chunks:?}"
+        );
+        assert_eq!(chunks[0]["error"]["code"], "server_is_overloaded");
+        assert_eq!(chunks[0]["error"]["type"], "api_error");
+        assert!(
+            chunks[0]["choices"].is_null(),
+            "an error frame carries no choices"
+        );
+        let failure = stream
+            .failure()
+            .expect("the failure is kept for the dispatcher");
+        assert_eq!(failure.code, "server_is_overloaded");
+        assert!(failure.is_account_throttle());
+        assert_eq!(failure.to_gateway_error().class, ErrorClass::NoCapacity);
+    }
+
+    #[test]
+    fn a_refused_stream_aggregates_to_an_error_not_an_empty_completion() {
+        let body: String = overloaded_transcript()
+            .iter()
+            .map(|payload| {
+                format!(
+                    "event: {}\ndata: {payload}\n\n",
+                    payload["type"].as_str().unwrap()
+                )
+            })
+            .collect();
+        let failure = aggregate_sse(body.as_bytes(), "gpt-5.6-luna")
+            .expect_err("a failed stream must not fold to a completion");
+        assert_eq!(failure.code, "server_is_overloaded");
+        assert!(failure.message.contains("overloaded"));
+    }
+
+    #[test]
+    fn a_completed_stream_still_aggregates() {
+        let body = concat!(
+            "event: response.created\ndata: {\"type\":\"response.created\",\"response\":{\"id\":\"r\",\"model\":\"m\"}}\n\n",
+            "event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"pong\"}\n\n",
+            "event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":3,\"output_tokens\":1}}}\n\n",
+        );
+        let value =
+            aggregate_sse(body.as_bytes(), "m").expect("a completed stream is a completion");
+        assert_eq!(value["choices"][0]["message"]["content"], "pong");
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        assert_eq!(value["usage"]["prompt_tokens"], 3);
+    }
+
+    #[test]
+    fn a_plain_server_error_is_a_502_but_still_an_account_throttle() {
+        // Terra answered `server_error` where Luna answered
+        // `server_is_overloaded`, on the same throttled accounts.
+        let failure = StreamFailure {
+            code: "server_error".into(),
+            message: "boom".into(),
+        };
+        assert_eq!(failure.to_gateway_error().class, ErrorClass::UpstreamError);
+        assert!(failure.is_account_throttle());
+        let unknown = StreamFailure {
+            code: "invalid_prompt".into(),
+            message: "no".into(),
+        };
+        assert!(!unknown.is_account_throttle());
     }
 }
 
@@ -1547,14 +1771,22 @@ pub fn aggregate_chunks(chunks: &[Value]) -> Value {
 }
 
 /// Consume a whole Codex SSE body into one chat completion.
-pub fn aggregate_sse(body: &[u8], model: &str) -> Value {
+///
+/// A stream the backend failed is an error, not a completion. Returning
+/// the empty message such a stream folds to is how a refused turn was
+/// served as a `200` with `"content": ""` — indistinguishable, to the
+/// caller, from the model having nothing to say.
+pub fn aggregate_sse(body: &[u8], model: &str) -> Result<Value, StreamFailure> {
     let mut parser = router_core::sse::SseParser::default();
     let mut stream = CodexStreamToOpenAi::new(model);
     let mut chunks = Vec::new();
     for event in parser.push(body) {
         chunks.extend(stream.on_event(&event));
     }
-    aggregate_chunks(&chunks)
+    if let Some(failure) = stream.failure() {
+        return Err(failure.clone());
+    }
+    Ok(aggregate_chunks(&chunks))
 }
 
 /// Prepare a Responses-shaped body for a native relay to the Codex

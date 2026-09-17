@@ -981,10 +981,88 @@ async fn attempt(
             } else {
                 // Stamps its own wait: the paths that collect the body
                 // waited longer than the headers took to arrive.
-                translated_response(route, response, permit, ctx, upstream_started).await
+                translated_response(
+                    route,
+                    response,
+                    permit,
+                    ctx,
+                    upstream_started,
+                    SeatOnTrial {
+                        breaker,
+                        key,
+                        is_last_candidate,
+                    },
+                )
+                .await
             }
         }
     }
+}
+
+/// The seat an attempt is riding on, for the response paths that can only
+/// tell after the `200` that the seat did not actually serve.
+#[derive(Clone, Copy)]
+struct SeatOnTrial<'a> {
+    breaker: &'a Breaker,
+    key: Option<&'a KeyRuntime>,
+    is_last_candidate: bool,
+}
+
+/// How long a seat the backend refused in-stream stays out of rotation.
+///
+/// The refusal carries no window — it is `server_is_overloaded` inside a
+/// `200`, not a `429` with a reset header — so the length is ours to pick.
+/// Measured 2026-09-17, the throttle was per account and held for hours,
+/// so the breaker's 15 s cooldown would have re-probed each throttled seat
+/// four times a minute, every probe spending one of the caller's attempts.
+/// Two minutes is long enough that a request's attempts land on seats
+/// that work, and short enough that a seat which recovers is back within
+/// the time it takes an operator to notice it was gone.
+const REFUSED_SEAT_BENCH: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// Hold out a seat the backend refused inside a `200`.
+///
+/// The failure counts against the breaker like a `5xx`, the check the
+/// console shows says what the backend said, and a refusal that is about
+/// the account (overload, rate limit) benches the seat for
+/// [`REFUSED_SEAT_BENCH`] so the pool stops re-discovering it. A refusal
+/// that is about the request (a bad prompt) does not bench — it would
+/// follow the request from seat to seat and take the whole pool out.
+fn hold_out_refused_seat(
+    provider: &router_core::router::ProviderRuntime,
+    breaker: &Breaker,
+    key: Option<&KeyRuntime>,
+    failure: &router_providers::subscription::StreamFailure,
+) {
+    let now = clock::now_ms();
+    breaker.record_failure(now);
+    if let Some(key) = key {
+        key.record_check(CheckOutcome {
+            status: "provider_error".into(),
+            detail: format!("{}: {}", failure.code, failure.message),
+            http_status: Some(200),
+            probed: false,
+            observed_ms: now,
+        });
+    }
+    metrics::counter!(
+        "rapid_stream_refusals_total",
+        "provider" => provider.name.clone(),
+        "code" => failure.code.clone(),
+    )
+    .increment(1);
+    if !(provider.kind.is_subscription() && failure.is_account_throttle()) {
+        return;
+    }
+    let benched = quota::bench_for(REFUSED_SEAT_BENCH, fastrand::f64());
+    breaker.bench_until(now + benched.as_millis() as u64);
+    tracing::warn!(
+        provider = %provider.name,
+        seat = key.map(|k| k.name.as_str()).unwrap_or(""),
+        code = %failure.code,
+        seconds = benched.as_secs(),
+        "backend refused the turn inside a 200; seat benched",
+    );
 }
 
 /// Bench a subscription key for as long as the provider says, and record
@@ -1088,6 +1166,7 @@ async fn translated_response(
     permit: tokio::sync::OwnedSemaphorePermit,
     ctx: TranslationCtx,
     upstream_started: Instant,
+    seat: SeatOnTrial<'_>,
 ) -> AttemptOutcome {
     let status = response.status();
 
@@ -1132,6 +1211,41 @@ async fn translated_response(
             }
         };
         drop(permit);
+
+        // A Codex `200` is not yet an answer: the backend refuses a turn
+        // *inside* the stream, after the status line. Only once the whole
+        // body is in hand is it known whether this seat served, and a
+        // seat that did not is treated exactly as a `5xx` from it would
+        // be — held out, and the request moved to the next seat.
+        if ctx.out_dialect == Dialect::CodexResponses
+            && let Err(failure) =
+                router_providers::subscription::aggregate_sse(&body, &route.upstream_model)
+        {
+            hold_out_refused_seat(&route.provider, seat.breaker, seat.key, &failure);
+            let err = failure
+                .to_gateway_error()
+                .with_provider(&route.provider.name)
+                .with_upstream_status(200);
+            // Holding this seat out may have emptied the pool for this
+            // caller. Then the refusal *is* the answer, and is worth more
+            // to them than the "all accounts benched" the next iteration
+            // would otherwise report in its place.
+            let nobody_left = seat.key.is_some_and(|k| {
+                route
+                    .provider
+                    .holding(&route.upstream_model, k.tenant.as_deref(), clock::now_ms())
+                    .usable
+                    == 0
+            });
+            if !seat.is_last_candidate && !nobody_left {
+                metrics::counter!("rapid_retries_total", "provider" => route.provider.name.clone())
+                    .increment(1);
+                return AttemptOutcome::Retry(err);
+            }
+            let response = error_response_for(ctx.render, &err);
+            return AttemptOutcome::Serve(with_upstream_time(response, waited));
+        }
+
         let openai = match router_providers::response_to_openai(
             ctx.out_dialect,
             &body,
@@ -1153,7 +1267,21 @@ async fn translated_response(
     let translator = UpstreamStream::new(ctx.out_dialect, &route.upstream_model, ctx.emulated);
     let formatter = InboundStream::new_for(ctx.render);
     let parser = WireParser::for_dialect(ctx.out_dialect);
-    let body = translated_stream_body(response.into_body(), permit, parser, translator, formatter);
+    // The headers are on the wire before the stream can fail, so there is
+    // no retry to be had here — but the seat is still ours to hold out,
+    // and the error frame the translator emits is the caller's.
+    let hold = StreamHold {
+        provider: route.provider.clone(),
+        key: seat.key.map(|k| k.name.clone()),
+    };
+    let body = translated_stream_body(
+        response.into_body(),
+        permit,
+        parser,
+        translator,
+        formatter,
+        hold,
+    );
     let response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "text/event-stream")
@@ -1188,18 +1316,43 @@ impl WireParser {
     }
 }
 
+/// What a live stream needs in order to hold out the seat it rides on
+/// once the upstream has ended: the provider, and which of its keys.
+/// Names rather than references, because the body outlives the attempt.
+struct StreamHold {
+    provider: Arc<router_core::router::ProviderRuntime>,
+    key: Option<String>,
+}
+
+impl StreamHold {
+    /// Called once, when the upstream ends: if the translator saw the
+    /// backend refuse the turn, hold the seat out as the sync path does.
+    fn settle(&self, translator: &UpstreamStream) {
+        let Some(failure) = translator.failure() else {
+            return;
+        };
+        let key = self
+            .key
+            .as_deref()
+            .and_then(|name| self.provider.keys.iter().find(|k| k.name == name));
+        hold_out_refused_seat(&self.provider, self.provider.breaker_for(key), key, failure);
+    }
+}
+
 fn translated_stream_body(
     upstream: hyper::body::Incoming,
     permit: tokio::sync::OwnedSemaphorePermit,
     parser: WireParser,
     translator: UpstreamStream,
     formatter: InboundStream,
+    hold: StreamHold,
 ) -> Body {
     struct StreamState {
         upstream: hyper::body::Incoming,
         parser: WireParser,
         translator: UpstreamStream,
         formatter: InboundStream,
+        hold: StreamHold,
         done: bool,
         _permit: tokio::sync::OwnedSemaphorePermit,
     }
@@ -1209,6 +1362,7 @@ fn translated_stream_body(
         parser,
         translator,
         formatter,
+        hold,
         done: false,
         _permit: permit,
     };
@@ -1238,11 +1392,13 @@ fn translated_stream_body(
                 Some(Err(err)) => {
                     tracing::warn!(%err, "upstream stream failed mid-flight");
                     st.done = true;
+                    st.hold.settle(&st.translator);
                     let tail: String = st.formatter.finish().concat();
                     return Some((Ok(Bytes::from(tail)), st));
                 }
                 None => {
                     st.done = true;
+                    st.hold.settle(&st.translator);
                     let tail: String = st.formatter.finish().concat();
                     if tail.is_empty() {
                         return None;

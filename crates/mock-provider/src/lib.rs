@@ -970,6 +970,53 @@ async fn codex_responses(
         return failure;
     }
 
+    // `refuse-<account>` / `refuse-all`: the refusal the real backend
+    // sends to an account it is throttling — `200 OK`, then an `error`
+    // event and a `response.failed` where the output would be, then EOF.
+    // Transcribed from a live capture on 2026-09-17. Keyed on the
+    // `ChatGPT-Account-Id` header because that is how the real one
+    // behaves: one seat refused every time, the seat beside it served.
+    if let Some(target) = model.strip_prefix("refuse-") {
+        let account = headers
+            .get("chatgpt-account-id")
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("");
+        if target == "all" || target == account {
+            let events = [
+                format!(
+                    "event: response.created\ndata: {}\n\n",
+                    json!({"type": "response.created",
+                           "response": {"id": "resp_refused", "model": model}})
+                ),
+                format!(
+                    "event: response.in_progress\ndata: {}\n\n",
+                    json!({"type": "response.in_progress", "response": {"id": "resp_refused"}})
+                ),
+                format!(
+                    "event: error\ndata: {}\n\n",
+                    json!({"type": "error", "sequence_number": 2, "error": {
+                        "type": "service_unavailable_error",
+                        "code": "server_is_overloaded",
+                        "message": "Our servers are currently overloaded. Please try again later.",
+                        "param": null}})
+                ),
+                format!(
+                    "event: response.failed\ndata: {}\n\n",
+                    json!({"type": "response.failed", "sequence_number": 3, "response": {
+                        "id": "resp_refused", "status": "failed", "output": [], "usage": null,
+                        "error": {"code": "server_is_overloaded",
+                                  "message": "Our servers are currently overloaded. Please try again later."}}})
+                ),
+            ];
+            return (
+                StatusCode::OK,
+                [(header::CONTENT_TYPE, "text/event-stream")],
+                events.concat(),
+            )
+                .into_response();
+        }
+    }
+
     let mut events = vec![format!(
         "event: response.created\ndata: {}\n\n",
         json!({"type": "response.created",

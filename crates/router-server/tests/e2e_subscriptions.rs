@@ -25,6 +25,12 @@ impl router_core::config::EnvSource for NoEnv {
 /// A Codex `auth.json`, with a JWT-shaped access token whose `exp` is far
 /// enough out that nothing tries to renew it mid-test.
 fn codex_auth_json(exp_secs: u64) -> String {
+    codex_auth_json_for(exp_secs, "acct-test")
+}
+
+/// The same, for a named account — the header the backend tells seats
+/// apart by, and so the one a per-seat refusal is keyed on.
+fn codex_auth_json_for(exp_secs: u64, account: &str) -> String {
     use base64::Engine;
     let encode = |v: &[u8]| base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(v);
     let jwt = |claims: Value| {
@@ -41,12 +47,55 @@ fn codex_auth_json(exp_secs: u64) -> String {
             "access_token": jwt(json!({"exp": exp_secs})),
             "refresh_token": "rt.1.AAAtest",
             "id_token": jwt(json!({
-                "https://api.openai.com/auth": {"chatgpt_account_id": "acct-test"}
+                "https://api.openai.com/auth": {"chatgpt_account_id": account}
             })),
-            "account_id": "acct-test"
+            "account_id": account
         }
     })
     .to_string()
+}
+
+/// A Codex pool of several seats, each its own account.
+async fn codex_pool(accounts: &[&str]) -> (String, MockProvider, tempfile::TempDir) {
+    let mock = MockProvider::spawn().await;
+    let dir = tempfile::tempdir().unwrap();
+    let keys: Vec<String> = accounts
+        .iter()
+        .map(|account| {
+            let path = dir.path().join(format!("{account}.json"));
+            std::fs::write(&path, codex_auth_json_for(4_000_000_000, account)).unwrap();
+            format!(
+                r#"{{ name = "{account}", value = "file:{}" }}"#,
+                path.display()
+            )
+        })
+        .collect();
+    let config = Config::from_str_with_env(
+        &format!(
+            r#"
+[providers.codex]
+type = "codex_subscription"
+base_url = "{base}"
+codex = {{ version = "0.199.0", reasoning_effort = "medium" }}
+keys = [{keys}]
+"#,
+            base = mock.base_url(),
+            keys = keys.join(", "),
+        ),
+        Format::Toml,
+        &NoEnv,
+    )
+    .unwrap();
+    let state = AppState::new(config);
+    let app = build_router(state.clone());
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}", listener.local_addr().unwrap());
+    tokio::spawn(async move {
+        router_server::serve(listener, state, app, std::future::pending())
+            .await
+            .unwrap()
+    });
+    (url, mock, dir)
 }
 
 async fn gateway() -> (String, MockProvider, tempfile::TempDir) {
@@ -347,6 +396,141 @@ async fn codex_streams_through_to_a_streaming_caller() {
     assert!(body.contains("chat.completion.chunk"), "{body}");
     assert!(body.contains("Hello"), "{body}");
     assert!(body.contains("[DONE]"));
+}
+
+// ---------------------------------------------------------------------------
+// Refusals inside a 200
+// ---------------------------------------------------------------------------
+//
+// The Codex backend does not refuse a turn with a status code. It answers
+// `200 OK`, then streams an `error` and a `response.failed` where the
+// output would be. Measured 2026-09-17 on 56 of 65 seats, every time, while
+// the seats beside them served: a per-account throttle wearing a `200`.
+// Read as a normal terminal event, that stream folds to a completion with
+// empty content — which is what callers were served, 92,000 times in a
+// day, with nothing in any log.
+
+/// Which accounts the mock was asked to serve, in order.
+fn accounts_hit(mock: &MockProvider) -> Vec<String> {
+    mock.requests()
+        .iter()
+        .map(|r| {
+            r.headers
+                .get("chatgpt-account-id")
+                .cloned()
+                .unwrap_or_default()
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_refused_stream_is_an_error_not_an_empty_completion() {
+    let (url, mock, _dir) = codex_pool(&["acct-a"]).await;
+    let (status, body) = chat(
+        &url,
+        json!({"model": "codex/refuse-all",
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_eq!(
+        status, 503,
+        "a refusal is an error, whatever the status line said: {body}"
+    );
+    let message = body["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("server_is_overloaded") && message.contains("overloaded"),
+        "the caller is told what the backend said: {body}"
+    );
+    assert!(
+        body["choices"].is_null(),
+        "and is not handed an empty assistant turn: {body}"
+    );
+
+    // The seat that was refused is held out: the next request does not
+    // go upstream at all, and is refused here rather than served empty.
+    let hits = mock.request_count();
+    let (status, body) = chat(
+        &url,
+        json!({"model": "codex/refuse-all",
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_ne!(status, 200, "{body}");
+    assert_eq!(
+        mock.request_count(),
+        hits,
+        "a benched seat is not re-probed"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_seat_is_stepped_over_for_one_that_serves() {
+    let (url, mock, _dir) = codex_pool(&["acct-a", "acct-b"]).await;
+    // Only acct-a is throttled; acct-b serves the same model normally.
+    for _ in 0..4 {
+        let (status, body) = chat(
+            &url,
+            json!({"model": "codex/refuse-acct-a",
+                   "messages": [{"role": "user", "content": "hi"}]}),
+        )
+        .await;
+        assert_eq!(status, 200, "{body}");
+        assert_eq!(
+            body["choices"][0]["message"]["content"], "Hello from Codex",
+            "the caller gets the answer the working seat produced: {body}"
+        );
+    }
+    let hit = accounts_hit(&mock);
+    let refused = hit.iter().filter(|a| *a == "acct-a").count();
+    assert!(
+        refused <= 1,
+        "the throttled seat is discovered once and then stepped over, not re-tried \
+         on every request: {hit:?}"
+    );
+    assert!(
+        hit.iter().filter(|a| *a == "acct-b").count() >= 4,
+        "{hit:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_refused_stream_ends_with_an_error_frame_for_a_streaming_caller() {
+    let (url, mock, _dir) = codex_pool(&["acct-a"]).await;
+    let res = reqwest::Client::new()
+        .post(format!("{url}/v1/chat/completions"))
+        .json(&json!({"model": "codex/refuse-all", "stream": true,
+                      "messages": [{"role": "user", "content": "hi"}]}))
+        .send()
+        .await
+        .unwrap();
+    // The headers were sent before the backend refused, so the status is
+    // the one honest thing that cannot change. The body can.
+    assert_eq!(res.status(), 200);
+    let body = res.text().await.unwrap();
+    assert!(
+        body.contains(r#""code":"server_is_overloaded""#),
+        "the refusal reaches the caller as an OpenAI error frame: {body}"
+    );
+    assert!(
+        !body.contains(r#""finish_reason":"stop""#),
+        "and is never dressed up as a clean stop: {body}"
+    );
+
+    // Holding the seat out does not depend on the sync path having seen
+    // the body.
+    let hits = mock.request_count();
+    let (status, _) = chat(
+        &url,
+        json!({"model": "codex/refuse-all",
+               "messages": [{"role": "user", "content": "hi"}]}),
+    )
+    .await;
+    assert_ne!(status, 200);
+    assert_eq!(
+        mock.request_count(),
+        hits,
+        "a seat refused mid-stream is benched too"
+    );
 }
 
 // ---------------------------------------------------------------------------
