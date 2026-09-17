@@ -395,6 +395,17 @@ pub struct UsageRecord {
     /// itself carries one. Absent on records written before this shipped.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt: Option<String>,
+    /// The provider key — for a subscription pool, the seat — that served
+    /// this request. The one fact the record could not answer before:
+    /// which account a request spent, which is what the log drawer is
+    /// opened to learn once a provider starts treating seats differently.
+    /// Absent when no key served (an error before dispatch) and on records
+    /// written before this shipped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The reasoning effort sent upstream, for targets that take one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_effort: Option<String>,
 }
 
 /// How much of the prompt the record keeps. Enough for a table cell to be
@@ -1135,6 +1146,8 @@ pub struct UsageHook {
     pub tag: Option<String>,
     /// The credential that served this request, when one did.
     pub seat: Option<crate::proxy::SeatUsed>,
+    /// The reasoning effort that went upstream, when the target takes one.
+    pub reasoning_effort: Option<String>,
     /// The request body as the caller sent it, kept for the log drawer.
     pub input_body: Option<String>,
 }
@@ -1189,6 +1202,8 @@ impl UsageHook {
             // on at all, so the log table shows a prompt even on a
             // gateway that stores no bodies.
             prompt: self.input_body.as_deref().and_then(prompt_preview),
+            account: self.seat.as_ref().map(|s| s.key.clone()),
+            reasoning_effort: self.reasoning_effort,
         };
         if let Some(events) = &self.events {
             let _ = events.send(serde_json::json!({
@@ -3185,6 +3200,8 @@ mod usage_summary_tests {
             attempts: 1,
             tag: None,
             prompt: None,
+            account: None,
+            reasoning_effort: None,
         }
     }
 
@@ -3768,6 +3785,8 @@ mod tests {
             attempts: 1,
             tag: None,
             prompt: None,
+            account: None,
+            reasoning_effort: None,
         }
     }
 
@@ -4123,6 +4142,8 @@ mod tests {
             attempts: 1,
             tag: None,
             prompt: None,
+            account: None,
+            reasoning_effort: None,
         };
         let now: u64 = 200 * 60_000;
         agg.record(&rec(now, "openai", Some("k1"), 500));
@@ -4167,6 +4188,8 @@ mod tests {
             attempts: 1,
             tag: None,
             prompt: None,
+            account: None,
+            reasoning_effort: None,
         };
         let old = now.saturating_sub(90 * 86_400_000);
         write_batch(

@@ -286,6 +286,21 @@ pub struct RawProvider {
     pub location: Option<String>,
     /// Codex subscription only.
     pub codex: Option<RawCodex>,
+    /// Ceilings applied to every key of this provider that does not set
+    /// its own. One place to say "no seat takes more than this" for a
+    /// pool of sixty, instead of sixty copies of the same three numbers.
+    pub key_limits: Option<RawKeyLimits>,
+}
+
+/// Per-key ceilings, stated once for the whole pool. A key's own `rpm`,
+/// `tpm` or `max_concurrency` overrides the matching field here.
+#[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct RawKeyLimits {
+    pub rpm: Option<u64>,
+    pub tpm: Option<u64>,
+    /// Requests one key may have in flight at once.
+    pub max_concurrency: Option<u32>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -322,6 +337,7 @@ impl Default for RawProvider {
             project: None,
             location: None,
             codex: None,
+            key_limits: None,
         }
     }
 }
@@ -353,6 +369,15 @@ pub struct RawKey {
     pub rpm: Option<u64>,
     #[serde(default)]
     pub tpm: Option<u64>,
+    /// How many requests this key may carry at once. A request past the
+    /// ceiling goes to the next key, not into a queue on this one.
+    ///
+    /// The ceiling that matters for a subscription seat: a rate limit
+    /// bounds how often a seat is asked, this bounds how hard it is
+    /// leaned on at any instant, and it was the seats leaned on hardest
+    /// that the provider throttled.
+    #[serde(default)]
+    pub max_concurrency: Option<u32>,
 }
 
 fn default_weight() -> f64 {

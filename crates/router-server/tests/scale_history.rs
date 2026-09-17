@@ -62,6 +62,8 @@ fn a_week_of_a_million_requests_a_day_reads_fast() {
                         attempts: 1,
                         tag: None,
                         prompt: None,
+                        account: None,
+                        reasoning_effort: None,
                     }
                 })
                 .collect();

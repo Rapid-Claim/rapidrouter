@@ -103,6 +103,11 @@ Hard-won details, all measured against the live backend:
   from that seat: the seat is benched for two minutes, the request moves
   to the next seat, and only when no seat is left does the caller see it —
   as a `503` carrying the backend's own message, never as an empty answer.
+  The seats it throttled were the ones carrying the most requests at
+  once, so the pool now takes a per-seat ceiling — `key_limits = {
+  max_concurrency = N, rpm = M }` on the provider, overridable per seat —
+  and a request past a seat's ceiling goes to the next seat rather than
+  onto that one.
 - **There is no document part.** The backend's content vocabulary is
   `input_text` and `input_image` and nothing else — the Codex client's own
   `ContentItem` enum has three variants and none of them is a file, so a PDF

@@ -1889,6 +1889,9 @@ struct NewKey {
     weight: Option<f64>,
     rpm: Option<u64>,
     tpm: Option<u64>,
+    /// Requests this key may carry at once; omitted = the provider's
+    /// `key_limits` default, or unbounded.
+    max_concurrency: Option<u32>,
     #[serde(default)]
     models: Vec<String>,
 }
@@ -1908,6 +1911,9 @@ fn key_entry(key: &NewKey, fallback_models: &[String]) -> toml_edit::InlineTable
     }
     if let Some(tpm) = key.tpm {
         entry.insert("tpm", (tpm as i64).into());
+    }
+    if let Some(max_concurrency) = key.max_concurrency {
+        entry.insert("max_concurrency", i64::from(max_concurrency).into());
     }
     let models = if key.models.is_empty() {
         fallback_models
@@ -2801,6 +2807,14 @@ async fn providers(State(state): State<Arc<AppState>>) -> Response {
                         "limits": {
                             "rpm": k.rpm.as_ref().map(|_| json!({ "remaining": rpm_left })),
                             "tpm": k.tpm.as_ref().map(|_| json!({ "remaining": tpm_left })),
+                            // How hard this key is being leaned on right
+                            // now, against how hard it may be. The number
+                            // an operator watches when the provider is
+                            // throttling the busiest seats.
+                            "concurrency": k.in_flight().map(|(in_flight, limit)| json!({
+                                "in_flight": in_flight,
+                                "limit": limit,
+                            })),
                         },
                         "quota": k.quota().map(|snapshot| json!({
                             "observed_ms": now_unix.saturating_sub(now.saturating_sub(snapshot.observed_ms)),

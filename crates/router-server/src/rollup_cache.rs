@@ -427,6 +427,8 @@ mod tests {
             overhead_us: 0,
             tag: None,
             prompt: None,
+            account: None,
+            reasoning_effort: None,
         }
     }
 
